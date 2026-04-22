@@ -609,6 +609,153 @@ impl SmtSolver {
         }
     }
 
+    // ---------- Optimization: solve_min / solve_max ----------
+    //
+    // "Bit-hunt" search: walk the target term's bitblasted SAT lits from
+    // MSB down to LSB and, at each bit, try forcing it to its preferred
+    // polarity (0 for min, 1 for max) via a single-literal assumption. A
+    // sat response locks that bit in; an unsat response flips the choice
+    // and moves on. Exactly `width` solve calls, each adding one unit
+    // assumption to the accumulated prefix — strictly cheaper than
+    // bitblasting an O(W)-wide comparator for every iteration of a
+    // caller-side binary search. The SAT solver's learned clauses carry
+    // across iterations since all state is preserved.
+    //
+    // After a successful search, the solver is left in a sat state whose
+    // model realizes the returned optimum, so `get_bv_value_*` on other
+    // terms reflects values consistent with the optimal assignment.
+
+    /// Minimum unsigned value of `x` satisfying all active assertions.
+    /// Returns `None` if the formula is unsat. Panics if `x`'s width > 128
+    /// — use [`solve_min_u_limbs`] for wider terms.
+    pub fn solve_min_u(&mut self, x: BvTerm) -> Option<u128> {
+        assert!(self.ctx.width_of(x) <= 128, "solve_min_u: width > 128");
+        self.solve_min_u_limbs(x).map(|l| limbs_to_u128(&l))
+    }
+
+    /// Maximum unsigned value of `x` satisfying all active assertions.
+    pub fn solve_max_u(&mut self, x: BvTerm) -> Option<u128> {
+        assert!(self.ctx.width_of(x) <= 128, "solve_max_u: width > 128");
+        self.solve_max_u_limbs(x).map(|l| limbs_to_u128(&l))
+    }
+
+    /// Minimum signed (two's complement) value of `x` satisfying all
+    /// active assertions, returned as `i128` with sign extension from
+    /// `x`'s width.
+    pub fn solve_min_s(&mut self, x: BvTerm) -> Option<i128> {
+        let w = self.ctx.width_of(x);
+        assert!(w <= 128, "solve_min_s: width > 128");
+        self.solve_min_s_limbs(x)
+            .map(|l| sign_extend_limbs_i128(&l, w))
+    }
+
+    /// Maximum signed (two's complement) value of `x` satisfying all
+    /// active assertions.
+    pub fn solve_max_s(&mut self, x: BvTerm) -> Option<i128> {
+        let w = self.ctx.width_of(x);
+        assert!(w <= 128, "solve_max_s: width > 128");
+        self.solve_max_s_limbs(x)
+            .map(|l| sign_extend_limbs_i128(&l, w))
+    }
+
+    /// Arbitrary-width variant of [`solve_min_u`]. Returns the minimum as
+    /// little-endian u64 limbs (LSB-first, same layout as
+    /// [`get_bv_value_limbs`]).
+    pub fn solve_min_u_limbs(&mut self, x: BvTerm) -> Option<Vec<u64>> {
+        let bits = self.opt_prologue(x)?;
+        Some(self.bit_hunt(&bits, |_| false))
+    }
+
+    /// Arbitrary-width variant of [`solve_max_u`].
+    pub fn solve_max_u_limbs(&mut self, x: BvTerm) -> Option<Vec<u64>> {
+        let bits = self.opt_prologue(x)?;
+        Some(self.bit_hunt(&bits, |_| true))
+    }
+
+    /// Arbitrary-width signed-min. Signed order differs from unsigned only
+    /// at the sign bit: for minimum, we prefer sign-bit 1 (most negative),
+    /// then zero elsewhere.
+    pub fn solve_min_s_limbs(&mut self, x: BvTerm) -> Option<Vec<u64>> {
+        let bits = self.opt_prologue(x)?;
+        let msb = bits.len() - 1;
+        Some(self.bit_hunt(&bits, |i| i == msb))
+    }
+
+    /// Arbitrary-width signed-max. Prefer sign-bit 0 (non-negative), then
+    /// ones elsewhere.
+    pub fn solve_max_s_limbs(&mut self, x: BvTerm) -> Option<Vec<u64>> {
+        let bits = self.opt_prologue(x)?;
+        let msb = bits.len() - 1;
+        Some(self.bit_hunt(&bits, |i| i != msb))
+    }
+
+    /// Shared opt-query setup: flush, bitblast the target term (so its
+    /// SAT lits exist and the formula incorporates all its clauses), and
+    /// do the initial feasibility check. Returns `None` when unsat (and
+    /// updates `last_result` accordingly); returns the LSB-first SAT lits
+    /// of `x` when sat, with `last_result = Sat`.
+    fn opt_prologue(&mut self, x: BvTerm) -> Option<Vec<Lit>> {
+        self.flush_pending();
+        // bitblast BEFORE the initial solve so the feasibility check sees
+        // any clauses the bitblaster adds for `x` — otherwise a sat model
+        // from the smaller formula could be falsified by the extra gates.
+        let bits = self.bitblast_bv(x);
+        let asmps = self.built_assumptions(&[]);
+        match self.sat.solve_under_assumptions(&asmps) {
+            SolveResult::Sat => {
+                self.last_result = Some(SmtResult::Sat);
+                Some(bits)
+            }
+            SolveResult::Unsat => {
+                self.last_result = Some(SmtResult::Unsat);
+                None
+            }
+        }
+    }
+
+    /// Core bit-hunt: given LSB-first SAT lits and a policy function
+    /// describing which value each bit prefers (`true` = prefer 1,
+    /// `false` = prefer 0), return the optimal bit pattern as u64 limbs.
+    /// Caller guarantees the formula is sat before invocation (via
+    /// [`opt_prologue`]).
+    fn bit_hunt(&mut self, bits: &[Lit], want_one: impl Fn(usize) -> bool) -> Vec<u64> {
+        let w = bits.len();
+        let nlimbs = (w + 63) / 64;
+        let mut limbs = vec![0u64; nlimbs];
+        let mut fixed: Vec<Lit> = Vec::with_capacity(w);
+        for i in (0..w).rev() {
+            let b = bits[i];
+            let prefer_one = want_one(i);
+            let first_try = if prefer_one { b } else { !b };
+            fixed.push(first_try);
+            let asmps = self.built_assumptions(&fixed);
+            let sat = matches!(
+                self.sat.solve_under_assumptions(&asmps),
+                SolveResult::Sat
+            );
+            if sat {
+                if prefer_one {
+                    limbs[i / 64] |= 1u64 << (i % 64);
+                }
+            } else {
+                // The opposite polarity must be sat under `fixed[..-1]`,
+                // by exhaustion of the two possibilities.
+                fixed.pop();
+                fixed.push(!first_try);
+                if !prefer_one {
+                    limbs[i / 64] |= 1u64 << (i % 64);
+                }
+            }
+        }
+        // Leave the SAT solver in a state whose current model realizes
+        // the returned optimum, so the caller can read other terms'
+        // values via `get_bv_value_*` afterward.
+        let asmps = self.built_assumptions(&fixed);
+        let _ = self.sat.solve_under_assumptions(&asmps);
+        self.last_result = Some(SmtResult::Sat);
+        limbs
+    }
+
     /// Top-level assertion emit, specialized on the outermost Bool shape to
     /// avoid synthesizing gates whose output is immediately forced. For a BV
     /// equality root `(assert (= x y))`, directly emit 2N guarded bit-
@@ -2131,4 +2278,26 @@ fn ceil_log2(n: usize) -> usize {
 #[inline]
 pub fn bv_value_fits(value: u128, width: u32) -> bool {
     value & !mask(width) == 0
+}
+
+/// Pack up to two little-endian u64 limbs into a u128. Extra limbs are
+/// ignored — the caller is responsible for ensuring the width fits.
+#[inline]
+fn limbs_to_u128(limbs: &[u64]) -> u128 {
+    let lo = limbs.first().copied().unwrap_or(0) as u128;
+    let hi = limbs.get(1).copied().unwrap_or(0) as u128;
+    lo | (hi << 64)
+}
+
+/// Interpret `limbs` as a two's-complement integer of `width` bits and
+/// return the sign-extended i128. Width must be ≤ 128.
+#[inline]
+fn sign_extend_limbs_i128(limbs: &[u64], width: u32) -> i128 {
+    let v = limbs_to_u128(limbs);
+    if width == 128 {
+        v as i128
+    } else {
+        let shift = 128 - width;
+        ((v as i128) << shift) >> shift
+    }
 }
