@@ -10,7 +10,7 @@
 //! lshr, ashr, extract, concat, zero-extend, sign-extend, ite.
 //! Comparisons: eq/ne, ult/ule/ugt/uge (unsigned), slt/sle/sgt/sge (signed).
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::bv::{BoolOp, BoolTerm, BvContext, BvOp, BvTerm, mask};
 use crate::lit::{LBool, Lit, Var};
@@ -183,16 +183,16 @@ impl SmtSolver {
         SmtSolver {
             ctx: BvContext::new(),
             sat: Solver::new(),
-            bv_cache: HashMap::new(),
-            bool_cache: HashMap::new(),
-            bv_var_lits: HashMap::new(),
-            bool_var_lits: HashMap::new(),
+            bv_cache: HashMap::default(),
+            bool_cache: HashMap::default(),
+            bv_var_lits: HashMap::default(),
+            bool_var_lits: HashMap::default(),
             bv_var_parent: Vec::new(),
             bool_var_parent: Vec::new(),
-            and_cache: HashMap::new(),
-            or_cache: HashMap::new(),
-            xor_cache: HashMap::new(),
-            mux_cache: HashMap::new(),
+            and_cache: HashMap::default(),
+            or_cache: HashMap::default(),
+            xor_cache: HashMap::default(),
+            mux_cache: HashMap::default(),
             true_lit: None,
             activation_stack: Vec::new(),
             pending: vec![Vec::new()],
@@ -201,7 +201,7 @@ impl SmtSolver {
             var_origin: Vec::new(),
             current_bv_ctx: None,
             ite_gates: Vec::new(),
-            ite_out_to_gate: HashMap::new(),
+            ite_out_to_gate: HashMap::default(),
             ite_branching_hints: true,
         }
     }

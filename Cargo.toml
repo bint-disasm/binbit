@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# FxHash: fast non-cryptographic multiplicative hash used by rustc itself.
+# Default SipHash is ~2-3x slower for small integer keys, which is exactly
+# what our hot maps have (BvTerm, Lit, (Lit, Lit), etc.). No DoS risk —
+# every key is an internal handle.
+rustc-hash = "2"
 
 # mimalloc is unavailable on WASM (no C runtime to link against).
 [target.'cfg(not(target_family = "wasm"))'.dependencies]

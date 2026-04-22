@@ -16,7 +16,7 @@
 //! case stays zero-overhead while still handling the occasional 256-bit or
 //! larger BV that shows up in real SMT-LIB queries.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 /// Maximum supported bitvector width. Widths up to this are fully handled;
 /// beyond it we reject at build time to avoid runaway allocations on
@@ -266,10 +266,10 @@ impl BvContext {
             bool_nodes: Vec::new(),
             bv_var_widths: Vec::new(),
             num_bool_vars: 0,
-            bv_hashcons: HashMap::new(),
-            bool_hashcons: HashMap::new(),
+            bv_hashcons: HashMap::default(),
+            bool_hashcons: HashMap::default(),
             wide_values: Vec::new(),
-            wide_interner: HashMap::new(),
+            wide_interner: HashMap::default(),
             select_tables: Vec::new(),
             known_bits: Vec::new(),
         }
