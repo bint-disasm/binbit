@@ -1,0 +1,15 @@
+[package]
+name = "binbit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+# mimalloc is unavailable on WASM (no C runtime to link against).
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
