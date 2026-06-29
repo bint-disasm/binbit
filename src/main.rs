@@ -77,6 +77,14 @@ fn main() {
                     eprintln!("c sat_clauses : {}", s.sat_clauses);
                     eprintln!("c conflicts   : {}", s.conflicts);
                     eprintln!("c decisions   : {}", s.decisions);
+                    eprintln!("c restarts    : {}", s.restarts);
+                    eprintln!("c learned     : {}", s.learned);
+                    eprintln!("c propagations: {}", s.propagations);
+                    eprintln!("c bv_var_total: {}", s.bv_var_total);
+                    eprintln!("c bv_aliased  : {}", s.bv_aliased);
+                    eprintln!("c bool_aliased: {}", s.bool_aliased);
+                    eprintln!("c bv_nodes    : {}", s.bv_nodes_total);
+                    eprintln!("c bv_blasted  : {}", s.bv_vars_bitblasted);
                 }
             }
             Err(e) => {

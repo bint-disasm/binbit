@@ -74,6 +74,14 @@ pub struct SmtSolverStats {
     pub conflicts: u64,
     /// Cumulative decisions across all `solve*` calls this session.
     pub decisions: u64,
+    pub restarts: u64,
+    pub learned: u64,
+    pub propagations: u64,
+    pub bv_aliased: usize,
+    pub bool_aliased: usize,
+    pub bv_var_total: usize,
+    pub bv_nodes_total: usize,
+    pub bv_vars_bitblasted: usize,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -856,11 +864,32 @@ impl SmtSolver {
     /// after `solve*` has flushed the pending queue; before that, the
     /// numbers reflect only clauses emitted by prior solves.
     pub fn sat_stats(&self) -> SmtSolverStats {
+        // Count BV/Bool vars that got merged into another root by alias_*.
+        let bv_aliased = self
+            .bv_var_parent
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| **p as usize != *i)
+            .count();
+        let bool_aliased = self
+            .bool_var_parent
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| **p as usize != *i)
+            .count();
         SmtSolverStats {
             sat_vars: self.sat.num_vars(),
             sat_clauses: self.sat.num_clauses(),
             conflicts: self.sat.stats_conflicts,
             decisions: self.sat.stats_decisions,
+            restarts: self.sat.stats_restarts,
+            learned: self.sat.stats_learned,
+            propagations: self.sat.stats_propagations,
+            bv_aliased,
+            bool_aliased,
+            bv_var_total: self.ctx.bv_var_widths.len(),
+            bv_nodes_total: self.ctx.bv_nodes.len(),
+            bv_vars_bitblasted: self.bv_var_lits.len(),
         }
     }
 

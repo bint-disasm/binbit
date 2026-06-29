@@ -126,6 +126,71 @@ impl ClauseArena {
         let base = c.0 as usize + HDR;
         self.data.swap(base + a, base + b);
     }
+
+    /// Walk every non-deleted clause and pass its literals (as a slice) to
+    /// the closure. Used by preprocessing passes — preprocessing is one-shot
+    /// and doesn't need to be on the propagate hot path, so this just walks
+    /// the arena linearly and skips deleted entries by reading their length.
+    pub fn for_each_clause<F: FnMut(&[Lit])>(&self, mut f: F) {
+        let mut pos = 0usize;
+        while pos + HDR <= self.data.len() {
+            let flags = self.data[pos];
+            let len = self.data[pos + 4] as usize;
+            let body_start = pos + HDR;
+            let end = body_start + len;
+            if end > self.data.len() {
+                break;
+            }
+            if (flags & FLAG_DELETED) == 0 {
+                // SAFETY: Lit is #[repr(transparent)] around u32, and `end`
+                // is bounded by self.data.len(), checked above.
+                let lits = unsafe {
+                    std::slice::from_raw_parts(
+                        self.data.as_ptr().add(body_start) as *const Lit,
+                        len,
+                    )
+                };
+                f(lits);
+            }
+            pos = end;
+        }
+    }
+
+    /// Hint the CPU to start loading this clause's header into L1.
+    /// Caller is expected to read the clause body soon afterwards; the
+    /// prefetch overlaps the cache fill with intervening work. A no-op on
+    /// architectures we don't have an intrinsic for.
+    #[inline(always)]
+    pub fn prefetch(&self, c: ClauseRef) {
+        let idx = c.0 as usize;
+        if idx >= self.data.len() {
+            return;
+        }
+        // SAFETY: bounded above; the prefetch instructions are pure hints
+        // and tolerate any pointer that doesn't cause an access violation.
+        unsafe {
+            let ptr = self.data.as_ptr().add(idx);
+            #[cfg(target_arch = "x86_64")]
+            {
+                core::arch::x86_64::_mm_prefetch(
+                    ptr as *const i8,
+                    core::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                core::arch::asm!(
+                    "prfm pldl1keep, [{p}]",
+                    p = in(reg) ptr,
+                    options(readonly, nostack, preserves_flags),
+                );
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                let _ = ptr;
+            }
+        }
+    }
 }
 
 impl Default for ClauseArena {

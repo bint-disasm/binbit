@@ -22,13 +22,51 @@ enum Reason {
     Binary(Lit),
 }
 
-/// Watcher for long clauses (size >= 3). The blocker is a hint: if it's true
-/// we know the clause is satisfied without having to touch the clause body.
-/// This is MiniSat's standard trick and is a big cache-locality win.
+/// A unified watcher entry. Used for both binary and long clauses, kept in a
+/// single per-literal list. The high bit of `cref` is the "binary" flag:
+///
+/// - **Long clause** (flag clear): `cref` is the arena offset and `blocker`
+///   is MiniSat's standard hint — if it's true we know the clause is
+///   satisfied without touching its body.
+/// - **Binary clause** (flag set): `cref`'s low bits are unused and
+///   `blocker` is the *partner* literal `q` in the clause `(false_lit ∨ q)`.
+///   For a binary entry `blocker` doubles as both the "is the clause
+///   satisfied" hint and the literal we may need to force / conflict on,
+///   so a single lookup of `value_of(blocker)` resolves the whole entry.
+///
+/// Packing binary entries into the same list saves an entire watch-list
+/// traversal (and its `mem::take`/restore round-trip) per propagated
+/// literal — MiniSat 2.2+'s standard layout.
 #[derive(Copy, Clone, Debug)]
 struct Watcher {
     cref: ClauseRef,
     blocker: Lit,
+}
+
+const WATCH_BINARY_FLAG: u32 = 1u32 << 31;
+
+impl Watcher {
+    #[inline]
+    fn long(cref: ClauseRef, blocker: Lit) -> Self {
+        debug_assert!(cref.0 & WATCH_BINARY_FLAG == 0, "clause ref overflows watcher flag bit");
+        Watcher { cref, blocker }
+    }
+    #[inline]
+    fn binary(partner: Lit) -> Self {
+        Watcher {
+            cref: ClauseRef(WATCH_BINARY_FLAG),
+            blocker: partner,
+        }
+    }
+    #[inline]
+    fn is_binary(self) -> bool {
+        self.cref.0 & WATCH_BINARY_FLAG != 0
+    }
+    #[inline]
+    fn long_cref(self) -> ClauseRef {
+        debug_assert!(!self.is_binary());
+        self.cref
+    }
 }
 
 /// Glucose-style adaptive restart policy. Replaces fixed Luby scheduling with
@@ -262,47 +300,55 @@ impl OrderHeap {
 }
 
 pub struct Solver {
+    // === Hot section — touched on every propagate() iteration. ===
+    // Field order here is deliberately packed for cache locality: the inner
+    // propagation loop reads clauses, lit_value, assigns, level, reason,
+    // trail, qhead, and watches together.
     clauses: ClauseArena,
+    // Per-literal assignment table — `lit_value[lit.0]` returns the truth
+    // value of `lit` directly, with no negate branch. When var v is set to
+    // True, lit_value[2v]=True and lit_value[2v+1]=False; unassigning resets
+    // both to Undef. This is the *only* assignment store — a per-variable
+    // `assigns` view used to live alongside but was redundant: a variable's
+    // value is exactly `lit_value[2v]` (the positive literal's value).
+    lit_value: Vec<LBool>,
+    // Per-variable state (indexed by Var.0).
+    level: Vec<i32>,
+    reason: Vec<Reason>,
+    // Trail: assignments in propagation order.
+    trail: Vec<Lit>,
+    qhead: usize,
+    trail_lim: Vec<usize>,
+    // Unified watch lists: one list per literal, holding both binary and
+    // long-clause watchers (see `Watcher` for the layout). Replaces the
+    // older split `watches` / `bin_watches` pair.
+    watches: Vec<Vec<Watcher>>,
+
+    // === Warm — touched during analyze() and branch picking. ===
+    activity: Vec<f64>,
+    polarity: Vec<bool>, // phase saving
+    order_heap: OrderHeap,
+    seen: Vec<bool>,
+    lbd_stamp: Vec<u64>,
+
     // Refs to still-live learned clauses (ones that haven't been deleted by
     // reduce_db). Kept separately from the arena so we can sort + prune
     // without scanning the whole arena.
     learnts: Vec<ClauseRef>,
-    // Total number of clauses ever allocated — just for stats display.
-    num_clauses_total: u64,
 
-    // Per-variable state (indexed by Var.0).
-    assigns: Vec<LBool>,
-    level: Vec<i32>,
-    reason: Vec<Reason>,
-    activity: Vec<f64>,
-    polarity: Vec<bool>, // phase saving
-
-    // Trail: assignments in propagation order.
-    trail: Vec<Lit>,
-    trail_lim: Vec<usize>,
-    qhead: usize,
-
-    // Watches for long clauses (size >= 3).
-    watches: Vec<Vec<Watcher>>,
-    // Binary-clause watches. bin_watches[l] = list of partner literals `q`
-    // such that (l ∨ q) is a clause. When l becomes false, q must be true.
-    bin_watches: Vec<Vec<Lit>>,
-
+    // === Cold — restart policy, DB reduction tuning, VSIDS scaling. ===
     // VSIDS.
     var_inc: f64,
     var_decay: f64,
-    order_heap: OrderHeap,
-
     // Clause activity + decay for DB reduction scoring.
     cla_inc: f64,
     cla_decay: f64,
     // When num_learnts exceeds this, reduce_db runs. Grows each time.
     max_learnts: f64,
-
     // Glucose-style adaptive restart policy.
     restart: RestartState,
 
-    // --- Incremental solving state ---
+    // === Incremental solving state. ===
     // Literals that must hold for the current solve. Each becomes a pseudo-
     // decision at its own level (level 1 = assumptions[0], level 2 =
     // assumptions[1], etc.). Real decisions from VSIDS stack on top.
@@ -312,17 +358,18 @@ pub struct Solver {
     // element is the assumption whose negation fired the conflict.
     conflict_core: Vec<Lit>,
 
-    // Scratch buffers reused across calls (avoid re-allocation).
-    seen: Vec<bool>,
+    // === Scratch buffers used only inside analyze() / lit_redundant(). ===
     // Every variable whose seen[] was set during the current conflict
     // analysis (including minimization). Walked once at the end to reset
     // seen[] to false in bulk.
     analyze_toclear: Vec<Lit>,
     // DFS stack reused by lit_redundant during clause minimization.
     analyze_stack: Vec<Lit>,
-    lbd_stamp: Vec<u64>,
     lbd_counter: u64,
 
+    // === Stats. ===
+    // Total number of clauses ever allocated — just for stats display.
+    num_clauses_total: u64,
     pub stats_conflicts: u64,
     pub stats_decisions: u64,
     pub stats_propagations: u64,
@@ -345,32 +392,31 @@ impl Solver {
     pub fn new() -> Self {
         Solver {
             clauses: ClauseArena::new(),
-            learnts: Vec::new(),
-            num_clauses_total: 0,
-            assigns: Vec::new(),
+            lit_value: Vec::new(),
             level: Vec::new(),
             reason: Vec::new(),
+            trail: Vec::new(),
+            qhead: 0,
+            trail_lim: Vec::new(),
+            watches: Vec::new(),
             activity: Vec::new(),
             polarity: Vec::new(),
-            trail: Vec::new(),
-            trail_lim: Vec::new(),
-            qhead: 0,
-            watches: Vec::new(),
-            bin_watches: Vec::new(),
+            order_heap: OrderHeap::new(),
+            seen: Vec::new(),
+            lbd_stamp: Vec::new(),
+            learnts: Vec::new(),
             var_inc: 1.0,
             var_decay: 0.95,
-            order_heap: OrderHeap::new(),
             cla_inc: 1.0,
             cla_decay: 0.999,
             max_learnts: 0.0,
             restart: RestartState::new(),
             assumptions: Vec::new(),
             conflict_core: Vec::new(),
-            seen: Vec::new(),
             analyze_toclear: Vec::new(),
             analyze_stack: Vec::new(),
-            lbd_stamp: Vec::new(),
             lbd_counter: 0,
+            num_clauses_total: 0,
             stats_conflicts: 0,
             stats_decisions: 0,
             stats_propagations: 0,
@@ -384,7 +430,7 @@ impl Solver {
     }
 
     pub fn num_vars(&self) -> usize {
-        self.assigns.len()
+        self.lit_value.len() >> 1
     }
     pub fn num_clauses(&self) -> usize {
         self.num_clauses_total as usize
@@ -398,7 +444,6 @@ impl Solver {
     /// would otherwise happen as variables and clauses stream in.
     pub fn reserve(&mut self, num_vars: usize, num_clauses: usize) {
         // Per-variable arrays.
-        self.assigns.reserve(num_vars);
         self.level.reserve(num_vars);
         self.reason.reserve(num_vars);
         self.activity.reserve(num_vars);
@@ -407,9 +452,9 @@ impl Solver {
         self.lbd_stamp.reserve(num_vars);
         self.order_heap.reserve(num_vars);
 
-        // One watch list per literal — two per variable.
+        // Per-literal arrays — two entries per variable.
+        self.lit_value.reserve(2 * num_vars);
         self.watches.reserve(2 * num_vars);
-        self.bin_watches.reserve(2 * num_vars);
 
         // Trail holds at most num_vars entries; trail_lim at most num_vars.
         self.trail.reserve(num_vars);
@@ -427,21 +472,21 @@ impl Solver {
     }
 
     pub fn new_var(&mut self) -> Var {
-        let v = Var(self.assigns.len() as u32);
-        self.assigns.push(LBool::Undef);
+        let v = Var((self.lit_value.len() >> 1) as u32);
+        // Per-literal value table — two entries per variable, both Undef.
+        self.lit_value.push(LBool::Undef);
+        self.lit_value.push(LBool::Undef);
         self.level.push(-1);
         self.reason.push(Reason::Decision);
         self.activity.push(0.0);
         self.polarity.push(false);
         self.seen.push(false);
         self.lbd_stamp.push(0);
-        // Two watch lists per variable (positive/negative literal). Prime
-        // them with a small capacity — most literals accumulate several
-        // watchers quickly, and reallocating from 0 → 1 → 2 → 4 adds up.
+        // One unified watch list per literal — two per variable. Prime each
+        // with a small capacity; most literals accumulate several watchers
+        // quickly, and reallocating from 0 → 1 → 2 → 4 adds up.
         self.watches.push(Vec::with_capacity(4));
         self.watches.push(Vec::with_capacity(4));
-        self.bin_watches.push(Vec::with_capacity(2));
-        self.bin_watches.push(Vec::with_capacity(2));
         self.order_heap.new_var();
         self.order_heap.insert(v.0, &self.activity);
         v
@@ -455,15 +500,17 @@ impl Solver {
 
     #[inline]
     pub fn value_of_var(&self, v: Var) -> LBool {
-        self.assigns[v.idx()]
+        // A variable's value is exactly the value of its positive literal,
+        // which lives at `lit_value[2v]`.
+        self.lit_value[(v.0 as usize) << 1]
     }
 
     #[inline]
     pub fn value_of(&self, l: Lit) -> LBool {
-        // `LBool::Undef.negate() == LBool::Undef`, so the explicit Undef check
-        // that once sat here was dead code — this collapses to a single branch.
-        let v = self.assigns[l.var_idx()];
-        if l.is_negated() { v.negate() } else { v }
+        // Branch-free: the per-literal table already encodes negation, so
+        // both `lit` and `!lit` are direct loads. Maintained in lockstep
+        // with `assigns` at every assign / unassign site.
+        self.lit_value[l.0 as usize]
     }
 
     #[inline]
@@ -522,9 +569,10 @@ impl Solver {
             0 => false,
             1 => self.enqueue(lits[0], Reason::Decision), // unit forced at level 0
             2 => {
-                // Binary: skip the arena, store inline in bin_watches.
-                self.bin_watches[lits[0].idx()].push(lits[1]);
-                self.bin_watches[lits[1].idx()].push(lits[0]);
+                // Binary: skip the arena, store inline as binary watchers
+                // in the same unified list used for long clauses.
+                self.watches[lits[0].idx()].push(Watcher::binary(lits[1]));
+                self.watches[lits[1].idx()].push(Watcher::binary(lits[0]));
                 true
             }
             _ => {
@@ -532,14 +580,8 @@ impl Solver {
                 let w1 = lits[1];
                 let cref = self.clauses.alloc(&lits, false);
                 self.num_clauses_total += 1;
-                self.watches[w0.idx()].push(Watcher {
-                    cref,
-                    blocker: w1,
-                });
-                self.watches[w1.idx()].push(Watcher {
-                    cref,
-                    blocker: w0,
-                });
+                self.watches[w0.idx()].push(Watcher::long(cref, w1));
+                self.watches[w1.idx()].push(Watcher::long(cref, w0));
                 true
             }
         }
@@ -553,7 +595,8 @@ impl Solver {
             LBool::False => false,
             LBool::Undef => {
                 let vi = lit.var_idx();
-                self.assigns[vi] = LBool::from_bool(!lit.is_negated());
+                self.lit_value[lit.0 as usize] = LBool::True;
+                self.lit_value[(lit.0 ^ 1) as usize] = LBool::False;
                 self.level[vi] = self.decision_level();
                 self.reason[vi] = reason;
                 self.trail.push(lit);
@@ -562,125 +605,258 @@ impl Solver {
         }
     }
 
-    /// Unit propagation via two-watched literals with a binary-clause fast
-    /// path and MiniSat-style blockers on long clauses. Returns `Some` on
-    /// conflict, tagging whether it was a binary or long-clause conflict.
+    /// Unit propagation via two-watched literals over a single unified
+    /// per-literal watch list (MiniSat 2.2+ layout). Binary and long
+    /// clauses share one traversal: a binary entry's `blocker` IS the
+    /// partner literal, so a single `value_of(blocker)` resolves it; a
+    /// long entry's `blocker` is the standard hint.
+    ///
+    /// Several layers of optimization stack here:
+    /// - **Disjoint field references**: `self` is destructured once so each
+    ///   hot field is its own `&mut` reference, letting the compiler see
+    ///   non-aliasing across the loop body.
+    /// - **Lazy two-watched management**: we don't eagerly swap `lits[0]`
+    ///   and `lits[1]` on every visit; instead we read both and remember
+    ///   which slot held `false_lit`. The arena write only happens when we
+    ///   actually migrate a watch.
+    /// - **Raw-pointer two-cursor iteration**: the watch list is compacted
+    ///   in place with `read`/`write` pointers — no per-element bound
+    ///   checks on the inner `ws[i]` / `ws[j]` accesses.
+    /// - **`get_unchecked` on indexed accesses** whose bounds are program
+    ///   invariants (every `Lit.0 < 2 * num_vars == lit_value.len()`,
+    ///   every variable index is < `level.len() / reason.len()`, etc.).
+    /// - **Software prefetch** of the next watcher's clause header.
+    ///
+    /// Returns `Some` on conflict, tagging binary vs long-clause.
     fn propagate(&mut self) -> Option<PropConflict> {
+        // Destructure `self` into disjoint mutable references. The compiler
+        // can prove non-aliasing between distinct fields, so each access
+        // inside the loop becomes a clean pointer/index op without the
+        // implicit "borrow checker barrier" of `self.field` projections.
+        let Solver {
+            clauses,
+            lit_value,
+            level,
+            reason,
+            trail,
+            trail_lim,
+            watches,
+            qhead,
+            stats_propagations,
+            ..
+        } = self;
+
+        // Decision level is invariant across one propagate() call.
+        let dl = trail_lim.len() as i32;
+        // Snapshot for stats — single accumulator update at the end.
+        let qhead_start = *qhead;
         let mut conflict: Option<PropConflict> = None;
 
-        'queue: while self.qhead < self.trail.len() {
-            let p = self.trail[self.qhead];
-            self.qhead += 1;
-            self.stats_propagations += 1;
+        'queue: while *qhead < trail.len() {
+            // SAFETY: the loop guard just established `*qhead < trail.len()`.
+            let p = unsafe { *trail.get_unchecked(*qhead) };
+            *qhead += 1;
 
-            // --- Binary propagation: fast path. ---
-            // p is now true, so !p is false. Any binary clause (!p ∨ q) needs
-            // q to be forced (or is already satisfied, or conflicts).
+            // p is now true, so !p is false. Visit every watcher of !p.
             let false_lit = !p;
-            {
-                let bws = std::mem::take(&mut self.bin_watches[false_lit.idx()]);
-                for &q in &bws {
-                    match self.value_of(q) {
+            let wl_idx = false_lit.idx();
+
+            // Detach this slot so long-clause migrations can push to other
+            // slots of `watches` without aliasing it. Binaries never
+            // migrate — they always get copied through to the write cursor.
+            //
+            // SAFETY: every literal on the trail is a valid Lit, so its
+            // index is < 2 * num_vars == watches.len().
+            let mut ws = std::mem::take(unsafe { watches.get_unchecked_mut(wl_idx) });
+
+            // Two-cursor compaction: `read` walks forward consuming entries,
+            // `write` lags behind recording the survivors. Final length is
+            // `write.offset_from(start)`.
+            let start_ptr = ws.as_mut_ptr();
+            let mut read = start_ptr;
+            let mut write = start_ptr;
+            // SAFETY: ws.len() is the valid extent of the buffer; `add` stays
+            // within (or one past) the allocation as required by the API.
+            let end = unsafe { start_ptr.add(ws.len()) };
+
+            'watches: while read < end {
+                // SAFETY: `read < end` and `end == start + len`, so `read`
+                // points to an initialized Watcher within the buffer.
+                let w = unsafe { *read };
+                // SAFETY: after this advance, `read <= end`. Subsequent
+                // reads are guarded by the `read < end` loop condition.
+                read = unsafe { read.add(1) };
+
+                // Software prefetch of the *next* watcher's clause body.
+                // We've already advanced `read` past the current entry, so
+                // `*read` (when read < end) is the upcoming watcher.
+                if read < end {
+                    let nw = unsafe { *read };
+                    if !nw.is_binary() {
+                        clauses.prefetch(nw.long_cref());
+                    }
+                }
+
+                // One lookup serves both clause shapes: for binary entries
+                // `blocker` IS the partner; for long entries it's a hint.
+                // SAFETY: blocker is a valid Lit, so blocker.0 < lit_value.len().
+                let bv = unsafe { *lit_value.get_unchecked(w.blocker.0 as usize) };
+
+                if w.is_binary() {
+                    // Binary path: blocker == q. Binaries never migrate, so
+                    // unconditionally copy through to the write cursor.
+                    let q = w.blocker;
+                    // SAFETY: `write <= read - 1 < end`.
+                    unsafe { *write = w };
+                    write = unsafe { write.add(1) };
+
+                    match bv {
                         LBool::True => {} // satisfied
                         LBool::Undef => {
-                            let vi = q.var_idx();
-                            self.assigns[vi] = LBool::from_bool(!q.is_negated());
-                            self.level[vi] = self.decision_level();
-                            self.reason[vi] = Reason::Binary(false_lit);
-                            self.trail.push(q);
+                            let vq = q.var_idx();
+                            // SAFETY: q.0 < lit_value.len() and vq < level.len() / reason.len().
+                            unsafe {
+                                *lit_value.get_unchecked_mut(q.0 as usize) = LBool::True;
+                                *lit_value.get_unchecked_mut((q.0 ^ 1) as usize) = LBool::False;
+                                *level.get_unchecked_mut(vq) = dl;
+                                *reason.get_unchecked_mut(vq) = Reason::Binary(false_lit);
+                            }
+                            trail.push(q);
                         }
                         LBool::False => {
-                            // Both !p and q false — conflict on binary clause.
-                            self.bin_watches[false_lit.idx()] = bws;
+                            // Both !p and q false — binary conflict. Copy
+                            // remaining watchers and exit the queue loop.
+                            while read < end {
+                                unsafe {
+                                    *write = *read;
+                                    read = read.add(1);
+                                    write = write.add(1);
+                                }
+                            }
+                            // SAFETY: write is between start_ptr and end, all
+                            // entries in [start, write) are initialized.
+                            let new_len = unsafe { write.offset_from(start_ptr) } as usize;
+                            unsafe { ws.set_len(new_len) };
+                            unsafe { *watches.get_unchecked_mut(wl_idx) = ws };
                             conflict = Some(PropConflict::Binary(false_lit, q));
                             break 'queue;
                         }
                     }
-                }
-                self.bin_watches[false_lit.idx()] = bws;
-            }
-
-            // --- Long-clause propagation with blockers. ---
-            let wl_idx = false_lit.idx();
-            let mut ws = std::mem::take(&mut self.watches[wl_idx]);
-            let mut i = 0usize;
-            let mut j = 0usize;
-
-            'watches: while i < ws.len() {
-                let w = ws[i];
-                i += 1;
-
-                // Blocker hint: if the blocker is true, this clause is
-                // satisfied and we skip touching its body.
-                if self.value_of(w.blocker) == LBool::True {
-                    ws[j] = w;
-                    j += 1;
                     continue 'watches;
                 }
 
-                let cref = w.cref;
-
-                if self.clauses.get_lit(cref, 0) == false_lit {
-                    self.clauses.swap_lits(cref, 0, 1);
-                }
-                let first = self.clauses.get_lit(cref, 0);
-                let first_val = self.value_of(first);
-
-                // Refresh blocker hint to `first` — a cheap opportunistic update.
-                if first_val == LBool::True {
-                    ws[j] = Watcher {
-                        cref,
-                        blocker: first,
-                    };
-                    j += 1;
+                // Long-clause path. If the blocker is true, the clause is
+                // satisfied — keep the watch verbatim.
+                if bv == LBool::True {
+                    unsafe { *write = w };
+                    write = unsafe { write.add(1) };
                     continue 'watches;
                 }
 
-                let clen = self.clauses.len(cref);
-                for k in 2..clen {
-                    let lk = self.clauses.get_lit(cref, k);
-                    if self.value_of(lk) != LBool::False {
-                        // After swap, lits[1] == lk — we already have the value
-                        // in a register, no need to re-read from the arena.
-                        self.clauses.swap_lits(cref, 1, k);
-                        self.watches[lk.idx()].push(Watcher {
-                            cref,
-                            blocker: first,
-                        });
-                        continue 'watches;
+                let cref = w.long_cref();
+
+                // Ensure lits[1] == false_lit so lits[0] is the "other"
+                // watch. We do this eagerly — a lazy variant was tried but
+                // changed the cross-visit arena state enough to shift
+                // propagation order, pushing one instance over the SMT-bench
+                // timeout cliff. Eager keeps propagation behavior identical
+                // to the pre-Tier 3 baseline.
+                if clauses.get_lit(cref, 0) == false_lit {
+                    clauses.swap_lits(cref, 0, 1);
+                }
+
+                let (first, first_val, found) = {
+                    let lits = clauses.lits(cref);
+                    // SAFETY: every long clause has length >= 3 by construction.
+                    let first = unsafe { *lits.get_unchecked(0) };
+                    // SAFETY: first is a valid Lit.
+                    let first_val =
+                        unsafe { *lit_value.get_unchecked(first.0 as usize) };
+
+                    if first_val == LBool::True {
+                        // Skip the inner scan — clause is satisfied by `first`.
+                        (first, first_val, None)
+                    } else {
+                        let mut found: Option<(usize, Lit)> = None;
+                        let n = lits.len();
+                        let mut k = 2usize;
+                        while k < n {
+                            // SAFETY: k < n == lits.len().
+                            let lk = unsafe { *lits.get_unchecked(k) };
+                            // SAFETY: lk.0 < lit_value.len().
+                            let lkv = unsafe { *lit_value.get_unchecked(lk.0 as usize) };
+                            if lkv != LBool::False {
+                                found = Some((k, lk));
+                                break;
+                            }
+                            k += 1;
+                        }
+                        (first, first_val, found)
                     }
+                };
+
+                if first_val == LBool::True {
+                    // Refresh blocker hint and keep watch.
+                    unsafe { *write = Watcher::long(cref, first) };
+                    write = unsafe { write.add(1) };
+                    continue 'watches;
                 }
 
-                // No replacement watch — keep this one in place.
-                ws[j] = Watcher {
-                    cref,
-                    blocker: first,
-                };
-                j += 1;
+                if let Some((k, lk)) = found {
+                    // Migrate: lits[1] holds false_lit (post-eager-swap);
+                    // swap with k so lk takes the watch and false_lit
+                    // moves into the body.
+                    clauses.swap_lits(cref, 1, k);
+                    // SAFETY: lk is a valid Lit, lk.idx() < watches.len().
+                    unsafe {
+                        watches
+                            .get_unchecked_mut(lk.idx())
+                            .push(Watcher::long(cref, first));
+                    }
+                    continue 'watches;
+                }
+
+                // No replacement watch — keep this one with refreshed blocker.
+                unsafe { *write = Watcher::long(cref, first) };
+                write = unsafe { write.add(1) };
 
                 if first_val == LBool::False {
-                    while i < ws.len() {
-                        ws[j] = ws[i];
-                        i += 1;
-                        j += 1;
+                    // Long-clause conflict. Copy remainder and exit.
+                    while read < end {
+                        unsafe {
+                            *write = *read;
+                            read = read.add(1);
+                            write = write.add(1);
+                        }
                     }
-                    ws.truncate(j);
-                    self.watches[wl_idx] = ws;
+                    let new_len = unsafe { write.offset_from(start_ptr) } as usize;
+                    unsafe { ws.set_len(new_len) };
+                    unsafe { *watches.get_unchecked_mut(wl_idx) = ws };
                     conflict = Some(PropConflict::Clause(cref));
                     break 'queue;
                 } else {
+                    // Unit prop on `first`. The eager swap above already
+                    // put `first` at lits[0], which is the invariant that
+                    // `analyze` and `lit_redundant` rely on when walking
+                    // a reason clause (they skip lits[0] as the pivot).
                     let vi = first.var_idx();
-                    self.assigns[vi] = LBool::from_bool(!first.is_negated());
-                    self.level[vi] = self.decision_level();
-                    self.reason[vi] = Reason::Clause(cref);
-                    self.trail.push(first);
+                    unsafe {
+                        *lit_value.get_unchecked_mut(first.0 as usize) = LBool::True;
+                        *lit_value.get_unchecked_mut((first.0 ^ 1) as usize) =
+                            LBool::False;
+                        *level.get_unchecked_mut(vi) = dl;
+                        *reason.get_unchecked_mut(vi) = Reason::Clause(cref);
+                    }
+                    trail.push(first);
                 }
             }
 
-            ws.truncate(j);
-            self.watches[wl_idx] = ws;
+            let new_len = unsafe { write.offset_from(start_ptr) } as usize;
+            unsafe { ws.set_len(new_len) };
+            unsafe { *watches.get_unchecked_mut(wl_idx) = ws };
         }
 
+        *stats_propagations += (*qhead - qhead_start) as u64;
         conflict
     }
 
@@ -1017,7 +1193,10 @@ impl Solver {
             let lit = self.trail[i];
             let vi = lit.var_idx();
             self.polarity[vi] = !lit.is_negated();
-            self.assigns[vi] = LBool::Undef;
+            // Reset both polarities in the per-literal table.
+            let pos = (lit.0 & !1) as usize;
+            self.lit_value[pos] = LBool::Undef;
+            self.lit_value[pos | 1] = LBool::Undef;
             self.level[vi] = -1;
             self.reason[vi] = Reason::Decision;
             self.order_heap.insert(lit.var().0, &self.activity);
@@ -1139,17 +1318,17 @@ impl Solver {
         self.learnts = new_learnts;
 
         // Clean up watch lists: drop watchers pointing at deleted clauses.
-        // Check the arena's deleted flag directly rather than threading a
-        // mask through.
+        // Binary watchers don't refer to the arena at all (their cref is a
+        // sentinel), so they're always preserved.
         let clauses = &self.clauses;
         for wl in &mut self.watches {
-            wl.retain(|w| !clauses.deleted(w.cref));
+            wl.retain(|w| w.is_binary() || !clauses.deleted(w.long_cref()));
         }
     }
 
     fn pick_branch_lit(&mut self) -> Option<Lit> {
         while let Some(v) = self.order_heap.pop(&self.activity) {
-            if self.assigns[v as usize] == LBool::Undef {
+            if self.lit_value[(v as usize) << 1] == LBool::Undef {
                 let lit = Lit::new(Var(v), !self.polarity[v as usize]);
                 return Some(lit);
             }
@@ -1157,6 +1336,83 @@ impl Solver {
             // popping. (It'll re-enter on the next backtrack.)
         }
         None
+    }
+
+    /// Jeroslow-Wang one-sided heuristic. For each variable v, score its
+    /// positive and negative literal as `J(l) = Σ_{C ∋ l} 2^-|C|` — short
+    /// clauses contribute exponentially more, since they're more constraining.
+    /// The polarity with the higher score is the one we pick first when the
+    /// var gets selected by VSIDS.
+    ///
+    /// **Not wired in by default.** Empirically didn't help (and on some
+    /// catchconv SAT traces it hurt by ~80%) — kept around as an opt-in for
+    /// callers who want to experiment. Best called once, after all input
+    /// clauses are loaded but before the first `solve*` — phase saving will
+    /// then carry the seed forward across incremental queries.
+    pub fn init_polarity_jw(&mut self) {
+        let n = self.polarity.len();
+        if n == 0 {
+            return;
+        }
+        let mut pos_score: Vec<f64> = vec![0.0; n];
+        let mut neg_score: Vec<f64> = vec![0.0; n];
+
+        // Long clauses live in the arena. Walk them.
+        let pos_ref = &mut pos_score;
+        let neg_ref = &mut neg_score;
+        self.clauses.for_each_clause(|lits| {
+            let w = 2f64.powi(-(lits.len() as i32));
+            for &l in lits {
+                let v = l.var_idx();
+                if l.is_negated() {
+                    neg_ref[v] += w;
+                } else {
+                    pos_ref[v] += w;
+                }
+            }
+        });
+
+        // Binary clauses are stored inline in the watch lists with the binary
+        // flag set on the watcher. Each binary appears twice (once per
+        // literal's slot); dedupe by counting it only when the slot's literal
+        // sorts below its partner.
+        let bin_w = 0.25_f64; // 2^-2
+        for i in 0..self.watches.len() {
+            let lit_a = Lit(i as u32);
+            for w in &self.watches[i] {
+                if !w.is_binary() {
+                    continue;
+                }
+                let lit_b = w.blocker;
+                if lit_a.0 >= lit_b.0 {
+                    continue;
+                }
+                let va = lit_a.var_idx();
+                if lit_a.is_negated() {
+                    neg_score[va] += bin_w;
+                } else {
+                    pos_score[va] += bin_w;
+                }
+                let vb = lit_b.var_idx();
+                if lit_b.is_negated() {
+                    neg_score[vb] += bin_w;
+                } else {
+                    pos_score[vb] += bin_w;
+                }
+            }
+        }
+
+        // Classical JW: prefer the more-frequent polarity (the one expected
+        // to satisfy more clauses per assignment).
+        for v in 0..n {
+            let p = pos_score[v];
+            let q = neg_score[v];
+            if p > q {
+                self.polarity[v] = true;
+            } else if q > p {
+                self.polarity[v] = false;
+            }
+        }
     }
 
     /// Solve the current formula. Equivalent to `solve_under_assumptions(&[])`.
@@ -1286,8 +1542,8 @@ impl Solver {
                     2 => {
                         let a = learned[0];
                         let b = learned[1];
-                        self.bin_watches[a.idx()].push(b);
-                        self.bin_watches[b.idx()].push(a);
+                        self.watches[a.idx()].push(Watcher::binary(b));
+                        self.watches[b.idx()].push(Watcher::binary(a));
                         self.enqueue(a, Reason::Binary(b));
                     }
                     _ => {
@@ -1297,14 +1553,8 @@ impl Solver {
                         self.num_clauses_total += 1;
                         self.clauses.set_lbd(cref, lbd);
                         self.learnts.push(cref);
-                        self.watches[w0.idx()].push(Watcher {
-                            cref,
-                            blocker: w1,
-                        });
-                        self.watches[w1.idx()].push(Watcher {
-                            cref,
-                            blocker: w0,
-                        });
+                        self.watches[w0.idx()].push(Watcher::long(cref, w1));
+                        self.watches[w1.idx()].push(Watcher::long(cref, w0));
                         self.bump_clause_activity(cref);
                         self.enqueue(w0, Reason::Clause(cref));
                     }
@@ -1385,7 +1635,7 @@ impl Solver {
     pub fn model_dimacs(&self) -> Vec<i32> {
         (0..self.num_vars())
             .map(|v| {
-                let sign = match self.assigns[v] {
+                let sign = match self.lit_value[v << 1] {
                     LBool::True => 1,
                     LBool::False => -1,
                     LBool::Undef => 1,
