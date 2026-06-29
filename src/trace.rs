@@ -50,8 +50,7 @@ pub fn dump_smtlib(solver: &SmtSolver, assertions: &[BoolTerm]) -> String {
         s: solver,
         bv_label: HashMap::new(),
         bool_label: HashMap::new(),
-        bv_order: Vec::new(),
-        bool_order: Vec::new(),
+        order: Vec::new(),
         bv_vars: Vec::new(),
         bool_vars: Vec::new(),
         counter: 0,
@@ -62,12 +61,21 @@ pub fn dump_smtlib(solver: &SmtSolver, assertions: &[BoolTerm]) -> String {
     p.emit(assertions)
 }
 
+/// A single entry in the topological emit order — either a BV or Bool
+/// `define-fun`. We keep one combined order list so BV defines that
+/// reference Bool symbols (via `ite p ...`) are still emitted *after*
+/// those Bool defines — without this, parsers reject the dump on
+/// "unknown symbol p<n>".
+enum OrderEntry {
+    Bv(BvTerm),
+    Bool(BoolTerm),
+}
+
 struct Printer<'a> {
     s: &'a SmtSolver,
     bv_label: HashMap<BvTerm, String>,
     bool_label: HashMap<BoolTerm, String>,
-    bv_order: Vec<BvTerm>,
-    bool_order: Vec<BoolTerm>,
+    order: Vec<OrderEntry>,
     bv_vars: Vec<(u32, u32)>, // (var_id, width)
     bool_vars: Vec<u32>,
     counter: u32,
@@ -125,7 +133,7 @@ impl<'a> Printer<'a> {
         }
         let lbl = self.fresh("bv");
         self.bv_label.insert(t, lbl);
-        self.bv_order.push(t);
+        self.order.push(OrderEntry::Bv(t));
     }
 
     fn visit_bool(&mut self, t: BoolTerm) {
@@ -160,7 +168,7 @@ impl<'a> Printer<'a> {
         }
         let lbl = self.fresh("p");
         self.bool_label.insert(t, lbl);
-        self.bool_order.push(t);
+        self.order.push(OrderEntry::Bool(t));
     }
 
     fn render_bv(&self, t: BvTerm) -> String {
@@ -355,20 +363,28 @@ impl<'a> Printer<'a> {
         for &id in &self.bool_vars {
             let _ = writeln!(out, "(declare-fun p{} () Bool)", id);
         }
-        for &t in &self.bv_order {
-            let w = self.s.ctx.width_of(t);
-            let _ = writeln!(
-                out,
-                "(define-fun {} () (_ BitVec {}) {})",
-                self.bv_label[&t], w, self.render_bv_rhs(t),
-            );
-        }
-        for &t in &self.bool_order {
-            let _ = writeln!(
-                out,
-                "(define-fun {} () Bool {})",
-                self.bool_label[&t], self.render_bool_rhs(t),
-            );
+        // Single combined order so cross-type references (`(ite p ...)`
+        // inside a BV define) resolve at parse time. Both visit functions
+        // push to `self.order` post-recursion, so the list is already
+        // topologically sorted across both kinds of nodes.
+        for entry in &self.order {
+            match entry {
+                OrderEntry::Bv(t) => {
+                    let w = self.s.ctx.width_of(*t);
+                    let _ = writeln!(
+                        out,
+                        "(define-fun {} () (_ BitVec {}) {})",
+                        self.bv_label[t], w, self.render_bv_rhs(*t),
+                    );
+                }
+                OrderEntry::Bool(t) => {
+                    let _ = writeln!(
+                        out,
+                        "(define-fun {} () Bool {})",
+                        self.bool_label[t], self.render_bool_rhs(*t),
+                    );
+                }
+            }
         }
         for &a in assertions {
             let _ = writeln!(out, "(assert {})", self.render_bool(a));

@@ -1229,16 +1229,19 @@ impl SmtSolver {
                 output
             }
             BvOp::Popcount(x) => {
-                let expanded = self.build_popcount_expansion(x);
-                self.bitblast_bv(expanded)
+                let xb = self.bitblast_bv(x);
+                let w = self.ctx.width_of(x) as usize;
+                self.mk_popcount(&xb, w)
             }
             BvOp::Clz(x) => {
-                let expanded = self.build_clz_expansion(x);
-                self.bitblast_bv(expanded)
+                let xb = self.bitblast_bv(x);
+                let w = self.ctx.width_of(x) as usize;
+                self.mk_clz(&xb, w)
             }
             BvOp::Ctz(x) => {
-                let expanded = self.build_ctz_expansion(x);
-                self.bitblast_bv(expanded)
+                let xb = self.bitblast_bv(x);
+                let w = self.ctx.width_of(x) as usize;
+                self.mk_ctz(&xb, w)
             }
             BvOp::RotateLeft(x, amount) => {
                 let expanded = self.build_rotate_dyn_expansion(x, amount, true);
@@ -1722,75 +1725,164 @@ impl SmtSolver {
         (sum, cout)
     }
 
-    /// Build a divide-and-conquer popcount tree for `x` as BV terms. The
-    /// resulting term is then bitblasted by the caller via the normal
-    /// dispatch path. Each level pairs adjacent partial sums, zero-extends
-    /// by one bit, and adds — total gate count is O(W log W) instead of
-    /// the chained-add form's O(W²).
-    fn build_popcount_expansion(&mut self, x: BvTerm) -> BvTerm {
-        let w = self.ctx.width_of(x);
-        debug_assert!(w >= 2, "single-bit popcount short-circuited in bv_popcount");
-        let mut layer: Vec<BvTerm> = (0..w)
-            .map(|i| self.ctx.bv_extract(x, i, i))
-            .collect();
-        let mut layer_w: u32 = 1;
-        while layer.len() > 1 {
-            let next_w = layer_w + 1;
-            let mut next: Vec<BvTerm> = Vec::with_capacity(layer.len().div_ceil(2));
-            let mut it = layer.into_iter();
-            while let Some(a) = it.next() {
-                let a_e = self.ctx.bv_zero_extend(a, next_w - layer_w);
-                match it.next() {
-                    Some(b) => {
-                        let b_e = self.ctx.bv_zero_extend(b, next_w - layer_w);
-                        next.push(self.ctx.bv_add(a_e, b_e));
-                    }
-                    None => next.push(a_e),
+    /// Wallace-tree population count. Takes `W` 1-bit inputs and produces
+    /// the popcount in `out_width` bits, zero-extended.
+    ///
+    /// Each input contributes to "column 0" (weight 2⁰). Repeated 3:2
+    /// compression — three bits in a column → one sum bit (same column) +
+    /// one carry bit (next column) via a full adder — drives every column
+    /// down to ≤2 rows. A final ripple-carry add combines the two rows.
+    /// Total ≈ W full adders for the compression + log(W) for the final
+    /// add — about 2-3× cheaper than the divide-and-conquer tree the
+    /// builder used to compose at the BV layer.
+    fn mk_popcount(&mut self, inputs: &[Lit], out_width: usize) -> Vec<Lit> {
+        if inputs.is_empty() {
+            return vec![!self.get_true_lit(); out_width];
+        }
+        if inputs.len() == 1 {
+            // 1-bit popcount is the bit itself, zero-extended.
+            let mut out = vec![!self.get_true_lit(); out_width];
+            out[0] = inputs[0];
+            return out;
+        }
+        // columns[k] holds the bits at column k (weight 2^k). Each
+        // compression round walks all columns, pulls groups of 3, and
+        // pushes (sum, carry) into the next round's columns. Leftover bits
+        // (0 to 2 per column per round) pass through. Loop ends when every
+        // column has ≤ 2 rows.
+        let mut columns: Vec<Vec<Lit>> = vec![inputs.to_vec()];
+        loop {
+            let mut any_above_two = false;
+            // Allocate one extra slot at the top for carries out of the
+            // highest current column.
+            let mut next: Vec<Vec<Lit>> = vec![Vec::new(); columns.len() + 1];
+            for k in 0..columns.len() {
+                let col = std::mem::take(&mut columns[k]);
+                let mut i = 0;
+                while i + 3 <= col.len() {
+                    let (sum, cout) =
+                        self.mk_full_adder(col[i], col[i + 1], col[i + 2]);
+                    next[k].push(sum);
+                    next[k + 1].push(cout);
+                    i += 3;
+                }
+                while i < col.len() {
+                    next[k].push(col[i]);
+                    i += 1;
+                }
+                if next[k].len() > 2 {
+                    any_above_two = true;
                 }
             }
-            layer = next;
-            layer_w = next_w;
+            // Trim trailing empty columns so the loop bound stays tight.
+            while next.last().map(|c| c.is_empty()).unwrap_or(false) {
+                next.pop();
+            }
+            columns = next;
+            if !any_above_two {
+                break;
+            }
         }
-        let result = layer[0];
-        if layer_w < w {
-            self.ctx.bv_zero_extend(result, w - layer_w)
-        } else {
-            result
+        // Pad each column out to two rows (with constant zeros where
+        // missing) and ripple-carry-add.
+        let false_lit = !self.get_true_lit();
+        let n_cols = columns.len();
+        let mut row1: Vec<Lit> = Vec::with_capacity(n_cols);
+        let mut row2: Vec<Lit> = Vec::with_capacity(n_cols);
+        for k in 0..n_cols {
+            match columns[k].len() {
+                0 => {
+                    row1.push(false_lit);
+                    row2.push(false_lit);
+                }
+                1 => {
+                    row1.push(columns[k][0]);
+                    row2.push(false_lit);
+                }
+                2 => {
+                    row1.push(columns[k][0]);
+                    row2.push(columns[k][1]);
+                }
+                _ => unreachable!("post-compression column has > 2 bits"),
+            }
         }
+        let (sum, cout) = self.ripple_carry_add(&row1, &row2, false_lit);
+        // Combine sum + overflow into one output vector, then fit to out_width.
+        let mut result = sum;
+        result.push(cout);
+        if result.len() < out_width {
+            result.resize(out_width, false_lit);
+        } else if result.len() > out_width {
+            result.truncate(out_width);
+        }
+        result
     }
 
-    /// Build the CLZ expansion as `popcount(~(x | x>>1 | x>>2 | ...))`.
-    /// The OR-fold drags the highest set bit downward so every bit at-or-
-    /// below it becomes 1; the popcount-of-not then counts the cleared
-    /// (leading-zero) bits.
-    fn build_clz_expansion(&mut self, x: BvTerm) -> BvTerm {
-        let w = self.ctx.width_of(x);
-        debug_assert!(w >= 2, "single-bit CLZ short-circuited in bv_clz");
-        let mut y = x;
-        let mut k = 1u32;
+    /// CLZ via `popcount(~(x | x>>1 | x>>2 | ... | x>>(w/2)))` at the lit
+    /// level. The shifts are structural (just slot-shift the input lit
+    /// vector with `false_lit` filling the gaps), and the OR / NOT are
+    /// per-bit at lit level — so the only real gates come from the final
+    /// popcount Wallace tree.
+    fn mk_clz(&mut self, inputs: &[Lit], out_width: usize) -> Vec<Lit> {
+        let w = inputs.len();
+        if w == 0 {
+            return vec![!self.get_true_lit(); out_width];
+        }
+        if w == 1 {
+            // clz of a 1-bit value is just !x.
+            let mut out = vec![!self.get_true_lit(); out_width];
+            out[0] = !inputs[0];
+            return out;
+        }
+        let false_lit = !self.get_true_lit();
+        // OR-fold: every bit at-or-below the highest set bit becomes 1.
+        // Shifts are by 1, 2, 4, ... up to < w. Bit i of `y >>L k` is
+        // y[i+k] for i+k < w, else false.
+        let mut y: Vec<Lit> = inputs.to_vec();
+        let mut k = 1usize;
         while k < w {
-            let shift = self.ctx.bv_const(k as u128, w);
-            let shifted = self.ctx.bv_lshr(y, shift);
-            y = self.ctx.bv_or(y, shifted);
+            let shifted: Vec<Lit> = (0..w)
+                .map(|i| if i + k < w { y[i + k] } else { false_lit })
+                .collect();
+            for i in 0..w {
+                y[i] = self.mk_or(y[i], shifted[i]);
+            }
             k <<= 1;
         }
-        let ny = self.ctx.bv_not(y);
-        self.build_popcount_expansion(ny)
+        let ny: Vec<Lit> = y.iter().map(|&l| !l).collect();
+        self.mk_popcount(&ny, out_width)
     }
 
-    /// Build the CTZ expansion as `popcount(~x & (x - 1))`. `x - 1` clears
-    /// the lowest set bit and sets all bits below it; ANDing with `~x`
-    /// isolates exactly the trailing-zero positions, so their popcount is
-    /// the CTZ. For `x == 0` the masks collapse to all-ones whose popcount
-    /// is `width`, matching the SMT-LIB convention.
-    fn build_ctz_expansion(&mut self, x: BvTerm) -> BvTerm {
-        let w = self.ctx.width_of(x);
-        debug_assert!(w >= 2, "single-bit CTZ short-circuited in bv_ctz");
-        let one = self.ctx.bv_const(1, w);
-        let xm1 = self.ctx.bv_sub(x, one);
-        let nx = self.ctx.bv_not(x);
-        let m = self.ctx.bv_and(nx, xm1);
-        self.build_popcount_expansion(m)
+    /// CTZ via `popcount(~x & (x - 1))` at the lit level. The mask
+    /// `~x & (x - 1)` has exactly one bit set for each trailing zero of `x`
+    /// (and is all-ones when `x == 0`, giving the SMT-LIB convention of
+    /// `ctz(0) = width`).
+    fn mk_ctz(&mut self, inputs: &[Lit], out_width: usize) -> Vec<Lit> {
+        let w = inputs.len();
+        if w == 0 {
+            return vec![!self.get_true_lit(); out_width];
+        }
+        if w == 1 {
+            let mut out = vec![!self.get_true_lit(); out_width];
+            out[0] = !inputs[0];
+            return out;
+        }
+        let true_lit = self.get_true_lit();
+        let false_lit = !true_lit;
+        // Build the constant `1` as a bit-vector of the right width.
+        let mut one_bits: Vec<Lit> = vec![false_lit; w];
+        one_bits[0] = true_lit;
+        // x - 1 is x + (~1) + 1 — but easier to just call ripple_carry_add
+        // with the negation. Specifically: x - 1 = x + 2^w - 1, i.e., add
+        // all-ones with no carry in, and discard the overflow. Equivalent
+        // to flipping the input to all-ones and ripple-adding.
+        let all_ones: Vec<Lit> = vec![true_lit; w];
+        let (xm1, _cout) = self.ripple_carry_add(inputs, &all_ones, false_lit);
+        // m = ~x & (x - 1)
+        let m: Vec<Lit> = (0..w)
+            .map(|i| self.mk_and(!inputs[i], xm1[i]))
+            .collect();
+        self.mk_popcount(&m, out_width)
     }
 
     /// Build a symbolic-amount rotation as a log-tree of conditional
