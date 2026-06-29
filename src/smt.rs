@@ -96,6 +96,33 @@ pub struct IteGate {
     pub source_term: Option<BvTerm>,
 }
 
+/// One row of the bitblast-cost report — see [`SmtSolver::bitblast_cost_report`].
+/// `sat_vars` / `sat_clauses` are *exclusive* of subterms: when this term
+/// hash-cons'd a child that had already been bitblasted, the child's cost
+/// stayed on the child's own row.
+#[derive(Copy, Clone, Debug)]
+pub struct BitblastCostEntry {
+    pub term: BvTerm,
+    pub width: u32,
+    pub sat_vars: usize,
+    pub sat_clauses: usize,
+}
+
+/// Bookkeeping for a single in-flight `bitblast_bv` call. Pushed at entry,
+/// popped at exit; child calls suspend the parent's accumulator and resume
+/// it after returning so exclusive cost is correctly attributed per term.
+struct BitblastCostFrame {
+    term: BvTerm,
+    /// SAT counters at the moment this frame was last (re)started — used
+    /// to compute "work done since" on suspend / final exit.
+    start_v: usize,
+    start_c: usize,
+    /// Cumulative exclusive work attributed to this frame so far (gets
+    /// flushed into `bitblast_cost` on pop).
+    acc_v: usize,
+    acc_c: usize,
+}
+
 pub struct SmtSolver {
     pub ctx: BvContext,
     sat: Solver,
@@ -172,6 +199,17 @@ pub struct SmtSolver {
     // term. Push/pop via save-and-restore in `bitblast_bv`.
     current_bv_ctx: Option<BvTerm>,
 
+    // --- Bitblast cost attribution ----------------------------------------
+    // Opt-in: when `bitblast_cost_enabled` is true, each call to
+    // `bitblast_bv` is bracketed by a stack frame that snapshots the SAT
+    // var / clause counters. Recursive child calls suspend the parent's
+    // accumulation so each term's recorded cost is *exclusive* of its
+    // (already-charged) subterms. Useful for "which SMT operation produced
+    // the most SAT formula" profiling — see `bitblast_cost_report()`.
+    bitblast_cost_enabled: bool,
+    bitblast_cost: HashMap<BvTerm, (usize, usize)>,
+    bitblast_cost_stack: Vec<BitblastCostFrame>,
+
     // Every ITE gate emitted by `mk_mux`, in insertion order.
     ite_gates: Vec<IteGate>,
     // Reverse index: for each SAT literal that's an ITE output, which gate
@@ -208,6 +246,9 @@ impl SmtSolver {
             last_result: None,
             var_origin: Vec::new(),
             current_bv_ctx: None,
+            bitblast_cost_enabled: false,
+            bitblast_cost: HashMap::default(),
+            bitblast_cost_stack: Vec::new(),
             ite_gates: Vec::new(),
             ite_out_to_gate: HashMap::default(),
             ite_branching_hints: true,
@@ -911,6 +952,43 @@ impl SmtSolver {
 
     // ---------- Metadata accessors ----------
 
+    /// Turn on bitblast cost attribution. From this point onward every
+    /// `bitblast_bv` call records how many SAT variables and clauses it
+    /// emitted, *exclusive* of any subterms (those are charged to their
+    /// own rows). Cheap to leave on — adds a per-call snapshot + a small
+    /// HashMap update. Call [`bitblast_cost_report`] after solving to read
+    /// out a ranked table.
+    ///
+    /// Calling this resets any previously-collected data.
+    pub fn enable_bitblast_cost_tracking(&mut self) {
+        self.bitblast_cost_enabled = true;
+        self.bitblast_cost.clear();
+        self.bitblast_cost_stack.clear();
+    }
+
+    /// Snapshot of the bitblast cost map, sorted by clause count
+    /// descending. Empty if [`enable_bitblast_cost_tracking`] was never
+    /// called. Each entry tells you how many SAT vars / clauses that BV
+    /// term contributed to the formula on its own.
+    ///
+    /// Bin't (or any caller) is expected to keep its own
+    /// `BvTerm → source-instruction` mapping and join on `.term` to map
+    /// back to symex-level operations.
+    pub fn bitblast_cost_report(&self) -> Vec<BitblastCostEntry> {
+        let mut out: Vec<BitblastCostEntry> = self
+            .bitblast_cost
+            .iter()
+            .map(|(&t, &(v, c))| BitblastCostEntry {
+                term: t,
+                width: self.ctx.width_of(t),
+                sat_vars: v,
+                sat_clauses: c,
+            })
+            .collect();
+        out.sort_by(|a, b| b.sat_clauses.cmp(&a.sat_clauses));
+        out
+    }
+
     /// What does this SAT variable represent? Returns `VarOrigin::Unknown`
     /// for any variable the bitblaster didn't explicitly tag (including
     /// out-of-range indices).
@@ -996,6 +1074,25 @@ impl SmtSolver {
     fn bitblast_bv(&mut self, t: BvTerm) -> Vec<Lit> {
         if let Some(cached) = self.bv_cache.get(&t) {
             return cached.clone();
+        }
+        // --- Bitblast cost attribution (opt-in via enable_bitblast_cost_tracking) ---
+        // Suspend the parent frame's accumulator so its recorded delta
+        // only counts work emitted *before* our recursion. Then push a
+        // fresh frame for this term.
+        if self.bitblast_cost_enabled {
+            let v_now = self.sat.num_vars();
+            let c_now = self.sat.num_clauses();
+            if let Some(parent) = self.bitblast_cost_stack.last_mut() {
+                parent.acc_v += v_now - parent.start_v;
+                parent.acc_c += c_now - parent.start_c;
+            }
+            self.bitblast_cost_stack.push(BitblastCostFrame {
+                term: t,
+                start_v: v_now,
+                start_c: c_now,
+                acc_v: 0,
+                acc_c: 0,
+            });
         }
         // Record the current BV term so aux vars created inside gate helpers
         // (mk_and, mk_mux, ripple_carry_add, …) inherit it as their origin
@@ -1253,6 +1350,25 @@ impl SmtSolver {
             }
         };
         self.current_bv_ctx = prev_ctx;
+        // Finalize the cost frame: flush the accumulated exclusive cost
+        // (acc + final tail since the last suspend) into the cost map,
+        // then re-baseline the parent so its next interval starts here.
+        if self.bitblast_cost_enabled {
+            let v_now = self.sat.num_vars();
+            let c_now = self.sat.num_clauses();
+            let frame = self.bitblast_cost_stack.pop()
+                .expect("bitblast_cost_stack underflow");
+            debug_assert_eq!(frame.term, t);
+            let dv = frame.acc_v + (v_now - frame.start_v);
+            let dc = frame.acc_c + (c_now - frame.start_c);
+            let entry = self.bitblast_cost.entry(t).or_insert((0, 0));
+            entry.0 += dv;
+            entry.1 += dc;
+            if let Some(parent) = self.bitblast_cost_stack.last_mut() {
+                parent.start_v = v_now;
+                parent.start_c = c_now;
+            }
+        }
         self.bv_cache.insert(t, bits.clone());
         bits
     }

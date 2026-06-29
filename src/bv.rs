@@ -1559,6 +1559,36 @@ impl BvContext {
                 self.bool_false()
             };
         }
+        // RHS constant: x < c. When `c` has leading zeros, split the
+        // comparator on c's top set bit. Replaces a W-bit ripple-comparator
+        // with an (W-k-1)-bit "high bits all zero" check + a (k+1)-bit
+        // comparator. Hugely common from `cmp r, #imm` lowerings.
+        if let Some(vy) = self.const_val(y) {
+            let c = vy & mask(w);
+            if c == 0 {
+                return self.bool_false();
+            }
+            let k = 127 - c.leading_zeros();
+            if k + 1 < w {
+                return self.narrow_ult_x_lt_c(x, c, k, w);
+            }
+        }
+        // LHS constant: c < x. Symmetric narrowing: x > c iff x has any
+        // high bit set above c's range, OR the low part is > c.
+        if let Some(vx) = self.const_val(x) {
+            let c = vx & mask(w);
+            if c == mask(w) {
+                return self.bool_false();
+            }
+            if c == 0 {
+                let zero = self.bv_const(0, w);
+                return self.bv_ne(y, zero);
+            }
+            let k = 127 - c.leading_zeros();
+            if k + 1 < w {
+                return self.narrow_ult_c_lt_x(y, c, k, w);
+            }
+        }
         // Unsigned interval check via bits-known: a term's known-ones form
         // its lower bound and its `w_mask & !known_zeros` form its upper
         // bound (any unknown bit could be one). If the ranges are disjoint
@@ -1588,6 +1618,33 @@ impl BvContext {
                 self.bool_false()
             };
         }
+        // RHS constant: x <= c. Same shape as bv_ult — splits the
+        // comparator on c's top set bit.
+        if let Some(vy) = self.const_val(y) {
+            let c = vy & mask(w);
+            if c == mask(w) {
+                return self.bool_true();
+            }
+            if c == 0 {
+                let zero = self.bv_const(0, w);
+                return self.bv_eq(x, zero);
+            }
+            let k = 127 - c.leading_zeros();
+            if k + 1 < w {
+                return self.narrow_ule_x_le_c(x, c, k, w);
+            }
+        }
+        // LHS constant: c <= x.
+        if let Some(vx) = self.const_val(x) {
+            let c = vx & mask(w);
+            if c == 0 {
+                return self.bool_true();
+            }
+            let k = 127 - c.leading_zeros();
+            if k + 1 < w {
+                return self.narrow_ule_c_le_x(y, c, k, w);
+            }
+        }
         if w <= 128 {
             if let Some((xl, xh, yl, yh)) = self.unsigned_interval_pair(x, y, w) {
                 if xh <= yl {
@@ -1599,6 +1656,54 @@ impl BvContext {
             }
         }
         self.push_bool(BoolOp::Ule(x, y))
+    }
+
+    /// `x < c` where the top set bit of `c` is at position `k < w-1`.
+    /// Equivalent to `(high bits of x above k all zero) AND
+    /// (low (k+1) bits of x < c)`. The recursive bv_ult on narrower
+    /// operands won't re-narrow (k+1 == new width).
+    fn narrow_ult_x_lt_c(&mut self, x: BvTerm, c: u128, k: u32, w: u32) -> BoolTerm {
+        let high = self.bv_extract(x, w - 1, k + 1);
+        let zero_high = self.bv_const(0, w - k - 1);
+        let high_zero = self.bv_eq(high, zero_high);
+        let low_x = self.bv_extract(x, k, 0);
+        let low_c = self.bv_const(c, k + 1);
+        let low_lt = self.bv_ult(low_x, low_c);
+        self.bool_and(high_zero, low_lt)
+    }
+
+    /// `c < x` where top set bit of `c` is at position `k < w-1`. Either
+    /// `x` has a bit set above `c`'s range, or the low parts compare so.
+    fn narrow_ult_c_lt_x(&mut self, x: BvTerm, c: u128, k: u32, w: u32) -> BoolTerm {
+        let high = self.bv_extract(x, w - 1, k + 1);
+        let zero_high = self.bv_const(0, w - k - 1);
+        let high_nonzero = self.bv_ne(high, zero_high);
+        let low_x = self.bv_extract(x, k, 0);
+        let low_c = self.bv_const(c, k + 1);
+        let low_gt = self.bv_ult(low_c, low_x);
+        self.bool_or(high_nonzero, low_gt)
+    }
+
+    /// `x <= c` where top set bit of `c` is at position `k < w-1`.
+    fn narrow_ule_x_le_c(&mut self, x: BvTerm, c: u128, k: u32, w: u32) -> BoolTerm {
+        let high = self.bv_extract(x, w - 1, k + 1);
+        let zero_high = self.bv_const(0, w - k - 1);
+        let high_zero = self.bv_eq(high, zero_high);
+        let low_x = self.bv_extract(x, k, 0);
+        let low_c = self.bv_const(c, k + 1);
+        let low_le = self.bv_ule(low_x, low_c);
+        self.bool_and(high_zero, low_le)
+    }
+
+    /// `c <= x` where top set bit of `c` is at position `k < w-1`.
+    fn narrow_ule_c_le_x(&mut self, x: BvTerm, c: u128, k: u32, w: u32) -> BoolTerm {
+        let high = self.bv_extract(x, w - 1, k + 1);
+        let zero_high = self.bv_const(0, w - k - 1);
+        let high_nonzero = self.bv_ne(high, zero_high);
+        let low_x = self.bv_extract(x, k, 0);
+        let low_c = self.bv_const(c, k + 1);
+        let low_le = self.bv_ule(low_c, low_x);
+        self.bool_or(high_nonzero, low_le)
     }
 
     /// Helper: `(x_lo, x_hi, y_lo, y_hi)` unsigned intervals from bits-known.
