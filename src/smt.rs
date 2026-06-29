@@ -250,6 +250,22 @@ impl SmtSolver {
     pub fn bv_add(&mut self, x: BvTerm, y: BvTerm) -> BvTerm { self.ctx.bv_add(x, y) }
     pub fn bv_sub(&mut self, x: BvTerm, y: BvTerm) -> BvTerm { self.ctx.bv_sub(x, y) }
     pub fn bv_neg(&mut self, x: BvTerm) -> BvTerm { self.ctx.bv_neg(x) }
+    /// Population count of `x` (number of 1 bits). Result width = input width.
+    pub fn bv_popcount(&mut self, x: BvTerm) -> BvTerm { self.ctx.bv_popcount(x) }
+    /// Count leading zeros — `clz(0) = width`. Result width = input width.
+    pub fn bv_clz(&mut self, x: BvTerm) -> BvTerm { self.ctx.bv_clz(x) }
+    /// Count trailing zeros — `ctz(0) = width`. Result width = input width.
+    pub fn bv_ctz(&mut self, x: BvTerm) -> BvTerm { self.ctx.bv_ctz(x) }
+    /// Rotate `x` left by a symbolic `amount` (modulo width). Both operands
+    /// must have the same width. Falls through to the constant builder when
+    /// `amount` is a constant.
+    pub fn bv_rotate_left_dyn(&mut self, x: BvTerm, amount: BvTerm) -> BvTerm {
+        self.ctx.bv_rotate_left_dyn(x, amount)
+    }
+    /// Mirror of [`Self::bv_rotate_left_dyn`].
+    pub fn bv_rotate_right_dyn(&mut self, x: BvTerm, amount: BvTerm) -> BvTerm {
+        self.ctx.bv_rotate_right_dyn(x, amount)
+    }
     pub fn bv_mul(&mut self, x: BvTerm, y: BvTerm) -> BvTerm { self.ctx.bv_mul(x, y) }
     pub fn bv_udiv(&mut self, x: BvTerm, y: BvTerm) -> BvTerm { self.ctx.bv_udiv(x, y) }
     pub fn bv_urem(&mut self, x: BvTerm, y: BvTerm) -> BvTerm { self.ctx.bv_urem(x, y) }
@@ -1212,6 +1228,26 @@ impl SmtSolver {
                 }
                 output
             }
+            BvOp::Popcount(x) => {
+                let expanded = self.build_popcount_expansion(x);
+                self.bitblast_bv(expanded)
+            }
+            BvOp::Clz(x) => {
+                let expanded = self.build_clz_expansion(x);
+                self.bitblast_bv(expanded)
+            }
+            BvOp::Ctz(x) => {
+                let expanded = self.build_ctz_expansion(x);
+                self.bitblast_bv(expanded)
+            }
+            BvOp::RotateLeft(x, amount) => {
+                let expanded = self.build_rotate_dyn_expansion(x, amount, true);
+                self.bitblast_bv(expanded)
+            }
+            BvOp::RotateRight(x, amount) => {
+                let expanded = self.build_rotate_dyn_expansion(x, amount, false);
+                self.bitblast_bv(expanded)
+            }
         };
         self.current_bv_ctx = prev_ctx;
         self.bv_cache.insert(t, bits.clone());
@@ -1684,6 +1720,126 @@ impl SmtSolver {
         let cin_and_xor = self.mk_and(cin, a_xor_b);
         let cout = self.mk_or(a_and_b, cin_and_xor);
         (sum, cout)
+    }
+
+    /// Build a divide-and-conquer popcount tree for `x` as BV terms. The
+    /// resulting term is then bitblasted by the caller via the normal
+    /// dispatch path. Each level pairs adjacent partial sums, zero-extends
+    /// by one bit, and adds — total gate count is O(W log W) instead of
+    /// the chained-add form's O(W²).
+    fn build_popcount_expansion(&mut self, x: BvTerm) -> BvTerm {
+        let w = self.ctx.width_of(x);
+        debug_assert!(w >= 2, "single-bit popcount short-circuited in bv_popcount");
+        let mut layer: Vec<BvTerm> = (0..w)
+            .map(|i| self.ctx.bv_extract(x, i, i))
+            .collect();
+        let mut layer_w: u32 = 1;
+        while layer.len() > 1 {
+            let next_w = layer_w + 1;
+            let mut next: Vec<BvTerm> = Vec::with_capacity(layer.len().div_ceil(2));
+            let mut it = layer.into_iter();
+            while let Some(a) = it.next() {
+                let a_e = self.ctx.bv_zero_extend(a, next_w - layer_w);
+                match it.next() {
+                    Some(b) => {
+                        let b_e = self.ctx.bv_zero_extend(b, next_w - layer_w);
+                        next.push(self.ctx.bv_add(a_e, b_e));
+                    }
+                    None => next.push(a_e),
+                }
+            }
+            layer = next;
+            layer_w = next_w;
+        }
+        let result = layer[0];
+        if layer_w < w {
+            self.ctx.bv_zero_extend(result, w - layer_w)
+        } else {
+            result
+        }
+    }
+
+    /// Build the CLZ expansion as `popcount(~(x | x>>1 | x>>2 | ...))`.
+    /// The OR-fold drags the highest set bit downward so every bit at-or-
+    /// below it becomes 1; the popcount-of-not then counts the cleared
+    /// (leading-zero) bits.
+    fn build_clz_expansion(&mut self, x: BvTerm) -> BvTerm {
+        let w = self.ctx.width_of(x);
+        debug_assert!(w >= 2, "single-bit CLZ short-circuited in bv_clz");
+        let mut y = x;
+        let mut k = 1u32;
+        while k < w {
+            let shift = self.ctx.bv_const(k as u128, w);
+            let shifted = self.ctx.bv_lshr(y, shift);
+            y = self.ctx.bv_or(y, shifted);
+            k <<= 1;
+        }
+        let ny = self.ctx.bv_not(y);
+        self.build_popcount_expansion(ny)
+    }
+
+    /// Build the CTZ expansion as `popcount(~x & (x - 1))`. `x - 1` clears
+    /// the lowest set bit and sets all bits below it; ANDing with `~x`
+    /// isolates exactly the trailing-zero positions, so their popcount is
+    /// the CTZ. For `x == 0` the masks collapse to all-ones whose popcount
+    /// is `width`, matching the SMT-LIB convention.
+    fn build_ctz_expansion(&mut self, x: BvTerm) -> BvTerm {
+        let w = self.ctx.width_of(x);
+        debug_assert!(w >= 2, "single-bit CTZ short-circuited in bv_ctz");
+        let one = self.ctx.bv_const(1, w);
+        let xm1 = self.ctx.bv_sub(x, one);
+        let nx = self.ctx.bv_not(x);
+        let m = self.ctx.bv_and(nx, xm1);
+        self.build_popcount_expansion(m)
+    }
+
+    /// Build a symbolic-amount rotation as a log-tree of conditional
+    /// constant rotations: for each bit `k` of `amount`, conditionally
+    /// rotate by `2^k`. Each step costs only the per-bit ITE since the
+    /// constant rotation lowers to extract + concat with zero SAT gates.
+    /// For non-power-of-two widths, fall back to the `urem` + shifts form
+    /// (rare in real pcode — instruction widths are 8/16/32/64).
+    fn build_rotate_dyn_expansion(
+        &mut self,
+        x: BvTerm,
+        amount: BvTerm,
+        left: bool,
+    ) -> BvTerm {
+        let w = self.ctx.width_of(x);
+        debug_assert!(w >= 2, "single-bit rotate short-circuited in builder");
+        if w.is_power_of_two() {
+            let log_w = w.trailing_zeros();
+            let one_bit = self.ctx.bv_const(1, 1);
+            let mut rot = x;
+            for k in 0..log_w {
+                let bit_k = self.ctx.bv_extract(amount, k, k);
+                let bit_set = self.ctx.bv_eq(bit_k, one_bit);
+                let shift = 1u32 << k;
+                let rotated = if left {
+                    self.ctx.bv_rotate_left(rot, shift)
+                } else {
+                    self.ctx.bv_rotate_right(rot, shift)
+                };
+                rot = self.ctx.bv_ite(bit_set, rotated, rot);
+            }
+            rot
+        } else {
+            let w_const = self.ctx.bv_const(w as u128, w);
+            let amt_mod = self.ctx.bv_urem(amount, w_const);
+            let complement = self.ctx.bv_sub(w_const, amt_mod);
+            let (left_term, right_term) = if left {
+                (
+                    self.ctx.bv_shl(x, amt_mod),
+                    self.ctx.bv_lshr(x, complement),
+                )
+            } else {
+                (
+                    self.ctx.bv_lshr(x, amt_mod),
+                    self.ctx.bv_shl(x, complement),
+                )
+            };
+            self.ctx.bv_or(left_term, right_term)
+        }
     }
 
     fn ripple_carry_add(&mut self, a: &[Lit], b: &[Lit], cin: Lit) -> (Vec<Lit>, Lit) {

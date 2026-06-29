@@ -110,6 +110,24 @@ pub enum BvOp {
     /// Signed modulo — sign follows the divisor.
     Smod(BvTerm, BvTerm),
 
+    // --- Bit-counting ---
+    /// Population count: number of 1 bits. Output is the same width as the
+    /// input (capped at width, so the count always fits).
+    Popcount(BvTerm),
+    /// Count of leading zeros — number of zero bits before the highest set
+    /// bit. `clz(0) = width`. Output is the same width as the input.
+    Clz(BvTerm),
+    /// Count of trailing zeros — number of zero bits after the lowest set
+    /// bit. `ctz(0) = width`. Output is the same width as the input.
+    Ctz(BvTerm),
+
+    /// Rotate left by a symbolic amount, modulo the bit-width. `amount`
+    /// has the same width as the value. For constant rotation amounts,
+    /// use [`BvContext::bv_rotate_left`] which lowers to extract + concat.
+    RotateLeft(BvTerm, BvTerm),
+    /// Mirror of `RotateLeft`.
+    RotateRight(BvTerm, BvTerm),
+
     // --- Shifts ---
     Shl(BvTerm, BvTerm),
     /// Logical shift right — fills high bits with 0.
@@ -420,6 +438,11 @@ impl BvContext {
                     return self.bv_and(a, merged);
                 }
             }
+            // NOTE: a constant-mask structural rewrite (concat tree of
+            // extracts + zero-consts) was tried here and reverted — the
+            // bitblaster's `mk_and` already short-circuits T/F operands at
+            // the literal level, so the term-level rewrite is redundant
+            // and costs preprocessing time on every formula.
         }
         self.push_bv(BvOp::And(x, y), w, 0)
     }
@@ -447,6 +470,9 @@ impl BvContext {
                     return self.bv_or(a, merged);
                 }
             }
+            // NOTE: see bv_and — `mk_or` already short-circuits T/F at the
+            // literal level, so a term-level constant-mask rewrite was
+            // tried here and reverted as redundant.
         }
         self.push_bv(BvOp::Or(x, y), w, 0)
     }
@@ -461,16 +487,26 @@ impl BvContext {
             return self.bv_const(vx ^ vy, w);
         }
         if let Some(vy) = self.const_val(y) {
-            if vy & mask(w) == 0 {
+            let vy_m = vy & mask(w);
+            if vy_m == 0 {
                 return x; // x ^ 0 = x
+            }
+            if vy_m == mask(w) {
+                return self.bv_not(x); // x ^ ~0 = ~x
             }
             // Associative rollup: (a ^ c) ^ c' = a ^ (c ^ c').
             if let BvOp::Xor(a, b) = self.bv_op(x) {
                 if let Some(vb) = self.const_val(b) {
-                    let merged = self.bv_const(vb ^ vy, w);
+                    let merged = self.bv_const(vb ^ vy_m, w);
                     return self.bv_xor(a, merged);
                 }
             }
+            // NOTE: a constant-mask structural rewrite (per-bit pass-through
+            // or invert via `bvnot`) was tried here but destroys the
+            // `BvOp::Xor` shape that downstream `(a ^ c) ^ c'` chains rely
+            // on for canonicalization. The bitblaster already specialises
+            // `BvOp::Xor(x, const)` to single-lit ops per bit, so the BV-
+            // layer rewrite buys nothing.
         }
         self.push_bv(BvOp::Xor(x, y), w, 0)
     }
@@ -536,6 +572,106 @@ impl BvContext {
             return inner;
         }
         self.push_bv(BvOp::Neg(x), w, 0)
+    }
+
+    /// Population count of `x`'s bits. Output width equals input width
+    /// (so the result is always representable). Bitblasts to a balanced
+    /// divide-and-conquer adder tree — `O(W log W)` gates vs the naive
+    /// chained sum's `O(W²)`.
+    pub fn bv_popcount(&mut self, x: BvTerm) -> BvTerm {
+        let w = self.width_of(x);
+        if let Some(vx) = self.const_val(x) {
+            return self.bv_const((vx & mask(w)).count_ones() as u128, w);
+        }
+        // For width 1 the popcount is just the bit itself.
+        if w == 1 {
+            return x;
+        }
+        self.push_bv(BvOp::Popcount(x), w, 0)
+    }
+
+    /// Count leading zeros — number of zero bits before the highest set
+    /// bit. `bv_clz(0)` is `width`. Output width equals input width.
+    pub fn bv_clz(&mut self, x: BvTerm) -> BvTerm {
+        let w = self.width_of(x);
+        if let Some(vx) = self.const_val(x) {
+            let masked = vx & mask(w);
+            let r = if masked == 0 {
+                w as u128
+            } else {
+                (masked.leading_zeros() - (128 - w)) as u128
+            };
+            return self.bv_const(r, w);
+        }
+        if w == 1 {
+            // 1-bit clz: 0 if bit set, 1 otherwise. Equivalent to bvnot(x).
+            return self.bv_not(x);
+        }
+        self.push_bv(BvOp::Clz(x), w, 0)
+    }
+
+    /// Count trailing zeros — number of zero bits after the lowest set
+    /// bit. `bv_ctz(0)` is `width`. Output width equals input width.
+    pub fn bv_ctz(&mut self, x: BvTerm) -> BvTerm {
+        let w = self.width_of(x);
+        if let Some(vx) = self.const_val(x) {
+            let masked = vx & mask(w);
+            let r = if masked == 0 {
+                w as u128
+            } else {
+                masked.trailing_zeros() as u128
+            };
+            return self.bv_const(r, w);
+        }
+        if w == 1 {
+            return self.bv_not(x);
+        }
+        self.push_bv(BvOp::Ctz(x), w, 0)
+    }
+
+    /// Rotate `x` left by a symbolic `amount`. Both terms must have the
+    /// same width. The amount is interpreted modulo the width. Folds to
+    /// a constant rotate when `amount` is constant; bitblasts via a
+    /// log-tree of conditional constant rotations for power-of-2 widths,
+    /// and falls back to `urem` + shifts otherwise.
+    pub fn bv_rotate_left_dyn(&mut self, x: BvTerm, amount: BvTerm) -> BvTerm {
+        let w = self.check_same_width(x, amount);
+        if let (Some(vx), Some(vamt)) = (self.const_val(x), self.const_val(amount)) {
+            let m = mask(w);
+            let a = (vamt % w as u128) as u32;
+            let v = vx & m;
+            let r = if a == 0 { v } else { ((v << a) | (v >> (w - a))) & m };
+            return self.bv_const(r, w);
+        }
+        if let Some(vamt) = self.const_val(amount) {
+            let a = (vamt % w as u128) as u32;
+            return self.bv_rotate_left(x, a);
+        }
+        if w == 1 {
+            // 1-bit value is unchanged by any rotation.
+            return x;
+        }
+        self.push_bv(BvOp::RotateLeft(x, amount), w, 0)
+    }
+
+    /// Mirror of [`bv_rotate_left_dyn`].
+    pub fn bv_rotate_right_dyn(&mut self, x: BvTerm, amount: BvTerm) -> BvTerm {
+        let w = self.check_same_width(x, amount);
+        if let (Some(vx), Some(vamt)) = (self.const_val(x), self.const_val(amount)) {
+            let m = mask(w);
+            let a = (vamt % w as u128) as u32;
+            let v = vx & m;
+            let r = if a == 0 { v } else { ((v >> a) | (v << (w - a))) & m };
+            return self.bv_const(r, w);
+        }
+        if let Some(vamt) = self.const_val(amount) {
+            let a = (vamt % w as u128) as u32;
+            return self.bv_rotate_right(x, a);
+        }
+        if w == 1 {
+            return x;
+        }
+        self.push_bv(BvOp::RotateRight(x, amount), w, 0)
     }
 
     pub fn bv_mul(&mut self, x: BvTerm, y: BvTerm) -> BvTerm {
@@ -746,6 +882,18 @@ impl BvContext {
                     return self.bv_shl(inner, combined);
                 }
             }
+            // Constant-amount shift: replace the variable-shift MUX tree
+            // with a structural concat. `x << c` is just `x`'s low (w-c)
+            // bits placed in the high (w-c) positions, with c zero bits at
+            // the bottom. Costs zero SAT gates (extract + const + concat
+            // are all structural at bitblast time).
+            if vy >= w as u128 {
+                return self.bv_const(0, w);
+            }
+            let c = vy as u32;
+            let zero_low = self.bv_const(0, c);
+            let kept = self.bv_extract(x, w - 1 - c, 0);
+            return self.bv_concat(kept, zero_low);
         }
         self.push_bv(BvOp::Shl(x, y), w, 0)
     }
@@ -768,6 +916,16 @@ impl BvContext {
                     return self.bv_lshr(inner, combined);
                 }
             }
+            // Constant-amount logical shift right: `x >>L c` is x's high
+            // (w-c) bits placed in the low (w-c) positions, with c zero
+            // bits at the top. Structural concat — zero SAT gates.
+            if vy >= w as u128 {
+                return self.bv_const(0, w);
+            }
+            let c = vy as u32;
+            let zero_high = self.bv_const(0, c);
+            let kept = self.bv_extract(x, w - 1, c);
+            return self.bv_concat(zero_high, kept);
         }
         self.push_bv(BvOp::Lshr(x, y), w, 0)
     }
@@ -828,6 +986,17 @@ impl BvContext {
             if vy == 0 {
                 return x;
             }
+            // Constant-amount arithmetic shift right: shift logically and
+            // fill the top `c` bits with copies of the sign bit. For c >= w
+            // the result is a sign-bit replication of full width. Both
+            // forms are structural (extract + sign_extend) — zero gates.
+            let c = (vy.min(w as u128)) as u32;
+            if c >= w {
+                let sign = self.bv_extract(x, w - 1, w - 1);
+                return self.bv_sign_extend(sign, w - 1);
+            }
+            let kept = self.bv_extract(x, w - 1, c);
+            return self.bv_sign_extend(kept, c);
         }
         self.push_bv(BvOp::Ashr(x, y), w, 0)
     }
@@ -857,8 +1026,10 @@ impl BvContext {
         //   - if entirely within the low part: just extract from `lo`.
         //   - if entirely within the high part: extract from `hi` (bits
         //     rebased by lo's width).
-        //   - otherwise: leave as-is (the cross-boundary case produces a
-        //     concat of two sub-extracts which we don't bother building).
+        //   - otherwise: split the slice on the concat boundary, extract
+        //     each half from its source, then concat. Each sub-extract
+        //     gets folded by the rules above, so a chain of concat+extract
+        //     collapses cleanly even across boundaries.
         if let BvOp::Concat(hi_t, lo_t) = self.bv_op(x) {
             let lo_w = self.width_of(lo_t);
             if high < lo_w {
@@ -867,6 +1038,9 @@ impl BvContext {
             if low >= lo_w {
                 return self.bv_extract(hi_t, high - lo_w, low - lo_w);
             }
+            let lo_part = self.bv_extract(lo_t, lo_w - 1, low);
+            let hi_part = self.bv_extract(hi_t, high - lo_w, 0);
+            return self.bv_concat(hi_part, lo_part);
         }
         // extract over zero/sign extend, staying inside the original bits:
         if let BvOp::ZeroExtend(inner, _n) = self.bv_op(x) {
@@ -879,6 +1053,65 @@ impl BvContext {
             let iw = self.width_of(inner);
             if high < iw {
                 return self.bv_extract(inner, high, low);
+            }
+        }
+        // Width narrowing through ops whose bit i depends only on bits
+        // 0..=i of the operands. We push the extract through, narrowing
+        // each operand to width `high+1`, build the op at the narrower
+        // width, and then slice out [low..=high] from the result. The
+        // recursive `bv_extract(narrowed, high, low)` falls through to the
+        // literal Extract case since `narrowed`'s width is exactly
+        // `high+1`, so this terminates after one round of narrowing.
+        //
+        // The big payoff is on traces from symbolic execution where most
+        // arithmetic feeds into a final extract that truncates the result
+        // — without this, a 32-bit add whose only consumer is `extract 7 0`
+        // would emit a full 32-bit ripple-carry adder, of which 24 bits
+        // are dead.
+        if high + 1 < wx {
+            let narrowed = match self.bv_op(x) {
+                BvOp::Add(a, b) => {
+                    let na = self.bv_extract(a, high, 0);
+                    let nb = self.bv_extract(b, high, 0);
+                    Some(self.bv_add(na, nb))
+                }
+                BvOp::Sub(a, b) => {
+                    let na = self.bv_extract(a, high, 0);
+                    let nb = self.bv_extract(b, high, 0);
+                    Some(self.bv_sub(na, nb))
+                }
+                BvOp::Mul(a, b) => {
+                    let na = self.bv_extract(a, high, 0);
+                    let nb = self.bv_extract(b, high, 0);
+                    Some(self.bv_mul(na, nb))
+                }
+                BvOp::Neg(a) => {
+                    let na = self.bv_extract(a, high, 0);
+                    Some(self.bv_neg(na))
+                }
+                BvOp::And(a, b) => {
+                    let na = self.bv_extract(a, high, 0);
+                    let nb = self.bv_extract(b, high, 0);
+                    Some(self.bv_and(na, nb))
+                }
+                BvOp::Or(a, b) => {
+                    let na = self.bv_extract(a, high, 0);
+                    let nb = self.bv_extract(b, high, 0);
+                    Some(self.bv_or(na, nb))
+                }
+                BvOp::Xor(a, b) => {
+                    let na = self.bv_extract(a, high, 0);
+                    let nb = self.bv_extract(b, high, 0);
+                    Some(self.bv_xor(na, nb))
+                }
+                BvOp::Not(a) => {
+                    let na = self.bv_extract(a, high, 0);
+                    Some(self.bv_not(na))
+                }
+                _ => None,
+            };
+            if let Some(t) = narrowed {
+                return self.bv_extract(t, high, low);
             }
         }
         self.push_bv(BvOp::Extract(x, high, low), new_w, 0)
@@ -894,6 +1127,33 @@ impl BvContext {
         if let (Some(vx), Some(vy)) = (self.const_val(x), self.const_val(y)) {
             let combined = ((vx & mask(wx)) << wy) | (vy & mask(wy));
             return self.bv_const(combined, w);
+        }
+        // Concat-of-concat with adjacent constants — fold them so chains of
+        // constant-shift rewrites collapse to a canonical structural form.
+        // Without this, `(x << 2) << 3` and `x << 5` produce equivalent but
+        // structurally distinct terms, losing hash-cons-based CSE.
+        //
+        // Left case: concat(concat(a, b_const), y_const) → concat(a, b++y)
+        if let Some(vy) = self.const_val(y) {
+            if let BvOp::Concat(a, b) = self.bv_op(x) {
+                if let Some(vb) = self.const_val(b) {
+                    let wb = self.width_of(b);
+                    let merged = ((vb & mask(wb)) << wy) | (vy & mask(wy));
+                    let merged_const = self.bv_const(merged, wb + wy);
+                    return self.bv_concat(a, merged_const);
+                }
+            }
+        }
+        // Right case: concat(x_const, concat(a_const, b)) → concat(x++a, b)
+        if let Some(vx) = self.const_val(x) {
+            if let BvOp::Concat(a, b) = self.bv_op(y) {
+                if let Some(va) = self.const_val(a) {
+                    let wa = self.width_of(a);
+                    let merged = ((vx & mask(wx)) << wa) | (va & mask(wa));
+                    let merged_const = self.bv_const(merged, wx + wa);
+                    return self.bv_concat(merged_const, b);
+                }
+            }
         }
         // concat(extract(z, h1, l1), extract(z, h2, l2)) collapses to a
         // single extract when the slices are adjacent on the same BV.
@@ -1232,6 +1492,50 @@ impl BvContext {
                         (false, true) => self.bool_not(c),
                     };
                 }
+            }
+        }
+        // Arithmetic solving: when the equality has a constant on the right
+        // and an add/sub/neg with at least one constant operand on the left,
+        // move the constant across so the equality becomes a direct
+        // constraint on the remaining variable term. The bvadd's gates die
+        // if this is its only consumer (hash-cons may keep it alive
+        // otherwise — that's fine, just no win in that case).
+        //
+        // (a + b_const) = vy   →  a = vy - b_const
+        // (a_const - b) = vy   →  b = a_const - vy
+        // (a - b_const) = vy   →  a = vy + b_const    (bv_sub normalises
+        //                                              const-rhs into add,
+        //                                              so this is here for
+        //                                              imported terms that
+        //                                              skipped the builder)
+        // (-a) = vy            →  a = -vy
+        if let Some(vy) = self.const_val(y) {
+            match self.bv_op(x) {
+                BvOp::Add(a, b) => {
+                    if let Some(vb) = self.const_val(b) {
+                        let target = self.bv_const(vy.wrapping_sub(vb), w);
+                        return self.bv_eq(a, target);
+                    }
+                    if let Some(va) = self.const_val(a) {
+                        let target = self.bv_const(vy.wrapping_sub(va), w);
+                        return self.bv_eq(b, target);
+                    }
+                }
+                BvOp::Sub(a, b) => {
+                    if let Some(va) = self.const_val(a) {
+                        let target = self.bv_const(va.wrapping_sub(vy), w);
+                        return self.bv_eq(b, target);
+                    }
+                    if let Some(vb) = self.const_val(b) {
+                        let target = self.bv_const(vy.wrapping_add(vb), w);
+                        return self.bv_eq(a, target);
+                    }
+                }
+                BvOp::Neg(a) => {
+                    let target = self.bv_const(0u128.wrapping_sub(vy), w);
+                    return self.bv_eq(a, target);
+                }
+                _ => {}
             }
         }
         self.push_bool(BoolOp::Eq(x, y))
@@ -1807,6 +2111,27 @@ impl BvContext {
                     zeros &= zv;
                 }
                 (ones, zeros)
+            }
+            BvOp::RotateLeft(_, _) | BvOp::RotateRight(_, _) => {
+                // Could in principle rotate the known-bits masks if the
+                // amount has narrow known-bits — skipped here for now.
+                (0, 0)
+            }
+            BvOp::Popcount(_) | BvOp::Clz(_) | BvOp::Ctz(_) => {
+                // The result is bounded by [0, width]. The bits above the
+                // minimum bit-width needed to represent `width` are known
+                // zero, which gives downstream `extract`s a free narrow
+                // (the high zero-bits fold to constants).
+                if width == 0 {
+                    (0, 0)
+                } else {
+                    let k_bits = 32 - width.leading_zeros();
+                    if k_bits >= width {
+                        (0, 0)
+                    } else {
+                        (0, !mask(k_bits) & w_mask)
+                    }
+                }
             }
         }
     }

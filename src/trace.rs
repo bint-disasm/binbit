@@ -97,7 +97,8 @@ impl<'a> Printer<'a> {
                 return;
             }
             BvOp::Not(a) | BvOp::Neg(a) | BvOp::Extract(a, _, _)
-            | BvOp::ZeroExtend(a, _) | BvOp::SignExtend(a, _) => {
+            | BvOp::ZeroExtend(a, _) | BvOp::SignExtend(a, _)
+            | BvOp::Popcount(a) | BvOp::Clz(a) | BvOp::Ctz(a) => {
                 self.visit_bv(a);
             }
             BvOp::And(a, b) | BvOp::Or(a, b) | BvOp::Xor(a, b)
@@ -105,6 +106,7 @@ impl<'a> Printer<'a> {
             | BvOp::Udiv(a, b) | BvOp::Urem(a, b)
             | BvOp::Sdiv(a, b) | BvOp::Srem(a, b) | BvOp::Smod(a, b)
             | BvOp::Shl(a, b) | BvOp::Lshr(a, b) | BvOp::Ashr(a, b)
+            | BvOp::RotateLeft(a, b) | BvOp::RotateRight(a, b)
             | BvOp::Concat(a, b) => {
                 self.visit_bv(a);
                 self.visit_bv(b);
@@ -206,10 +208,51 @@ impl<'a> Printer<'a> {
             BvOp::Shl(a, b)     => format!("(bvshl {} {})",  self.render_bv(a), self.render_bv(b)),
             BvOp::Lshr(a, b)    => format!("(bvlshr {} {})", self.render_bv(a), self.render_bv(b)),
             BvOp::Ashr(a, b)    => format!("(bvashr {} {})", self.render_bv(a), self.render_bv(b)),
+            // SMT-LIB has no rotate-by-symbolic; inline as `(x << m) | (x >> (w - m))`
+            // where `m = amt mod w`. The `urem` is there to handle out-of-range
+            // amounts robustly.
+            BvOp::RotateLeft(a, b) => {
+                let xs = self.render_bv(a);
+                let amt = self.render_bv(b);
+                let w = self.s.ctx.width_of(a);
+                let w_const = format!("(_ bv{} {})", w, w);
+                let m = format!("(bvurem {} {})", amt, w_const);
+                format!(
+                    "(bvor (bvshl {} {}) (bvlshr {} (bvsub {} {})))",
+                    xs, m, xs, w_const, m,
+                )
+            }
+            BvOp::RotateRight(a, b) => {
+                let xs = self.render_bv(a);
+                let amt = self.render_bv(b);
+                let w = self.s.ctx.width_of(a);
+                let w_const = format!("(_ bv{} {})", w, w);
+                let m = format!("(bvurem {} {})", amt, w_const);
+                format!(
+                    "(bvor (bvlshr {} {}) (bvshl {} (bvsub {} {})))",
+                    xs, m, xs, w_const, m,
+                )
+            }
             BvOp::Extract(a, hi, lo) => format!("((_ extract {} {}) {})", hi, lo, self.render_bv(a)),
             BvOp::Concat(a, b)  => format!("(concat {} {})", self.render_bv(a), self.render_bv(b)),
             BvOp::ZeroExtend(a, n) => format!("((_ zero_extend {}) {})", n, self.render_bv(a)),
             BvOp::SignExtend(a, n) => format!("((_ sign_extend {}) {})", n, self.render_bv(a)),
+            // SMT-LIB has no standard popcount / clz / ctz, so inline the
+            // expansions in primitive ops. Output is verbose but parseable
+            // by z3 / bitwuzla / cvc5 and round-trips through binbit's
+            // own parser.
+            BvOp::Popcount(a) => {
+                let xs = self.render_bv(a);
+                Self::render_popcount(&xs, self.s.ctx.width_of(a))
+            }
+            BvOp::Clz(a) => {
+                let xs = self.render_bv(a);
+                Self::render_clz(&xs, self.s.ctx.width_of(a))
+            }
+            BvOp::Ctz(a) => {
+                let xs = self.render_bv(a);
+                Self::render_ctz(&xs, self.s.ctx.width_of(a))
+            }
             BvOp::Ite(c, tt, ee) => format!(
                 "(ite {} {} {})",
                 self.render_bool(c), self.render_bv(tt), self.render_bv(ee),
@@ -253,6 +296,54 @@ impl<'a> Printer<'a> {
             BoolOp::SdivOverflow(a, b) => format!("(bvsdivo {} {})", self.render_bv(a), self.render_bv(b)),
             BoolOp::NegOverflow(a)     => format!("(bvnego {})",     self.render_bv(a)),
         }
+    }
+
+    /// Inline popcount as a chain of zero-extended single-bit adds. Each
+    /// `((_ extract i i) xs)` produces a 1-bit term that we zero-extend to
+    /// the full width and sum. Verbose but uses only standard SMT-LIB.
+    fn render_popcount(xs: &str, w: u32) -> String {
+        if w == 1 {
+            return xs.to_string();
+        }
+        let mut acc = format!("((_ zero_extend {}) ((_ extract 0 0) {}))", w - 1, xs);
+        for i in 1..w {
+            acc = format!(
+                "(bvadd {} ((_ zero_extend {}) ((_ extract {} {}) {})))",
+                acc, w - 1, i, i, xs,
+            );
+        }
+        acc
+    }
+
+    /// Inline CLZ as `popcount(~(x | x>>1 | x>>2 | ... | x>>(W/2)))`. The
+    /// OR-fold makes every bit at-or-below the highest set bit a 1, then
+    /// popcount-of-not counts the cleared (leading-zero) bits.
+    fn render_clz(xs: &str, w: u32) -> String {
+        if w == 1 {
+            return format!("(bvnot {})", xs);
+        }
+        let mut y = xs.to_string();
+        let mut k = 1u32;
+        while k < w {
+            y = format!("(bvor {} (bvlshr {} (_ bv{} {})))", y, y, k, w);
+            k <<= 1;
+        }
+        let ny = format!("(bvnot {})", y);
+        Self::render_popcount(&ny, w)
+    }
+
+    /// Inline CTZ via `popcount(~x & (x - 1))`. For `x == 0` the
+    /// expression collapses to all-ones whose popcount is `w` (the
+    /// SMT-LIB convention).
+    fn render_ctz(xs: &str, w: u32) -> String {
+        if w == 1 {
+            return format!("(bvnot {})", xs);
+        }
+        let m = format!(
+            "(bvand (bvnot {}) (bvsub {} (_ bv1 {})))",
+            xs, xs, w,
+        );
+        Self::render_popcount(&m, w)
     }
 
     fn emit(&self, assertions: &[BoolTerm]) -> String {
