@@ -687,14 +687,20 @@ impl Solver {
                 // reads are guarded by the `read < end` loop condition.
                 read = unsafe { read.add(1) };
 
-                // Software prefetch of the *next* watcher's clause body.
-                // We've already advanced `read` past the current entry, so
-                // `*read` (when read < end) is the upcoming watcher.
+                // Software prefetch of the *next* watcher's clause body
+                // AND of its blocker's `lit_value` slot. Both are off the
+                // critical path of this iteration but on the critical path
+                // of the next, so a hint here overlaps the cache fill with
+                // the current iteration's work. `lit_value` is large
+                // (2 × num_vars bytes) so its lookups regularly miss L1/L2
+                // on big formulas — pulling the next slot in early is
+                // measurable on long watch lists.
                 if read < end {
                     let nw = unsafe { *read };
                     if !nw.is_binary() {
                         clauses.prefetch(nw.long_cref());
                     }
+                    prefetch_lit_value_slot(lit_value, nw.blocker.0 as usize);
                 }
 
                 // One lookup serves both clause shapes: for binary entries
@@ -1665,4 +1671,39 @@ enum AnalyzeSrc {
     // Binary reason: resolving on literal at position 0, keeping position 1.
     // Stored as (pivot, other) so we know which to skip.
     Binary(Lit, Lit),
+}
+
+/// Hint the CPU to start loading the `lit_value` byte at `idx` into L1.
+/// Companion to `ClauseArena::prefetch` — used during `propagate` to
+/// overlap the next watcher's blocker-value fetch with this iteration's
+/// work. No-op on architectures without a prefetch intrinsic we know.
+#[inline(always)]
+fn prefetch_lit_value_slot(lv: &[LBool], idx: usize) {
+    if idx >= lv.len() {
+        return;
+    }
+    // SAFETY: bounded above; prefetch is a pure CPU hint that tolerates
+    // any pointer not causing an access violation.
+    unsafe {
+        let ptr = lv.as_ptr().add(idx);
+        #[cfg(target_arch = "x86_64")]
+        {
+            core::arch::x86_64::_mm_prefetch(
+                ptr as *const i8,
+                core::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            core::arch::asm!(
+                "prfm pldl1keep, [{p}]",
+                p = in(reg) ptr,
+                options(readonly, nostack, preserves_flags),
+            );
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let _ = ptr;
+        }
+    }
 }
