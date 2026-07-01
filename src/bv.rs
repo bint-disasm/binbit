@@ -247,6 +247,19 @@ pub struct BvContext {
     bv_hashcons: HashMap<BvNode, BvTerm>,
     bool_hashcons: HashMap<BoolOp, BoolTerm>,
 
+    /// Memoises the *rewrite* performed by [`bv_extract`], keyed by
+    /// `(source term, high, low)` → result term. Hash-consing dedups
+    /// the resulting nodes, but the extract-narrowing rule recurses
+    /// into BOTH operands of `Add`/`Sub`/`Mul`/`And`/… — so on a term
+    /// DAG with shared subterms (e.g. `x` reused across a chain of
+    /// `lea [rax + rax*4]` multiply-by-5 steps), an un-memoised
+    /// descent re-walks every root-to-leaf path, which is exponential
+    /// in depth. Caching the per-`(term, slice)` result collapses that
+    /// back to one visit per distinct subproblem. The arena is
+    /// append-only and terms are immutable, so a cached extract stays
+    /// valid for the context's lifetime.
+    extract_cache: HashMap<(BvTerm, u32, u32), BvTerm>,
+
     /// Storage for wide constants (width > 128). Each entry is the limb
     /// representation of a unique constant value — little-endian, length
     /// exactly `ceil(width / 64)`. Indexed by `BvNode::wide`.
@@ -286,6 +299,7 @@ impl BvContext {
             num_bool_vars: 0,
             bv_hashcons: HashMap::default(),
             bool_hashcons: HashMap::default(),
+            extract_cache: HashMap::default(),
             wide_values: Vec::new(),
             wide_interner: HashMap::default(),
             select_tables: Vec::new(),
@@ -1007,11 +1021,27 @@ impl BvContext {
         let wx = self.width_of(x);
         assert!(high < wx, "extract high={} out of range for width {}", high, wx);
         assert!(low <= high, "extract low={} > high={}", low, high);
-        let new_w = high - low + 1;
-        // Full-width extract is a no-op.
+        // Full-width extract is a no-op — cheap, skip the cache.
         if low == 0 && high + 1 == wx {
             return x;
         }
+        // Memoise the (possibly recursive) rewrite. Without this the
+        // extract-narrowing rule below re-descends shared subterms
+        // exponentially; see `extract_cache`'s doc comment.
+        let key = (x, high, low);
+        if let Some(&cached) = self.extract_cache.get(&key) {
+            return cached;
+        }
+        let result = self.bv_extract_uncached(x, high, low, wx);
+        self.extract_cache.insert(key, result);
+        result
+    }
+
+    /// The body of [`bv_extract`] — its rewrite rules, minus the
+    /// memoisation wrapper. Recurses via the cached `bv_extract` so
+    /// shared subterms are only rewritten once.
+    fn bv_extract_uncached(&mut self, x: BvTerm, high: u32, low: u32, wx: u32) -> BvTerm {
+        let new_w = high - low + 1;
         if let Some(vx) = self.const_val(x) {
             let shifted = (vx >> low) & mask(new_w);
             return self.bv_const(shifted, new_w);
