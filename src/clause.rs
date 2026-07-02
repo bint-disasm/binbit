@@ -9,30 +9,57 @@ pub struct ClauseRef(pub u32);
 /// All clauses live in one big `Vec<u32>`. Per clause:
 ///
 /// ```text
-/// word 0        : flags  (bit 0 = learned, bit 1 = deleted)
-/// word 1        : LBD
-/// word 2..=3    : activity (f64, low u32 first)
-/// word 4        : length (number of literals)
-/// word 5..5+len : literals (each Lit stored as its .0)
+/// word 0        : flags  (bit 0 = learned, bit 1 = deleted, bit 2 = relocated)
+/// word 1        : LBD (or forwarding ClauseRef while bit 2 is set mid-GC)
+/// word 2        : activity (f32 bits)
+/// word 3        : length (number of literals)
+/// word 4..4+len : literals (each Lit stored as its .0)
 /// ```
+///
+/// Header size matters: a 6th word (a `touched` stamp for Chanseok-Oh-style
+/// tiered retention, July 2026) cost a consistent 3-5% on large instances —
+/// the retention policy itself also regressed, so both were removed. The
+/// same measurement motivated shrinking activity f64 -> f32 (5 words -> 4).
+/// Activity only tie-breaks reduce_db's LBD-first sort, so f32 precision is
+/// ample; the solver keeps its increment (`cla_inc`) in f64 and narrows on
+/// store. Don't grow the header without re-measuring nobranch.
 ///
 /// This eliminates the per-clause heap allocation of `Vec<Lit>` and packs
 /// every live clause into contiguous memory, which is a big cache win for
 /// unit propagation (the hottest loop in the solver).
 pub struct ClauseArena {
     data: Vec<u32>,
+    // Words occupied by clauses that have been marked deleted. The arena is
+    // otherwise append-only, so this only grows until a garbage collection
+    // copies the survivors out and drops the old buffer. Drives the GC
+    // trigger in `Solver::reduce_db`.
+    wasted: usize,
 }
 
-const HDR: usize = 5;
+const HDR: usize = 4;
 const FLAG_LEARNED: u32 = 1;
 const FLAG_DELETED: u32 = 2;
+// Set during garbage collection when a clause has been copied to the new
+// arena. Its forwarding pointer (the new ClauseRef) lives in the LBD slot
+// (header word 1). Never persists past a GC — the flagged buffer is dropped.
+const FLAG_RELOC: u32 = 4;
 
 impl ClauseArena {
     pub fn new() -> Self {
-        ClauseArena { data: Vec::new() }
+        ClauseArena {
+            data: Vec::new(),
+            wasted: 0,
+        }
     }
 
-    /// Reserve `extra_words` of raw storage. Each clause needs `5 + len` words.
+    pub fn with_capacity(words: usize) -> Self {
+        ClauseArena {
+            data: Vec::with_capacity(words),
+            wasted: 0,
+        }
+    }
+
+    /// Reserve `extra_words` of raw storage. Each clause needs `4 + len` words.
     pub fn reserve(&mut self, extra_words: usize) {
         self.data.reserve(extra_words);
     }
@@ -42,13 +69,17 @@ impl ClauseArena {
         self.data.len()
     }
 
+    /// Words occupied by deleted clauses — reclaimable by a GC.
+    pub fn wasted(&self) -> usize {
+        self.wasted
+    }
+
     /// Append a new clause. Returns its ref (the offset of its header word).
     pub fn alloc(&mut self, lits: &[Lit], learned: bool) -> ClauseRef {
         let cref = ClauseRef(self.data.len() as u32);
         self.data.push(if learned { FLAG_LEARNED } else { 0 });
         self.data.push(0); // lbd
-        self.data.push(0); // activity lo
-        self.data.push(0); // activity hi
+        self.data.push(0); // activity (f32 bits; 0.0)
         self.data.push(lits.len() as u32);
         for l in lits {
             self.data.push(l.0);
@@ -68,7 +99,50 @@ impl ClauseArena {
 
     #[inline]
     pub fn mark_deleted(&mut self, c: ClauseRef) {
-        self.data[c.0 as usize] |= FLAG_DELETED;
+        let h = c.0 as usize;
+        if self.data[h] & FLAG_DELETED == 0 {
+            self.data[h] |= FLAG_DELETED;
+            self.wasted += HDR + self.data[h + 3] as usize;
+        }
+    }
+
+    /// Copy the clause into `to`, leaving a forwarding pointer behind in the
+    /// old header. Idempotent — calling again for the same clause returns the
+    /// same new ref, so the several holders of a ClauseRef (two watchers, a
+    /// possible trail reason, the learnts list) can each remap independently.
+    /// Placement in `to` is allocation order, which is how the GC controls
+    /// cache tiering: whatever is relocated first ends up lowest in memory.
+    pub fn reloc(&mut self, c: ClauseRef, to: &mut ClauseArena) -> ClauseRef {
+        let h = c.0 as usize;
+        if self.data[h] & FLAG_RELOC != 0 {
+            return ClauseRef(self.data[h + 1]);
+        }
+        debug_assert!(
+            self.data[h] & FLAG_DELETED == 0,
+            "relocating a deleted clause"
+        );
+        let len = self.data[h + 3] as usize;
+        let new = ClauseRef(to.data.len() as u32);
+        to.data.extend_from_slice(&self.data[h..h + HDR + len]);
+        self.data[h] |= FLAG_RELOC;
+        self.data[h + 1] = new.0; // forwarding pointer lives in the LBD slot
+        new
+    }
+
+    /// Relocate every live *original* (non-learned) clause into `to`, in
+    /// arena order. First stage of GC: originals are the propagation
+    /// workhorses, so they claim the low, densely-shared region of the new
+    /// arena before any learnts are placed.
+    pub fn reloc_originals(&mut self, to: &mut ClauseArena) {
+        let mut pos = 0usize;
+        while pos + HDR <= self.data.len() {
+            let flags = self.data[pos];
+            let len = self.data[pos + 3] as usize;
+            if flags & (FLAG_LEARNED | FLAG_DELETED | FLAG_RELOC) == 0 {
+                self.reloc(ClauseRef(pos as u32), to);
+            }
+            pos += HDR + len;
+        }
     }
 
     #[inline]
@@ -82,19 +156,13 @@ impl ClauseArena {
     }
 
     #[inline]
-    pub fn activity(&self, c: ClauseRef) -> f64 {
-        let h = c.0 as usize;
-        let lo = self.data[h + 2] as u64;
-        let hi = self.data[h + 3] as u64;
-        f64::from_bits(lo | (hi << 32))
+    pub fn activity(&self, c: ClauseRef) -> f32 {
+        f32::from_bits(self.data[c.0 as usize + 2])
     }
 
     #[inline]
-    pub fn set_activity(&mut self, c: ClauseRef, a: f64) {
-        let h = c.0 as usize;
-        let bits = a.to_bits();
-        self.data[h + 2] = bits as u32;
-        self.data[h + 3] = (bits >> 32) as u32;
+    pub fn set_activity(&mut self, c: ClauseRef, a: f32) {
+        self.data[c.0 as usize + 2] = a.to_bits();
     }
 
     // The next four accessors are on the unit-propagation hot path (called
@@ -118,7 +186,7 @@ impl ClauseArena {
 
     #[inline]
     pub fn len(&self, c: ClauseRef) -> usize {
-        let idx = c.0 as usize + 4;
+        let idx = c.0 as usize + 3;
         debug_assert!(idx < self.data.len(), "clause len read out of bounds");
         // SAFETY: a live clause header occupies words [c.0 .. c.0 + HDR).
         unsafe { *self.data.as_ptr().add(idx) as usize }
@@ -137,10 +205,10 @@ impl ClauseArena {
     #[inline]
     pub fn lits(&self, c: ClauseRef) -> &[Lit] {
         let h = c.0 as usize;
-        debug_assert!(h + 4 < self.data.len(), "clause header out of bounds");
+        debug_assert!(h + 3 < self.data.len(), "clause header out of bounds");
         let base = self.data.as_ptr();
-        // SAFETY: header word `h+4` is in bounds for any live clause.
-        let len = unsafe { *base.add(h + 4) as usize };
+        // SAFETY: header word `h+3` is in bounds for any live clause.
+        let len = unsafe { *base.add(h + 3) as usize };
         let start = h + HDR;
         debug_assert!(start + len <= self.data.len(), "clause body out of bounds");
         // SAFETY: Lit is #[repr(transparent)] around u32, so a &[u32] can be
@@ -169,7 +237,7 @@ impl ClauseArena {
         let mut pos = 0usize;
         while pos + HDR <= self.data.len() {
             let flags = self.data[pos];
-            let len = self.data[pos + 4] as usize;
+            let len = self.data[pos + 3] as usize;
             let body_start = pos + HDR;
             let end = body_start + len;
             if end > self.data.len() {

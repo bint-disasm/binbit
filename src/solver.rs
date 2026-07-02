@@ -374,6 +374,17 @@ pub struct Solver {
     cla_inc: f64,
     cla_decay: f64,
     // When num_learnts exceeds this, reduce_db runs. Grows each time.
+    //
+    // Seeded from num_clauses/3, which on SMT-scale instances (millions of
+    // input clauses) effectively never fires — the live learnt set then
+    // grows unboundedly and propagate is memory-bound on it. Two attempts
+    // to change that (July 2026) both regressed and were removed:
+    // a Glucose 2000+300n LBD-sort-and-halve schedule (nobranch 36.6s ->
+    // 57.1s, conflicts x1.87) and Chanseok-Oh-style tiers with touch
+    // stamps + on-use LBD refresh (nobranch conflicts +29%, propagations
+    // x2.16; spear/samba conflicts x7.5). On this workload learnts are
+    // cheap to keep and expensive to re-derive — don't retry deletion
+    // policies without new evidence.
     max_learnts: f64,
     // Glucose-style adaptive restart policy.
     restart: RestartState,
@@ -408,6 +419,7 @@ pub struct Solver {
     pub stats_deleted: u64,
     pub stats_reductions: u64,
     pub stats_min_removed: u64,
+    pub stats_gcs: u64,
 
     // Sticky "this formula is already UNSAT" flag. Set whenever `add_clause`
     // detects trivial unsatisfiability (empty clause, or a unit whose value
@@ -456,6 +468,7 @@ impl Solver {
             stats_deleted: 0,
             stats_reductions: 0,
             stats_min_removed: 0,
+            stats_gcs: 0,
             dead: false,
         }
     }
@@ -496,7 +509,7 @@ impl Solver {
         self.analyze_toclear.reserve(num_vars);
         self.analyze_stack.reserve(num_vars);
 
-        // Clause arena: reserve raw word capacity. Each clause takes 5 header
+        // Clause arena: reserve raw word capacity. Each clause takes 4 header
         // words plus its literals (~3 for random 3-SAT, more on average for
         // learned clauses). Conservative estimate: ~10 words per clause.
         self.clauses.reserve(num_clauses * 10);
@@ -1014,7 +1027,18 @@ impl Solver {
             }
 
             current = match self.reason[pvi] {
-                Reason::Clause(cr) => AnalyzeSrc::Clause(cr),
+                Reason::Clause(cr) => {
+                    // Prefetch the next reason clause. Unlike propagate —
+                    // which prefetches the next watcher's clause — analyze
+                    // walks a data-dependent chain of reason clauses
+                    // scattered across the arena, so each first touch is a
+                    // likely cache miss. Issuing the hint here overlaps the
+                    // fill with the loop-back + `bump_clause_activity` before
+                    // the literal scan reads it. Pure hint; no behaviour
+                    // change.
+                    self.clauses.prefetch(cr);
+                    AnalyzeSrc::Clause(cr)
+                }
                 Reason::Binary(other) => AnalyzeSrc::Binary(p, other),
                 Reason::Decision => {
                     panic!("analyze walked past a decision without reaching UIP")
@@ -1336,7 +1360,11 @@ impl Solver {
         if !self.clauses.learned(cref) {
             return;
         }
-        let new_act = self.clauses.activity(cref) + self.cla_inc;
+        // Stored activity is f32 (see the arena header layout); the
+        // increment stays f64 so its growth-by-decay stays smooth, and we
+        // narrow on store. Activity only tie-breaks reduce_db's LBD-first
+        // sort, so the lost mantissa bits are inconsequential.
+        let new_act = self.clauses.activity(cref) + self.cla_inc as f32;
         self.clauses.set_activity(cref, new_act);
         if new_act > 1e20 {
             self.rescale_clause_activity();
@@ -1415,6 +1443,72 @@ impl Solver {
         for wl in &mut self.watches {
             wl.retain(|w| w.is_binary() || !clauses.deleted(w.long_cref()));
         }
+
+        // Compact the arena once a fifth of it is dead words. Deletion only
+        // marks; without this the arena grows monotonically and live clauses
+        // end up scattered islands among dead learnts — every propagate touch
+        // of a learned clause then drags in cache lines that are mostly
+        // garbage. Must run while `learnts` still holds the quality order the
+        // sort above produced — garbage_collect uses it for tiered placement.
+        if self.clauses.wasted() * 5 > self.clauses.word_size() {
+            self.garbage_collect();
+        }
+    }
+
+    /// Compact the clause arena, dropping deleted clauses' words and laying
+    /// survivors out in cache-tier order:
+    ///
+    /// 1. **Originals** (in arena order) — the permanent propagation
+    ///    workhorses claim the base of the new arena.
+    /// 2. **Learnts, best-quality-first** — `reduce_db` (the only caller)
+    ///    has just sorted `learnts` by (LBD, activity), so glue and other
+    ///    long-lived keepers pack right behind the originals, while the
+    ///    churny tail — likely deleted by the next reduction — sits at the
+    ///    top where its death frees contiguous space.
+    ///
+    /// The hot working set becomes a dense prefix of one allocation instead
+    /// of islands in a mostly-dead arena — fewer cache lines and TLB pages
+    /// backing the propagate loop.
+    ///
+    /// Pure plumbing, no trajectory change: clause contents, watch-list
+    /// order, and `learnts` order are all preserved; only ClauseRef values
+    /// and physical placement change. Runs mid-search at any decision level —
+    /// trail reasons are remapped in place (reduce_db keeps locked clauses,
+    /// so every reason clause is live).
+    fn garbage_collect(&mut self) {
+        self.stats_gcs += 1;
+        let live = self.clauses.word_size() - self.clauses.wasted();
+        // Headroom so the new arena doesn't immediately regrow as learning
+        // resumes; it still shrinks the footprint whenever waste > 20%.
+        let mut to = ClauseArena::with_capacity(live + live / 4);
+
+        // Tier 0: originals.
+        self.clauses.reloc_originals(&mut to);
+
+        // Tier 1: learnts in the quality order reduce_db just established.
+        for cr in self.learnts.iter_mut() {
+            *cr = self.clauses.reloc(*cr, &mut to);
+        }
+
+        // Remap the remaining ClauseRef holders. `reloc` is idempotent, so
+        // everything already moved just gets its forwarding pointer back.
+        // Watcher order within each list is preserved — that's what keeps
+        // the propagation trajectory identical.
+        for wl in self.watches.iter_mut() {
+            for w in wl.iter_mut() {
+                if !w.is_binary() {
+                    *w = Watcher::long(self.clauses.reloc(w.long_cref(), &mut to), w.blocker);
+                }
+            }
+        }
+        for i in 0..self.trail.len() {
+            let vi = self.trail[i].var_idx();
+            if let Reason::Clause(cr) = self.reason[vi] {
+                self.reason[vi] = Reason::Clause(self.clauses.reloc(cr, &mut to));
+            }
+        }
+
+        self.clauses = to;
     }
 
     fn pick_branch_lit(&mut self) -> Option<Lit> {

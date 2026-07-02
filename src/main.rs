@@ -115,6 +115,8 @@ fn real_main() -> i32 {
                     eprintln!("c restarts    : {}", s.restarts);
                     eprintln!("c learned     : {}", s.learned);
                     eprintln!("c propagations: {}", s.propagations);
+                    eprintln!("c reductions  : {}", s.reductions);
+                    eprintln!("c gcs         : {}", s.gcs);
                     eprintln!("c bv_var_total: {}", s.bv_var_total);
                     eprintln!("c bv_aliased  : {}", s.bv_aliased);
                     eprintln!("c bool_aliased: {}", s.bool_aliased);
@@ -238,6 +240,7 @@ fn real_main() -> i32 {
     eprintln!("c learned     : {}", solver.stats_learned);
     eprintln!("c deleted     : {}", solver.stats_deleted);
     eprintln!("c reductions  : {}", solver.stats_reductions);
+    eprintln!("c gcs         : {}", solver.stats_gcs);
     eprintln!("c min removed : {}", solver.stats_min_removed);
     eprintln!("c cpu time    : {:.3}s", elapsed.as_secs_f64());
     0

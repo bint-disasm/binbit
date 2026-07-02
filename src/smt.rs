@@ -99,6 +99,9 @@ pub struct SmtSolverStats {
     pub restarts: u64,
     pub learned: u64,
     pub propagations: u64,
+    /// Learned-DB reductions and clause-arena garbage collections.
+    pub reductions: u64,
+    pub gcs: u64,
     pub bv_aliased: usize,
     pub bool_aliased: usize,
     pub bv_var_total: usize,
@@ -2186,6 +2189,8 @@ impl SmtSolver {
             restarts: self.sat.stats_restarts,
             learned: self.sat.stats_learned,
             propagations: self.sat.stats_propagations,
+            reductions: self.sat.stats_reductions,
+            gcs: self.sat.stats_gcs,
             bv_aliased,
             bool_aliased,
             bv_var_total: self.ctx.bv_var_widths.len(),
