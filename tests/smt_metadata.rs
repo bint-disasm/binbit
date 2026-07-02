@@ -15,10 +15,12 @@ fn solve_sat(s: &mut SmtSolver) {
 fn input_bv_var_bits_are_tagged() {
     let mut s = SmtSolver::new();
     let x = s.bv_var(8);
-    // Force bitblasting by asserting something that references x.
-    let c = s.bv_const(0, 8);
-    let eq = s.bv_eq(x, c);
-    s.assert(eq);
+    // Force bitblasting by asserting something that references x. Must be
+    // an inequality: `(= x const)` roots get variable-substituted away and
+    // x would never allocate SAT bits at all.
+    let c = s.bv_const(200, 8);
+    let lt = s.bv_ult(x, c);
+    s.assert(lt);
     solve_sat(&mut s);
 
     // Walk every SAT var and collect origins that are BvBit on `x`.
@@ -154,10 +156,12 @@ fn ite_gate_is_registered() {
     let a = s.bv_var(8);
     let b = s.bv_var(8);
     let ite = s.bv_ite(c, a, b);
-    // Force bitblasting by asserting equality with another symbolic term.
+    // Force bitblasting via an inequality against another symbolic term —
+    // `(= ite probe)` would substitute probe := ite and drop the assertion
+    // (leaving no gates to register).
     let probe = s.bv_var(8);
-    let eq = s.bv_eq(ite, probe);
-    s.assert(eq);
+    let lt = s.bv_ult(ite, probe);
+    s.assert(lt);
     solve_sat(&mut s);
 
     let gates = s.ite_gates();

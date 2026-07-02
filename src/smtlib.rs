@@ -90,8 +90,13 @@ struct Runner<'a> {
     // nothing has captured the old fresh-var term yet. First lookup through
     // `eval_atom` evicts the name from this set.
     declared: std::collections::HashSet<String>,
-    // Nested let-binding scopes.
-    let_stack: Vec<HashMap<String, TaggedTerm>>,
+    // Let bindings: per-name shadow stacks + per-scope frames recording
+    // which names to unbind on pop. O(1) lookup regardless of nesting
+    // depth — Sage2-style dumps nest `let` thousands deep, and a
+    // scope-list scan per symbol reference is quadratic over the file
+    // (bench_3335: 5.7s of pure lookup, zero SAT conflicts).
+    let_bindings: HashMap<String, Vec<TaggedTerm>>,
+    let_frames: Vec<Vec<String>>,
     output: String,
 }
 
@@ -101,7 +106,8 @@ impl<'a> Runner<'a> {
             solver,
             symbols: HashMap::new(),
             declared: std::collections::HashSet::new(),
-            let_stack: Vec::new(),
+            let_bindings: HashMap::new(),
+            let_frames: Vec::new(),
             output: String::new(),
         }
     }
@@ -399,9 +405,9 @@ impl<'a> Runner<'a> {
             return Ok(TaggedTerm::Bv(self.solver.bv_const_wide(&limbs, w), w));
         }
 
-        // Named symbol lookup: first in local let scopes, then globals.
-        for scope in self.let_stack.iter().rev() {
-            if let Some(&t) = scope.get(s) {
+        // Named symbol lookup: first in local let bindings, then globals.
+        if let Some(stack) = self.let_bindings.get(s) {
+            if let Some(&t) = stack.last() {
                 return Ok(t);
             }
         }
@@ -451,7 +457,10 @@ impl<'a> Runner<'a> {
                     .get(1)
                     .ok_or("let: missing body")?;
 
-                let mut scope = HashMap::new();
+                // SMT-LIB `let` is parallel: evaluate every bound value
+                // in the OUTER scope before any binding takes effect.
+                let mut pairs: Vec<(String, TaggedTerm)> =
+                    Vec::with_capacity(bindings_list.len());
                 for b in bindings_list {
                     let pair = match b {
                         SExpr::List(xs) if xs.len() == 2 => xs,
@@ -459,11 +468,27 @@ impl<'a> Runner<'a> {
                     };
                     let name = atom(pair.first())?;
                     let value = self.eval_expr(&pair[1])?;
-                    scope.insert(name.to_string(), value);
+                    pairs.push((name.to_string(), value));
                 }
-                self.let_stack.push(scope);
+                let mut frame = Vec::with_capacity(pairs.len());
+                for (name, value) in pairs {
+                    self.let_bindings
+                        .entry(name.clone())
+                        .or_default()
+                        .push(value);
+                    frame.push(name);
+                }
+                self.let_frames.push(frame);
                 let result = self.eval_expr(body);
-                self.let_stack.pop();
+                let frame = self.let_frames.pop().expect("balanced let frames");
+                for name in frame {
+                    if let Some(stack) = self.let_bindings.get_mut(&name) {
+                        stack.pop();
+                        if stack.is_empty() {
+                            self.let_bindings.remove(&name);
+                        }
+                    }
+                }
                 result
             }
 
@@ -1121,10 +1146,8 @@ impl<'a> Runner<'a> {
             _ => return None,
         };
         // Shadowing check — let binds must not capture `name`.
-        for scope in self.let_stack.iter().rev() {
-            if scope.contains_key(name) {
-                return None;
-            }
+        if self.let_bindings.get(name).map_or(false, |s| !s.is_empty()) {
+            return None;
         }
         if !self.declared.contains(name) {
             return None;
@@ -1192,10 +1215,11 @@ impl<'a> Runner<'a> {
         let lname = name_of(&xs[1])?;
         let rname = name_of(&xs[2])?;
         // Names shadowed by a `let` binding aren't eligible.
-        for scope in self.let_stack.iter().rev() {
-            if scope.contains_key(&lname) || scope.contains_key(&rname) {
-                return None;
-            }
+        let shadowed = |m: &HashMap<String, Vec<TaggedTerm>>, n: &str| {
+            m.get(n).map_or(false, |s| !s.is_empty())
+        };
+        if shadowed(&self.let_bindings, &lname) || shadowed(&self.let_bindings, &rname) {
+            return None;
         }
         let &lt = self.symbols.get(&lname)?;
         let &rt = self.symbols.get(&rname)?;
@@ -1250,10 +1274,8 @@ impl<'a> Runner<'a> {
             // let-scoped names never enter `self.declared`, but a name might
             // coincidentally shadow a declared symbol; in that case we must
             // not substitute, because the let wins.
-            for scope in self.let_stack.iter().rev() {
-                if scope.contains_key(name) {
-                    return None;
-                }
+            if self.let_bindings.get(name).map_or(false, |s| !s.is_empty()) {
+                return None;
             }
             if !self.declared.contains(name) {
                 return None;

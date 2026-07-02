@@ -104,6 +104,8 @@ pub struct SmtSolverStats {
     pub bv_var_total: usize,
     pub bv_nodes_total: usize,
     pub bv_vars_bitblasted: usize,
+    /// Variables substituted away at the term level (`x = t` roots).
+    pub pp_substituted: u64,
     /// Gate variables removed by CNF preprocessing (bounded VE).
     pub pp_eliminated: u64,
     /// Clauses removed by (self-)subsumption during CNF preprocessing.
@@ -185,6 +187,21 @@ pub struct SmtSolver {
     /// commitment. `None` = direct mode (model probes, assumptions,
     /// named assertions).
     cnf_buffer: Option<Vec<Vec<Lit>>>,
+
+    /// Top-level variable substitution: `x → t` for every flush-time
+    /// assertion root `(= x t)` where `x` is an un-bitblasted variable not
+    /// occurring in `t` (transitively, through the map). Consulted by
+    /// `bitblast_bv`'s Var arm — a substituted variable never allocates
+    /// SAT bits; model reads evaluate `t` instead, so `get_bv_value(x)`
+    /// stays consistent. Keyed by union-find ROOT variable id.
+    bv_var_subst: HashMap<u32, BvTerm>,
+    /// Memo maps for applying the substitution to assertion DAGs. Cleared
+    /// whenever the substitution map grows (older rewrites may be stale
+    /// with respect to newly-accepted substitutions).
+    subst_bool_memo: HashMap<BoolTerm, BoolTerm>,
+    subst_bv_memo: HashMap<BvTerm, BvTerm>,
+    /// Cumulative number of installed substitutions (stats).
+    pp_substituted: u64,
 
     /// Arithmetic normalization (flatten/cancel bvadd chains under
     /// comparisons) applied to every pending assertion at flush. Memo maps
@@ -300,6 +317,10 @@ impl SmtSolver {
             aig_lit: Vec::new(),
             lit_node: Vec::new(),
             cnf_buffer: None,
+            bv_var_subst: HashMap::default(),
+            subst_bool_memo: HashMap::default(),
+            subst_bv_memo: HashMap::default(),
+            pp_substituted: 0,
             normalize_enabled: true,
             norm_bool_memo: HashMap::default(),
             norm_bv_memo: HashMap::default(),
@@ -498,6 +519,11 @@ impl SmtSolver {
             return false;
         }
         if self.bv_var_refs.contains_key(&xid) || self.bv_var_refs.contains_key(&yid) {
+            return false;
+        }
+        let rx = self.find_bv_var_root(xid);
+        let ry = self.find_bv_var_root(yid);
+        if self.bv_var_subst.contains_key(&rx) || self.bv_var_subst.contains_key(&ry) {
             return false;
         }
         self.union_bv_var_ids(xid, yid);
@@ -990,6 +1016,415 @@ impl SmtSolver {
         }
     }
 
+    /// Scan batch roots for `(= x t)` substitution candidates and install
+    /// the sound ones into `bv_var_subst`. Returns how many were added.
+    ///
+    /// Eligibility for `x → t`: `x` is a bare variable whose union-find
+    /// root has no SAT bits yet (nothing outside this batch can reference
+    /// it), the root isn't already substituted, and `x` does not occur in
+    /// `t` — transitively through already-accepted substitutions, which
+    /// also guarantees the map stays acyclic. Var=var equalities go to the
+    /// cheaper union-find alias when possible.
+    fn collect_substitutions(&mut self, batch: &[(usize, Vec<BoolTerm>)]) -> usize {
+        let mut installed = 0usize;
+        for (_, ts) in batch {
+            for &t in ts {
+                let BoolOp::Eq(a, b) = self.ctx.bool_op(t) else { continue };
+                // var = var: alias (free) — falls through to substitution
+                // if one side is already bitblasted.
+                if self.alias_bv_vars(a, b) {
+                    continue;
+                }
+                for (x, rhs) in [(a, b), (b, a)] {
+                    let BvOp::Var(id) = self.ctx.bv_op(x) else { continue };
+                    let root = self.find_bv_var_root(id);
+                    if self.bv_var_refs.contains_key(&root)
+                        || self.bv_var_subst.contains_key(&root)
+                    {
+                        continue;
+                    }
+                    if self.subst_occurs(root, rhs) {
+                        continue;
+                    }
+                    self.bv_var_subst.insert(root, rhs);
+                    self.pp_substituted += 1;
+                    installed += 1;
+                    break;
+                }
+            }
+        }
+        installed
+    }
+
+    /// Does variable root `x_root` occur in `t`, chasing already-installed
+    /// substitutions? Iterative DAG walk with a visited set.
+    fn subst_occurs(&mut self, x_root: u32, t: BvTerm) -> bool {
+        let mut visited: HashMap<BvTerm, ()> = HashMap::default();
+        let mut stack = vec![t];
+        while let Some(cur) = stack.pop() {
+            if visited.contains_key(&cur) {
+                continue;
+            }
+            visited.insert(cur, ());
+            match self.ctx.bv_op(cur) {
+                BvOp::Var(id) => {
+                    let root = self.find_bv_var_root(id);
+                    if root == x_root {
+                        return true;
+                    }
+                    if let Some(&sub) = self.bv_var_subst.get(&root) {
+                        stack.push(sub);
+                    }
+                }
+                BvOp::Const => {}
+                BvOp::Not(x) | BvOp::Neg(x) | BvOp::Popcount(x) | BvOp::Clz(x)
+                | BvOp::Ctz(x) | BvOp::Extract(x, _, _) | BvOp::ZeroExtend(x, _)
+                | BvOp::SignExtend(x, _) => stack.push(x),
+                BvOp::And(x, y) | BvOp::Or(x, y) | BvOp::Xor(x, y)
+                | BvOp::Add(x, y) | BvOp::Sub(x, y) | BvOp::Mul(x, y)
+                | BvOp::Udiv(x, y) | BvOp::Urem(x, y) | BvOp::Sdiv(x, y)
+                | BvOp::Srem(x, y) | BvOp::Smod(x, y) | BvOp::Shl(x, y)
+                | BvOp::Lshr(x, y) | BvOp::Ashr(x, y) | BvOp::Concat(x, y)
+                | BvOp::RotateLeft(x, y) | BvOp::RotateRight(x, y) => {
+                    stack.push(x);
+                    stack.push(y);
+                }
+                BvOp::Ite(c, x, y) => {
+                    stack.push(x);
+                    stack.push(y);
+                    self.push_bool_bv_children(c, &mut stack, &mut visited);
+                }
+                BvOp::Select(idx) => {
+                    let table = self.ctx.select_tables[idx as usize].clone();
+                    for &v in table.values.iter() {
+                        stack.push(v);
+                    }
+                    stack.push(table.default);
+                    for &s in table.selectors.iter() {
+                        self.push_bool_bv_children(s, &mut stack, &mut visited);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Push the BV children of a Bool term (and recurse through its Bool
+    /// structure) onto an occurs-check stack.
+    fn push_bool_bv_children(
+        &mut self,
+        t: BoolTerm,
+        stack: &mut Vec<BvTerm>,
+        visited: &mut HashMap<BvTerm, ()>,
+    ) {
+        let _ = visited;
+        let mut bools = vec![t];
+        let mut seen: HashMap<BoolTerm, ()> = HashMap::default();
+        while let Some(bt) = bools.pop() {
+            if seen.contains_key(&bt) {
+                continue;
+            }
+            seen.insert(bt, ());
+            match self.ctx.bool_op(bt) {
+                BoolOp::True | BoolOp::False | BoolOp::Var(_) => {}
+                BoolOp::Not(a) => bools.push(a),
+                BoolOp::And(a, b) | BoolOp::Or(a, b) | BoolOp::Implies(a, b) => {
+                    bools.push(a);
+                    bools.push(b);
+                }
+                BoolOp::Eq(a, b) | BoolOp::Ult(a, b) | BoolOp::Ule(a, b)
+                | BoolOp::Slt(a, b) | BoolOp::Sle(a, b)
+                | BoolOp::UaddOverflow(a, b) | BoolOp::SaddOverflow(a, b)
+                | BoolOp::UsubOverflow(a, b) | BoolOp::SsubOverflow(a, b)
+                | BoolOp::UmulOverflow(a, b) | BoolOp::SmulOverflow(a, b)
+                | BoolOp::SdivOverflow(a, b) => {
+                    stack.push(a);
+                    stack.push(b);
+                }
+                BoolOp::NegOverflow(a) => stack.push(a),
+            }
+        }
+    }
+
+    /// Apply the substitution map to a Bool assertion DAG (memoized). Runs
+    /// through the term builders so rewrites fire on substituted forms —
+    /// that's where most of the payoff is (constants flow through folds,
+    /// comparisons collapse via bits-known, adder chains cancel).
+    fn apply_subst_bool(
+        &mut self,
+        t: BoolTerm,
+        bm: &mut HashMap<BoolTerm, BoolTerm>,
+        vm: &mut HashMap<BvTerm, BvTerm>,
+    ) -> BoolTerm {
+        if let Some(&r) = bm.get(&t) {
+            return r;
+        }
+        let op = self.ctx.bool_op(t);
+        let r = match op {
+            BoolOp::True | BoolOp::False | BoolOp::Var(_) => t,
+            BoolOp::Not(x) => {
+                let nx = self.apply_subst_bool(x, bm, vm);
+                if nx == x { t } else { self.ctx.bool_not(nx) }
+            }
+            BoolOp::And(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bool(x, bm, vm), self.apply_subst_bool(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bool_and(nx, ny) }
+            }
+            BoolOp::Or(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bool(x, bm, vm), self.apply_subst_bool(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bool_or(nx, ny) }
+            }
+            BoolOp::Implies(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bool(x, bm, vm), self.apply_subst_bool(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bool_implies(nx, ny) }
+            }
+            BoolOp::Eq(a, b) => {
+                let (na, nb) =
+                    (self.apply_subst_bv(a, bm, vm), self.apply_subst_bv(b, bm, vm));
+                if na == a && nb == b { t } else { self.ctx.bv_eq(na, nb) }
+            }
+            BoolOp::Ult(a, b) => {
+                let (na, nb) =
+                    (self.apply_subst_bv(a, bm, vm), self.apply_subst_bv(b, bm, vm));
+                if na == a && nb == b { t } else { self.ctx.bv_ult(na, nb) }
+            }
+            BoolOp::Ule(a, b) => {
+                let (na, nb) =
+                    (self.apply_subst_bv(a, bm, vm), self.apply_subst_bv(b, bm, vm));
+                if na == a && nb == b { t } else { self.ctx.bv_ule(na, nb) }
+            }
+            BoolOp::Slt(a, b) => {
+                let (na, nb) =
+                    (self.apply_subst_bv(a, bm, vm), self.apply_subst_bv(b, bm, vm));
+                if na == a && nb == b { t } else { self.ctx.bv_slt(na, nb) }
+            }
+            BoolOp::Sle(a, b) => {
+                let (na, nb) =
+                    (self.apply_subst_bv(a, bm, vm), self.apply_subst_bv(b, bm, vm));
+                if na == a && nb == b { t } else { self.ctx.bv_sle(na, nb) }
+            }
+            BoolOp::UaddOverflow(a, b) => {
+                let (na, nb) =
+                    (self.apply_subst_bv(a, bm, vm), self.apply_subst_bv(b, bm, vm));
+                if na == a && nb == b { t } else { self.ctx.bv_uadd_overflow(na, nb) }
+            }
+            BoolOp::SaddOverflow(a, b) => {
+                let (na, nb) =
+                    (self.apply_subst_bv(a, bm, vm), self.apply_subst_bv(b, bm, vm));
+                if na == a && nb == b { t } else { self.ctx.bv_sadd_overflow(na, nb) }
+            }
+            BoolOp::UsubOverflow(a, b) => {
+                let (na, nb) =
+                    (self.apply_subst_bv(a, bm, vm), self.apply_subst_bv(b, bm, vm));
+                if na == a && nb == b { t } else { self.ctx.bv_usub_overflow(na, nb) }
+            }
+            BoolOp::SsubOverflow(a, b) => {
+                let (na, nb) =
+                    (self.apply_subst_bv(a, bm, vm), self.apply_subst_bv(b, bm, vm));
+                if na == a && nb == b { t } else { self.ctx.bv_ssub_overflow(na, nb) }
+            }
+            BoolOp::UmulOverflow(a, b) => {
+                let (na, nb) =
+                    (self.apply_subst_bv(a, bm, vm), self.apply_subst_bv(b, bm, vm));
+                if na == a && nb == b { t } else { self.ctx.bv_umul_overflow(na, nb) }
+            }
+            BoolOp::SmulOverflow(a, b) => {
+                let (na, nb) =
+                    (self.apply_subst_bv(a, bm, vm), self.apply_subst_bv(b, bm, vm));
+                if na == a && nb == b { t } else { self.ctx.bv_smul_overflow(na, nb) }
+            }
+            BoolOp::NegOverflow(a) => {
+                let na = self.apply_subst_bv(a, bm, vm);
+                if na == a { t } else { self.ctx.bv_neg_overflow(na) }
+            }
+            BoolOp::SdivOverflow(a, b) => {
+                let (na, nb) =
+                    (self.apply_subst_bv(a, bm, vm), self.apply_subst_bv(b, bm, vm));
+                if na == a && nb == b { t } else { self.ctx.bv_sdiv_overflow(na, nb) }
+            }
+        };
+        bm.insert(t, r);
+        r
+    }
+
+    fn apply_subst_bv(
+        &mut self,
+        t: BvTerm,
+        bm: &mut HashMap<BoolTerm, BoolTerm>,
+        vm: &mut HashMap<BvTerm, BvTerm>,
+    ) -> BvTerm {
+        if let Some(&r) = vm.get(&t) {
+            return r;
+        }
+        let op = self.ctx.bv_op(t);
+        let r = match op {
+            BvOp::Var(id) => {
+                let root = self.find_bv_var_root(id);
+                match self.bv_var_subst.get(&root).copied() {
+                    // Substitution targets may themselves contain
+                    // substituted vars — recurse (map is acyclic).
+                    Some(sub) => self.apply_subst_bv(sub, bm, vm),
+                    None => t,
+                }
+            }
+            BvOp::Const => t,
+            BvOp::Not(x) => {
+                let nx = self.apply_subst_bv(x, bm, vm);
+                if nx == x { t } else { self.ctx.bv_not(nx) }
+            }
+            BvOp::Neg(x) => {
+                let nx = self.apply_subst_bv(x, bm, vm);
+                if nx == x { t } else { self.ctx.bv_neg(nx) }
+            }
+            BvOp::And(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_and(nx, ny) }
+            }
+            BvOp::Or(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_or(nx, ny) }
+            }
+            BvOp::Xor(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_xor(nx, ny) }
+            }
+            BvOp::Add(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_add(nx, ny) }
+            }
+            BvOp::Sub(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_sub(nx, ny) }
+            }
+            BvOp::Mul(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_mul(nx, ny) }
+            }
+            BvOp::Udiv(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_udiv(nx, ny) }
+            }
+            BvOp::Urem(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_urem(nx, ny) }
+            }
+            BvOp::Sdiv(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_sdiv(nx, ny) }
+            }
+            BvOp::Srem(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_srem(nx, ny) }
+            }
+            BvOp::Smod(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_smod(nx, ny) }
+            }
+            BvOp::Shl(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_shl(nx, ny) }
+            }
+            BvOp::Lshr(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_lshr(nx, ny) }
+            }
+            BvOp::Ashr(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_ashr(nx, ny) }
+            }
+            BvOp::RotateLeft(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_rotate_left_dyn(nx, ny) }
+            }
+            BvOp::RotateRight(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_rotate_right_dyn(nx, ny) }
+            }
+            BvOp::Popcount(x) => {
+                let nx = self.apply_subst_bv(x, bm, vm);
+                if nx == x { t } else { self.ctx.bv_popcount(nx) }
+            }
+            BvOp::Clz(x) => {
+                let nx = self.apply_subst_bv(x, bm, vm);
+                if nx == x { t } else { self.ctx.bv_clz(nx) }
+            }
+            BvOp::Ctz(x) => {
+                let nx = self.apply_subst_bv(x, bm, vm);
+                if nx == x { t } else { self.ctx.bv_ctz(nx) }
+            }
+            BvOp::Extract(x, hi, lo) => {
+                let nx = self.apply_subst_bv(x, bm, vm);
+                if nx == x { t } else { self.ctx.bv_extract(nx, hi, lo) }
+            }
+            BvOp::Concat(x, y) => {
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.ctx.bv_concat(nx, ny) }
+            }
+            BvOp::ZeroExtend(x, n) => {
+                let nx = self.apply_subst_bv(x, bm, vm);
+                if nx == x { t } else { self.ctx.bv_zero_extend(nx, n) }
+            }
+            BvOp::SignExtend(x, n) => {
+                let nx = self.apply_subst_bv(x, bm, vm);
+                if nx == x { t } else { self.ctx.bv_sign_extend(nx, n) }
+            }
+            BvOp::Ite(c, x, y) => {
+                let nc = self.apply_subst_bool(c, bm, vm);
+                let (nx, ny) =
+                    (self.apply_subst_bv(x, bm, vm), self.apply_subst_bv(y, bm, vm));
+                if nc == c && nx == x && ny == y {
+                    t
+                } else {
+                    self.ctx.bv_ite(nc, nx, ny)
+                }
+            }
+            BvOp::Select(idx) => {
+                let table = self.ctx.select_tables[idx as usize].clone();
+                let sels: Vec<BoolTerm> = table
+                    .selectors
+                    .iter()
+                    .map(|&s| self.apply_subst_bool(s, bm, vm))
+                    .collect();
+                let vals: Vec<BvTerm> = table
+                    .values
+                    .iter()
+                    .map(|&v| self.apply_subst_bv(v, bm, vm))
+                    .collect();
+                let ndef = self.apply_subst_bv(table.default, bm, vm);
+                let unchanged = ndef == table.default
+                    && sels.iter().zip(table.selectors.iter()).all(|(a, b)| a == b)
+                    && vals.iter().zip(table.values.iter()).all(|(a, b)| a == b);
+                if unchanged {
+                    t
+                } else {
+                    self.ctx.bv_select(&sels, &vals, ndef)
+                }
+            }
+        };
+        vm.insert(t, r);
+        r
+    }
+
     /// Bitblast every pending assertion, emitting SAT clauses for the AIG
     /// cone each assertion actually reaches. After flush, the pending queues
     /// for every scope are empty and all those assertions live in the SAT
@@ -1008,6 +1443,29 @@ impl SmtSolver {
                 let terms = std::mem::take(&mut self.pending[depth]);
                 if !terms.is_empty() {
                     batch.push((depth, terms));
+                }
+            }
+
+            // Top-level variable substitution (bitwuzla's varsubst-lite):
+            // only sound outside push scopes — a popped scope must not
+            // leave permanent substitutions behind.
+            if self.activation_stack.is_empty() {
+                let installed = self.collect_substitutions(&batch);
+                if installed > 0 {
+                    // New substitutions invalidate prior rewrites.
+                    self.subst_bool_memo.clear();
+                    self.subst_bv_memo.clear();
+                }
+                if !self.bv_var_subst.is_empty() {
+                    let mut bm = std::mem::take(&mut self.subst_bool_memo);
+                    let mut vm = std::mem::take(&mut self.subst_bv_memo);
+                    for (_, ts) in batch.iter_mut() {
+                        for t in ts.iter_mut() {
+                            *t = self.apply_subst_bool(*t, &mut bm, &mut vm);
+                        }
+                    }
+                    self.subst_bool_memo = bm;
+                    self.subst_bv_memo = vm;
                 }
             }
 
@@ -1265,6 +1723,7 @@ impl SmtSolver {
             bv_var_total: self.ctx.bv_var_widths.len(),
             bv_nodes_total: self.ctx.bv_nodes.len(),
             bv_vars_bitblasted: self.bv_var_refs.len(),
+            pp_substituted: self.pp_substituted,
             pp_eliminated: self.pp_eliminated,
             pp_subsumed: self.pp_subsumed,
             pp_strengthened: self.pp_strengthened,
@@ -1475,7 +1934,16 @@ impl SmtSolver {
         self.current_bv_ctx = Some(t);
         let node = self.ctx.bv_nodes[t.0 as usize];
         let bits = match node.op {
-            BvOp::Var(id) => self.get_or_make_bv_var(id, node.width),
+            BvOp::Var(id) => {
+                // Substituted variables never allocate SAT bits — they ARE
+                // their target term. Keeps model reads consistent:
+                // get_bv_value(x) evaluates t's cone.
+                let root = self.find_bv_var_root(id);
+                match self.bv_var_subst.get(&root).copied() {
+                    Some(sub) => self.bitblast_bv(sub),
+                    None => self.get_or_make_bv_var(root, node.width),
+                }
+            }
             BvOp::Const => {
                 if node.wide == crate::bv::WIDE_NONE {
                     // Fast path: value lives inline as a u128.

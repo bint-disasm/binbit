@@ -101,6 +101,7 @@ fn real_main() -> i32 {
                     eprintln!("c bool_aliased: {}", s.bool_aliased);
                     eprintln!("c bv_nodes    : {}", s.bv_nodes_total);
                     eprintln!("c bv_blasted  : {}", s.bv_vars_bitblasted);
+                    eprintln!("c pp_subst    : {}", s.pp_substituted);
                     eprintln!("c pp_elim     : {}", s.pp_eliminated);
                     eprintln!("c pp_subsumed : {}", s.pp_subsumed);
                 }
