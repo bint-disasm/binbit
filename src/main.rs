@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::time::Instant;
 
-use binbit::{LBool, Lit, SolveResult, Solver, Var, dimacs, run_script};
+use binbit::{LBool, Lit, SolveResult, Solver, Var, dimacs};
 
 // Swap the global allocator for mimalloc — the solver allocates heavily in a
 // few places (clause arena growth, watch lists, learned-clause Vecs) and

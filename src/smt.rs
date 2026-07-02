@@ -186,6 +186,14 @@ pub struct SmtSolver {
     /// named assertions).
     cnf_buffer: Option<Vec<Vec<Lit>>>,
 
+    /// Arithmetic normalization (flatten/cancel bvadd chains under
+    /// comparisons) applied to every pending assertion at flush. Memo maps
+    /// persist across flushes — terms are immutable, so a term's normal
+    /// form never changes.
+    normalize_enabled: bool,
+    norm_bool_memo: HashMap<BoolTerm, BoolTerm>,
+    norm_bv_memo: HashMap<BvTerm, BvTerm>,
+
     /// Cumulative preprocessing counters (vars eliminated / clauses
     /// subsumed / literals strengthened) — exposed via [`sat_stats`].
     pp_eliminated: u64,
@@ -269,11 +277,6 @@ pub struct SmtSolver {
     // `flush_pending` converts records whose output node got a lit into
     // public `IteGate`s.
     pending_ite_gates: Vec<PendingIte>,
-    // Deferred VSIDS boosts for ITE selectors: (sel, out). Applied at flush
-    // for every record whose `out` was materialized — mirrors the old
-    // behaviour of boosting once per mk_mux call on live muxes.
-    pending_sel_boosts: Vec<(AigRef, AigRef)>,
-
     // Every ITE gate whose CNF was emitted, in flush order.
     ite_gates: Vec<IteGate>,
     // Reverse index: for each SAT literal that's an ITE output, which gate
@@ -297,6 +300,9 @@ impl SmtSolver {
             aig_lit: Vec::new(),
             lit_node: Vec::new(),
             cnf_buffer: None,
+            normalize_enabled: true,
+            norm_bool_memo: HashMap::default(),
+            norm_bv_memo: HashMap::default(),
             pp_eliminated: 0,
             pp_subsumed: 0,
             pp_strengthened: 0,
@@ -316,11 +322,17 @@ impl SmtSolver {
             bitblast_cost_enabled: false,
             bitblast_cost: HashMap::default(),
             pending_ite_gates: Vec::new(),
-            pending_sel_boosts: Vec::new(),
             ite_gates: Vec::new(),
             ite_out_to_gate: HashMap::default(),
             ite_branching_hints: true,
         }
+    }
+
+    /// Enable or disable arithmetic normalization of assertions at flush
+    /// (bitwuzla-style bvadd flattening/cancellation under comparisons).
+    /// On by default; off is useful for ablation benchmarks.
+    pub fn set_normalization(&mut self, on: bool) {
+        self.normalize_enabled = on;
     }
 
     /// Enable or disable the ITE-aware branching hint. On (the default)
@@ -990,12 +1002,88 @@ impl SmtSolver {
             // they're gate outputs. Everything older may be referenced by
             // clauses already in the SAT core and must survive.
             let batch_start_var = self.sat.num_vars();
-            self.cnf_buffer = Some(Vec::new());
+            // Collect the batch per scope depth.
+            let mut batch: Vec<(usize, Vec<BoolTerm>)> = Vec::new();
             for depth in 0..self.pending.len() {
                 let terms = std::mem::take(&mut self.pending[depth]);
-                if terms.is_empty() {
-                    continue;
+                if !terms.is_empty() {
+                    batch.push((depth, terms));
                 }
+            }
+
+            // Arithmetic normalization with size-based acceptance: rewrite
+            // the batch, then bitblast BOTH variants into the AIG (pure —
+            // no CNF is emitted by bitblasting) and count fresh nodes.
+            // Keep the normalized batch only if it builds a smaller
+            // circuit. Reassociation can either merge thousands of
+            // permuted adder chains into one (huge win) or destroy
+            // sharing with non-additive consumers (huge loss) — measuring
+            // is the only reliable arbiter, and the loser's AIG nodes are
+            // memory-only garbage.
+            if self.normalize_enabled {
+                let cancelled_before = self.ctx.norm_cancelled;
+                let merged_before = self.ctx.norm_merged;
+                let mut bm = std::mem::take(&mut self.norm_bool_memo);
+                let mut vm = std::mem::take(&mut self.norm_bv_memo);
+                let normalized: Vec<(usize, Vec<BoolTerm>)> = batch
+                    .iter()
+                    .map(|(d, ts)| {
+                        (
+                            *d,
+                            ts.iter()
+                                .map(|&t| self.ctx.normalize_assertion(t, &mut bm, &mut vm))
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                self.norm_bool_memo = bm;
+                self.norm_bv_memo = vm;
+
+                let changed = normalized
+                    .iter()
+                    .zip(batch.iter())
+                    .any(|((_, na), (_, oa))| na != oa);
+                if changed {
+                    let cancelled = self.ctx.norm_cancelled - cancelled_before;
+                    let merged = self.ctx.norm_merged - merged_before;
+                    // Accept the normalized batch only when equality
+                    // flattening actually cancelled addends across sides —
+                    // a semantic simplification that reliably predicts a
+                    // search win even when coefficient rebuilds grow the
+                    // raw circuit (bench_5906: 4× more AIG nodes, 15×
+                    // faster solve). Pure reassociation (no cancellation)
+                    // was tried under several acceptance schemes —
+                    // unconditional, fresh-node scoring, reachable-cone
+                    // scoring — and consistently traded wins on one family
+                    // for losses on another; circuit size is a poor proxy
+                    // for search hardness, so without the cancellation
+                    // signal we keep the original formula.
+                    // Threshold on merge volume: the decisive wins on
+                    // this workload collapse tens of thousands of
+                    // duplicated addends (bench_5906/64/13728: ~19-20K
+                    // merges alongside ~300 cancellations); the one
+                    // observed counterexample where cancellation alone
+                    // mispredicts (bench_7373, unsat: 0.9s → 12s) sits at
+                    // 7K. Empirical, and deliberately conservative —
+                    // a rejected batch behaves exactly like the
+                    // pre-normalization solver.
+                    let accept = cancelled > 0 && merged >= 10_000;
+                    if std::env::var_os("BINBIT_DEBUG_NORM").is_some() {
+                        eprintln!(
+                            "c norm score: cancelled={} merged={} -> {}",
+                            cancelled,
+                            merged,
+                            if accept { "NORM" } else { "ORIG" }
+                        );
+                    }
+                    if accept {
+                        batch = normalized;
+                    }
+                }
+            }
+
+            self.cnf_buffer = Some(Vec::new());
+            for (depth, terms) in batch {
                 let act_lit = if depth == 0 {
                     None
                 } else {
@@ -1028,8 +1116,16 @@ impl SmtSolver {
     /// output var may later be dissolved by CNF preprocessing.
     fn resolve_pending_ites(&mut self) {
         let pending_ites = std::mem::take(&mut self.pending_ite_gates);
-        for rec in pending_ites {
-            let Some(o) = self.try_lit_of(rec.out) else { continue };
+        // Canonical processing order: by materialized output variable.
+        // Var indices follow structural materialization order, so gate
+        // registration (and the VSIDS bump sequence it drives) is
+        // independent of how many bitblast passes queued the records.
+        let mut resolved: Vec<(Lit, PendingIte)> = pending_ites
+            .into_iter()
+            .filter_map(|rec| self.try_lit_of(rec.out).map(|o| (o, rec)))
+            .collect();
+        resolved.sort_by_key(|(o, _)| o.var_idx());
+        for (o, rec) in resolved {
             if self.ite_out_to_gate.contains_key(&o) {
                 continue;
             }
@@ -1049,16 +1145,15 @@ impl SmtSolver {
                 source_term: rec.src,
             });
             self.ite_out_to_gate.insert(o, idx);
-        }
-
-        // Apply queued VSIDS boosts for ITE selectors whose gate is live.
-        let boosts = std::mem::take(&mut self.pending_sel_boosts);
-        for (sel, out) in boosts {
-            if self.try_lit_of(out).is_none() {
-                continue; // dead mux — never reached an asserted root
-            }
-            if let Some(sel_lit) = self.try_lit_of(sel) {
-                self.sat.boost_var_activity(sel_lit.var());
+            // Branching hint: deciding `sel` resolves the whole ITE
+            // subtree, so bump it once per live gate. Width-N ITEs stack
+            // N bumps on the same selector (one per bit-level gate),
+            // giving deep / wide ITE fan-outs a proportionally strong
+            // priority. Registration is deduped by output lit, so the
+            // bump count is independent of how many bitblast passes
+            // (e.g. normalization scoring) touched the mux.
+            if self.ite_branching_hints {
+                self.sat.boost_var_activity(sel.var());
             }
         }
     }
@@ -1181,6 +1276,7 @@ impl SmtSolver {
     pub fn aig_nodes(&self) -> usize {
         self.aig.num_nodes()
     }
+
 
     // ---------- Metadata accessors ----------
 
@@ -2187,13 +2283,6 @@ impl SmtSolver {
             out,
             src: self.current_bv_ctx,
         });
-        // Branching hint: deciding `sel` resolves the whole ITE subtree.
-        // Width-N ITEs naturally stack N queued boosts onto the same
-        // selector, giving deep / wide ITE fan-outs a proportionally
-        // strong priority once their gates go live.
-        if self.ite_branching_hints {
-            self.pending_sel_boosts.push((sel, out));
-        }
         out
     }
 

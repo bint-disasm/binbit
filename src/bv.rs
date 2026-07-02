@@ -28,8 +28,10 @@ pub const MAX_BV_WIDTH: u32 = 1 << 16; // 64K bits
 /// `value` field (width ≤ 128), nothing to look up in the wide pool.
 pub const WIDE_NONE: u32 = u32::MAX;
 
-/// Opaque handle to a bitvector-sorted term.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+/// Opaque handle to a bitvector-sorted term. `Ord` follows creation order
+/// (arena index) — used by the normalization pass for canonical operand
+/// ordering.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct BvTerm(pub u32);
 
 /// Opaque handle to a boolean-sorted term.
@@ -275,6 +277,16 @@ pub struct BvContext {
     /// O(N·M) for no measurable dedup gain.
     pub select_tables: Vec<SelectTable>,
 
+    /// Cumulative count of addends cancelled by `norm_eq_add` (terms whose
+    /// coefficients zeroed out when the two sides of an equality merged).
+    /// Read by the SMT layer's normalization-acceptance heuristic.
+    pub norm_cancelled: u64,
+
+    /// Cumulative count of coefficient merges during add-chain flattening
+    /// (an addend occurring again while flattening — `x + ... + x` folding
+    /// to `2·x`). Second signal for normalization acceptance.
+    pub norm_merged: u64,
+
     /// Parallel to [`bv_nodes`]: for each term, `(known_ones, known_zeros)`
     /// — a 3-valued abstraction of the term's bits. Bit i of `known_ones`
     /// is set iff bit i of the term is provably 1 under every satisfying
@@ -303,6 +315,8 @@ impl BvContext {
             wide_values: Vec::new(),
             wide_interner: HashMap::default(),
             select_tables: Vec::new(),
+            norm_cancelled: 0,
+            norm_merged: 0,
             known_bits: Vec::new(),
         }
     }
@@ -2236,6 +2250,527 @@ impl BvContext {
         let wy = self.width_of(y);
         assert_eq!(wx, wy, "BV width mismatch: {} vs {}", wx, wy);
         wx
+    }
+
+    // ---------- Arithmetic normalization (bitwuzla-style) ----------
+    //
+    // Flatten bvadd chains under comparisons into coefficient multisets
+    // (`term → coefficient mod 2^w`), then rebuild in a canonical order.
+    // Two payoffs:
+    //
+    //   - **Sharing.** `(x + y) + z` and `(z + x) + y` become the same
+    //     term, so permuted re-associations across thousands of assertions
+    //     bitblast to ONE adder chain instead of many that the SAT solver
+    //     must prove equal by search. This is the pass that decides the
+    //     Sage2-style `bvadd`/`bvmul` benchmarks (ablating the equivalent
+    //     pass in bitwuzla turns 0.7s solves into >30s timeouts).
+    //   - **Cancellation.** For equalities, common addends on both sides
+    //     cancel outright (`a + b = b + c` → `a = c`), and negative
+    //     coefficients move across the relation — both sound in Z/2^w.
+    //     For inequalities only the per-side canonicalization applies
+    //     (cancellation across `<` is unsound under wraparound).
+    //
+    // Flattening rules (all ring identities in Z/2^w):
+    //   Const v         → constant accumulator += coeff · v
+    //   Add(x, y)       → flatten(x, coeff), flatten(y, coeff)
+    //   Sub(x, y)       → flatten(x, coeff), flatten(y, −coeff)
+    //   Neg(x)          → flatten(x, −coeff)
+    //   Not(x)          → accumulator −= coeff; flatten(x, −coeff)   [~x = −x−1]
+    //   Mul(x, c)/(c, x)→ flatten(x, coeff · c)
+    //   anything else   → leaf: occs[t] += coeff
+
+    /// Normalize one assertion. Rewrites every comparison node reachable in
+    /// the Bool/BV DAG whose operands contain `bvadd` chains. Memoized via
+    /// the caller-provided maps so shared subterms rewrite once (pass the
+    /// same maps across calls for cross-assertion sharing).
+    pub fn normalize_assertion(
+        &mut self,
+        t: BoolTerm,
+        bool_memo: &mut HashMap<BoolTerm, BoolTerm>,
+        bv_memo: &mut HashMap<BvTerm, BvTerm>,
+    ) -> BoolTerm {
+        self.norm_bool(t, bool_memo, bv_memo)
+    }
+
+    fn norm_bool(
+        &mut self,
+        t: BoolTerm,
+        bm: &mut HashMap<BoolTerm, BoolTerm>,
+        vm: &mut HashMap<BvTerm, BvTerm>,
+    ) -> BoolTerm {
+        if let Some(&r) = bm.get(&t) {
+            return r;
+        }
+        let op = self.bool_op(t);
+        let r = match op {
+            BoolOp::True | BoolOp::False | BoolOp::Var(_) => t,
+            BoolOp::Not(x) => {
+                let nx = self.norm_bool(x, bm, vm);
+                if nx == x { t } else { self.bool_not(nx) }
+            }
+            BoolOp::And(x, y) => {
+                let nx = self.norm_bool(x, bm, vm);
+                let ny = self.norm_bool(y, bm, vm);
+                if nx == x && ny == y { t } else { self.bool_and(nx, ny) }
+            }
+            BoolOp::Or(x, y) => {
+                let nx = self.norm_bool(x, bm, vm);
+                let ny = self.norm_bool(y, bm, vm);
+                if nx == x && ny == y { t } else { self.bool_or(nx, ny) }
+            }
+            BoolOp::Implies(x, y) => {
+                let nx = self.norm_bool(x, bm, vm);
+                let ny = self.norm_bool(y, bm, vm);
+                if nx == x && ny == y { t } else { self.bool_implies(nx, ny) }
+            }
+            BoolOp::Eq(a, b) => {
+                let na = self.norm_bv(a, bm, vm);
+                let nb = self.norm_bv(b, bm, vm);
+                self.norm_eq_add(na, nb, bm, vm)
+            }
+            BoolOp::Ult(a, b) => {
+                let (na, nb) = self.norm_cmp_sides(a, b, bm, vm);
+                self.bv_ult(na, nb)
+            }
+            BoolOp::Ule(a, b) => {
+                let (na, nb) = self.norm_cmp_sides(a, b, bm, vm);
+                self.bv_ule(na, nb)
+            }
+            BoolOp::Slt(a, b) => {
+                let (na, nb) = self.norm_cmp_sides(a, b, bm, vm);
+                self.bv_slt(na, nb)
+            }
+            BoolOp::Sle(a, b) => {
+                let (na, nb) = self.norm_cmp_sides(a, b, bm, vm);
+                self.bv_sle(na, nb)
+            }
+            // Overflow predicates: normalize operands, keep the predicate.
+            BoolOp::UaddOverflow(a, b) => {
+                let na = self.norm_bv(a, bm, vm);
+                let nb = self.norm_bv(b, bm, vm);
+                if na == a && nb == b { t } else { self.bv_uadd_overflow(na, nb) }
+            }
+            BoolOp::SaddOverflow(a, b) => {
+                let na = self.norm_bv(a, bm, vm);
+                let nb = self.norm_bv(b, bm, vm);
+                if na == a && nb == b { t } else { self.bv_sadd_overflow(na, nb) }
+            }
+            BoolOp::UsubOverflow(a, b) => {
+                let na = self.norm_bv(a, bm, vm);
+                let nb = self.norm_bv(b, bm, vm);
+                if na == a && nb == b { t } else { self.bv_usub_overflow(na, nb) }
+            }
+            BoolOp::SsubOverflow(a, b) => {
+                let na = self.norm_bv(a, bm, vm);
+                let nb = self.norm_bv(b, bm, vm);
+                if na == a && nb == b { t } else { self.bv_ssub_overflow(na, nb) }
+            }
+            BoolOp::UmulOverflow(a, b) => {
+                let na = self.norm_bv(a, bm, vm);
+                let nb = self.norm_bv(b, bm, vm);
+                if na == a && nb == b { t } else { self.bv_umul_overflow(na, nb) }
+            }
+            BoolOp::SmulOverflow(a, b) => {
+                let na = self.norm_bv(a, bm, vm);
+                let nb = self.norm_bv(b, bm, vm);
+                if na == a && nb == b { t } else { self.bv_smul_overflow(na, nb) }
+            }
+            BoolOp::NegOverflow(a) => {
+                let na = self.norm_bv(a, bm, vm);
+                if na == a { t } else { self.bv_neg_overflow(na) }
+            }
+            BoolOp::SdivOverflow(a, b) => {
+                let na = self.norm_bv(a, bm, vm);
+                let nb = self.norm_bv(b, bm, vm);
+                if na == a && nb == b { t } else { self.bv_sdiv_overflow(na, nb) }
+            }
+        };
+        bm.insert(t, r);
+        r
+    }
+
+    /// Recursively rewrite a BV term: nested comparisons (inside ITE
+    /// conditions) get normalized, and every `bvadd`-topped subterm is
+    /// rebuilt in canonical flattened form so permuted re-associations
+    /// share one term.
+    fn norm_bv(
+        &mut self,
+        t: BvTerm,
+        bm: &mut HashMap<BoolTerm, BoolTerm>,
+        vm: &mut HashMap<BvTerm, BvTerm>,
+    ) -> BvTerm {
+        if let Some(&r) = vm.get(&t) {
+            return r;
+        }
+        let op = self.bv_op(t);
+        let r = match op {
+            BvOp::Var(_) | BvOp::Const => t,
+            BvOp::Not(x) => {
+                let nx = self.norm_bv(x, bm, vm);
+                if nx == x { t } else { self.bv_not(nx) }
+            }
+            BvOp::And(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_and(nx, ny) }
+            }
+            BvOp::Or(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_or(nx, ny) }
+            }
+            BvOp::Xor(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_xor(nx, ny) }
+            }
+            BvOp::Add(_, _) | BvOp::Sub(_, _) | BvOp::Neg(_) => {
+                // Canonical flattened rebuild; acceptance decided at the
+                // batch level by the SMT layer (see flush_pending).
+                self.canon_add(t, bm, vm)
+            }
+            BvOp::Mul(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_mul(nx, ny) }
+            }
+            BvOp::Udiv(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_udiv(nx, ny) }
+            }
+            BvOp::Urem(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_urem(nx, ny) }
+            }
+            BvOp::Sdiv(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_sdiv(nx, ny) }
+            }
+            BvOp::Srem(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_srem(nx, ny) }
+            }
+            BvOp::Smod(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_smod(nx, ny) }
+            }
+            BvOp::Shl(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_shl(nx, ny) }
+            }
+            BvOp::Lshr(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_lshr(nx, ny) }
+            }
+            BvOp::Ashr(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_ashr(nx, ny) }
+            }
+            BvOp::RotateLeft(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_rotate_left_dyn(nx, ny) }
+            }
+            BvOp::RotateRight(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_rotate_right_dyn(nx, ny) }
+            }
+            BvOp::Popcount(x) => {
+                let nx = self.norm_bv(x, bm, vm);
+                if nx == x { t } else { self.bv_popcount(nx) }
+            }
+            BvOp::Clz(x) => {
+                let nx = self.norm_bv(x, bm, vm);
+                if nx == x { t } else { self.bv_clz(nx) }
+            }
+            BvOp::Ctz(x) => {
+                let nx = self.norm_bv(x, bm, vm);
+                if nx == x { t } else { self.bv_ctz(nx) }
+            }
+            BvOp::Extract(x, hi, lo) => {
+                let nx = self.norm_bv(x, bm, vm);
+                if nx == x { t } else { self.bv_extract(nx, hi, lo) }
+            }
+            BvOp::Concat(x, y) => {
+                let (nx, ny) = (self.norm_bv(x, bm, vm), self.norm_bv(y, bm, vm));
+                if nx == x && ny == y { t } else { self.bv_concat(nx, ny) }
+            }
+            BvOp::ZeroExtend(x, n) => {
+                let nx = self.norm_bv(x, bm, vm);
+                if nx == x { t } else { self.bv_zero_extend(nx, n) }
+            }
+            BvOp::SignExtend(x, n) => {
+                let nx = self.norm_bv(x, bm, vm);
+                if nx == x { t } else { self.bv_sign_extend(nx, n) }
+            }
+            BvOp::Ite(c, a, b) => {
+                let nc = self.norm_bool(c, bm, vm);
+                let (na, nb) = (self.norm_bv(a, bm, vm), self.norm_bv(b, bm, vm));
+                if nc == c && na == a && nb == b {
+                    t
+                } else {
+                    self.bv_ite(nc, na, nb)
+                }
+            }
+            BvOp::Select(idx) => {
+                let table = self.select_tables[idx as usize].clone();
+                let sels: Vec<BoolTerm> = table
+                    .selectors
+                    .iter()
+                    .map(|&s| self.norm_bool(s, bm, vm))
+                    .collect();
+                let vals: Vec<BvTerm> = table
+                    .values
+                    .iter()
+                    .map(|&v| self.norm_bv(v, bm, vm))
+                    .collect();
+                let ndef = self.norm_bv(table.default, bm, vm);
+                let unchanged = ndef == table.default
+                    && sels.iter().zip(table.selectors.iter()).all(|(a, b)| a == b)
+                    && vals.iter().zip(table.values.iter()).all(|(a, b)| a == b);
+                if unchanged {
+                    t
+                } else {
+                    self.bv_select(&sels, &vals, ndef)
+                }
+            }
+        };
+        vm.insert(t, r);
+        r
+    }
+
+    /// Flatten `t` (an add-chain) into `occs` with the given coefficient.
+    /// All arithmetic mod 2^w.
+    ///
+    /// Iterative and DAG-aware: decomposable nodes are queued with
+    /// accumulated coefficients and processed largest-index-first. Since
+    /// children always have smaller arena indices than their parents, every
+    /// node is decomposed exactly once with its full coefficient — a naive
+    /// recursive flatten re-visits shared subterms once per PATH, which is
+    /// exponential on deep shared add-DAGs (bench_4351 hangs in it).
+    fn flatten_add(
+        &mut self,
+        t: BvTerm,
+        coeff: u128,
+        w: u32,
+        occs: &mut std::collections::BTreeMap<BvTerm, u128>,
+        acc: &mut u128,
+        bm: &mut HashMap<BoolTerm, BoolTerm>,
+        vm: &mut HashMap<BvTerm, BvTerm>,
+    ) {
+        let m = mask(w);
+        // Pending decomposition queue: node index → accumulated coefficient.
+        let mut pending: std::collections::BTreeMap<u32, u128> =
+            std::collections::BTreeMap::new();
+        let add_pending = |map: &mut std::collections::BTreeMap<u32, u128>,
+                               node: BvTerm,
+                               c: u128,
+                               merged: &mut u64| {
+            match map.entry(node.0) {
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    *merged += 1;
+                    let v = e.get_mut();
+                    *v = v.wrapping_add(c) & m;
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(c & m);
+                }
+            }
+        };
+        let mut merged_local = 0u64;
+        add_pending(&mut pending, t, coeff, &mut merged_local);
+
+        while let Some((&idx, _)) = pending.last_key_value() {
+            let c = pending.remove(&idx).unwrap();
+            if c & m == 0 {
+                continue;
+            }
+            let cur = BvTerm(idx);
+            match self.bv_op(cur) {
+                BvOp::Const => {
+                    if let Some(v) = self.const_val(cur) {
+                        *acc = acc.wrapping_add(c.wrapping_mul(v)) & m;
+                        continue;
+                    }
+                }
+                BvOp::Add(x, y) => {
+                    add_pending(&mut pending, x, c, &mut merged_local);
+                    add_pending(&mut pending, y, c, &mut merged_local);
+                    continue;
+                }
+                BvOp::Sub(x, y) => {
+                    let neg = 0u128.wrapping_sub(c) & m;
+                    add_pending(&mut pending, x, c, &mut merged_local);
+                    add_pending(&mut pending, y, neg, &mut merged_local);
+                    continue;
+                }
+                BvOp::Neg(x) => {
+                    let neg = 0u128.wrapping_sub(c) & m;
+                    add_pending(&mut pending, x, neg, &mut merged_local);
+                    continue;
+                }
+                BvOp::Not(x) => {
+                    // ~x = -x - 1
+                    *acc = acc.wrapping_sub(c) & m;
+                    let neg = 0u128.wrapping_sub(c) & m;
+                    add_pending(&mut pending, x, neg, &mut merged_local);
+                    continue;
+                }
+                BvOp::Mul(x, y) => {
+                    if let Some(cv) = self.const_val(y) {
+                        add_pending(&mut pending, x, c.wrapping_mul(cv) & m, &mut merged_local);
+                        continue;
+                    }
+                    if let Some(cv) = self.const_val(x) {
+                        add_pending(&mut pending, y, c.wrapping_mul(cv) & m, &mut merged_local);
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            // Leaf: normalize it independently, then record the occurrence.
+            let nt = self.norm_bv(cur, bm, vm);
+            match occs.entry(nt) {
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    self.norm_merged += 1;
+                    let v = e.get_mut();
+                    *v = v.wrapping_add(c) & m;
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(c & m);
+                }
+            }
+        }
+        self.norm_merged += merged_local;
+    }
+
+    /// Rebuild a flattened side in canonical order: terms ascending by id,
+    /// each scaled by its coefficient (the `bv_mul` builder turns powers
+    /// of two into structural shifts and everything else into sparse NAF
+    /// adds), constant last.
+    fn rebuild_add(
+        &mut self,
+        occs: &std::collections::BTreeMap<BvTerm, u128>,
+        acc: u128,
+        w: u32,
+    ) -> BvTerm {
+        let m = mask(w);
+        let mut out: Option<BvTerm> = None;
+        for (&t, &c) in occs.iter() {
+            let c = c & m;
+            if c == 0 {
+                continue;
+            }
+            let scaled = if c == 1 {
+                t
+            } else if c == m {
+                self.bv_neg(t)
+            } else {
+                let cc = self.bv_const(c, w);
+                self.bv_mul(t, cc)
+            };
+            out = Some(match out {
+                None => scaled,
+                Some(prev) => self.bv_add(prev, scaled),
+            });
+        }
+        match out {
+            None => self.bv_const(acc, w),
+            Some(sum) => {
+                if acc & m == 0 {
+                    sum
+                } else {
+                    let cc = self.bv_const(acc, w);
+                    self.bv_add(sum, cc)
+                }
+            }
+        }
+    }
+
+    /// Canonical rebuild of an add-topped term (used per-side under
+    /// inequalities and for standalone adds).
+    fn canon_add(
+        &mut self,
+        t: BvTerm,
+        bm: &mut HashMap<BoolTerm, BoolTerm>,
+        vm: &mut HashMap<BvTerm, BvTerm>,
+    ) -> BvTerm {
+        let w = self.width_of(t);
+        if w > 128 {
+            return t; // coefficient arithmetic is u128-based
+        }
+        let mut occs = std::collections::BTreeMap::new();
+        let mut acc = 0u128;
+        self.flatten_add(t, 1, w, &mut occs, &mut acc, bm, vm);
+        self.rebuild_add(&occs, acc, w)
+    }
+
+    /// Normalize both sides of a comparison (per-side only — cancellation
+    /// across an inequality is unsound in modular arithmetic).
+    fn norm_cmp_sides(
+        &mut self,
+        a: BvTerm,
+        b: BvTerm,
+        bm: &mut HashMap<BoolTerm, BoolTerm>,
+        vm: &mut HashMap<BvTerm, BvTerm>,
+    ) -> (BvTerm, BvTerm) {
+        let na = self.norm_bv(a, bm, vm);
+        let nb = self.norm_bv(b, bm, vm);
+        (na, nb)
+    }
+
+    /// Equality over adds: flatten both sides, move everything to one map
+    /// (lhs − rhs), then split — coefficients with a clear sign bit stay
+    /// left, sign-bit-set coefficients move right negated (min-signed stays
+    /// left: it is its own negation and would ping-pong). Common terms
+    /// cancel automatically in the subtraction. Sound in Z/2^w.
+    fn norm_eq_add(
+        &mut self,
+        a: BvTerm,
+        b: BvTerm,
+        bm: &mut HashMap<BoolTerm, BoolTerm>,
+        vm: &mut HashMap<BvTerm, BvTerm>,
+    ) -> BoolTerm {
+        let w = self.width_of(a);
+        if w > 128 {
+            return self.bv_eq(a, b);
+        }
+        // Only bother when at least one side is an additive shape — plain
+        // `x = y` equalities gain nothing from the multiset round-trip.
+        let additive = |op: BvOp| {
+            matches!(
+                op,
+                BvOp::Add(_, _) | BvOp::Sub(_, _) | BvOp::Neg(_)
+            )
+        };
+        if !additive(self.bv_op(a)) && !additive(self.bv_op(b)) {
+            return self.bv_eq(a, b);
+        }
+        let m = mask(w);
+        let mut occs = std::collections::BTreeMap::new();
+        let mut acc = 0u128;
+        self.flatten_add(a, 1, w, &mut occs, &mut acc, bm, vm);
+        // rhs enters with coefficient −1: lhs − rhs = 0.
+        let neg1 = m;
+        self.flatten_add(b, neg1, w, &mut occs, &mut acc, bm, vm);
+
+        let min_signed = if w == 0 { 0 } else { 1u128 << (w - 1) };
+        let mut lhs = std::collections::BTreeMap::new();
+        let mut rhs = std::collections::BTreeMap::new();
+        for (&t, &c) in occs.iter() {
+            let c = c & m;
+            if c == 0 {
+                self.norm_cancelled += 1;
+                continue;
+            }
+            let negative = (c & min_signed) != 0 && c != min_signed;
+            if negative {
+                rhs.insert(t, 0u128.wrapping_sub(c) & m);
+            } else {
+                lhs.insert(t, c);
+            }
+        }
+        // Constant: keep on the right as −acc so the common SSA shape
+        // `sum = k` comes out with the constant alone when possible.
+        let rhs_const = 0u128.wrapping_sub(acc) & m;
+        let l = self.rebuild_add(&lhs, 0, w);
+        let r = self.rebuild_add(&rhs, rhs_const, w);
+        self.bv_eq(l, r)
     }
 }
 
