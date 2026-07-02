@@ -1,10 +1,28 @@
 //! SMT solver for quantifier-free bitvector logic (QF_BV).
 //!
-//! Strategy: eager bitblasting. Every BV term of width N becomes N SAT
-//! literals (one per bit, LSB-first). Every Boolean term becomes one SAT
-//! literal. Gates are encoded via the standard Tseitin translation, which
-//! produces mostly 2- and 3-literal clauses — exactly what the SAT core is
-//! optimized for.
+//! Strategy: eager bitblasting through an And-Inverter Graph. Every BV term
+//! of width N becomes N AIG references (one per bit, LSB-first); every
+//! Boolean term becomes one AIG reference. No CNF is emitted while
+//! bitblasting — clauses are generated at `solve*` time by walking the AIG
+//! cone reachable from the asserted roots (`lit_of`). Three wins over the
+//! older Lit-first Tseitin pipeline:
+//!
+//!   - **Cross-operator structural dedup.** `bvor(a, b)` and
+//!     `bvnot(bvand(bvnot(a), bvnot(b)))` are the same AIG node because OR
+//!     is `!and(!, !)` with the inversions on the edges. The old per-gate
+//!     `(Lit, Lit) → Lit` caches only caught pairwise coincidences.
+//!   - **Cone-of-influence CNF.** Logic that never feeds an asserted root
+//!     (dead quotients, unread flag bits, shadowed branches) never reaches
+//!     the SAT solver at all.
+//!   - **A substrate for AIG-level rewriting** (fraiging via
+//!     `Aig::simulate`, cut sweeping, …) before any clause is committed.
+//!
+//! CNF quality is preserved by shape-aware emission: `lit_of` recognizes
+//! the 3-node And patterns that `xor` / `mux` construction produces and
+//! emits the direct 4-clause, single-output-var Tseitin encodings for
+//! them, so adders and muxes cost exactly what they did under the old
+//! direct encoder (5 vars / 17 clauses per full adder) while everything
+//! still participates in AIG dedup.
 //!
 //! Supported BV ops: not, and, or, xor, add, sub, mul, udiv, urem, shl,
 //! lshr, ashr, extract, concat, zero-extend, sign-extend, ite.
@@ -12,6 +30,7 @@
 
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::aig::{Aig, AigNode, AigRef};
 use crate::bv::{BoolOp, BoolTerm, BvContext, BvOp, BvTerm, mask};
 use crate::lit::{LBool, Lit, Var};
 use crate::solver::{SolveResult, Solver};
@@ -46,7 +65,9 @@ pub enum VarOrigin {
 }
 
 /// Which gate produced a SAT variable. Kept deliberately small so that
-/// downstream code can `match` exhaustively.
+/// downstream code can `match` exhaustively. With the AIG pipeline, `And`
+/// covers plain AND nodes; `Xor` / `Ite` cover the pattern-mapped 3-node
+/// shapes that get the direct 4-clause encodings.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum GateKind {
     And,
@@ -59,9 +80,10 @@ pub enum GateKind {
     FaCarry,
 }
 
-/// Recorded ITE gate: semantically `o ↔ (sel ∧ t) ∨ (¬sel ∧ e)`. Emitted by
-/// every `mk_mux` invocation; stored in `SmtSolver::ite_gates` so that
-/// future ITE-aware propagation / branching can look them up cheaply.
+/// Recorded ITE gate: semantically `o ↔ (sel ∧ t) ∨ (¬sel ∧ e)`. Registered
+/// at flush time for every `mk_mux` whose output was actually materialized
+/// to CNF (dead-code muxes never show up). Stored in `SmtSolver::ite_gates`
+/// so ITE-aware propagation / branching can look gates up cheaply.
 /// Post-solve statistics, comparable to what mature solvers print via their
 /// `:statistics` interface. Returned by [`SmtSolver::sat_stats`].
 #[derive(Copy, Clone, Debug)]
@@ -82,6 +104,12 @@ pub struct SmtSolverStats {
     pub bv_var_total: usize,
     pub bv_nodes_total: usize,
     pub bv_vars_bitblasted: usize,
+    /// Gate variables removed by CNF preprocessing (bounded VE).
+    pub pp_eliminated: u64,
+    /// Clauses removed by (self-)subsumption during CNF preprocessing.
+    pub pp_subsumed: u64,
+    /// Literals removed by strengthening during CNF preprocessing.
+    pub pp_strengthened: u64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -97,9 +125,10 @@ pub struct IteGate {
 }
 
 /// One row of the bitblast-cost report — see [`SmtSolver::bitblast_cost_report`].
-/// `sat_vars` / `sat_clauses` are *exclusive* of subterms: when this term
-/// hash-cons'd a child that had already been bitblasted, the child's cost
-/// stayed on the child's own row.
+/// `sat_vars` / `sat_clauses` are *exclusive* of subterms: gate vars are
+/// charged to the BV term that was being bitblasted when their AIG node was
+/// first created (`Aig::src_terms`, first-writer-wins), so a shared subterm's
+/// cost stays on its own row.
 #[derive(Copy, Clone, Debug)]
 pub struct BitblastCostEntry {
     pub term: BvTerm,
@@ -108,57 +137,84 @@ pub struct BitblastCostEntry {
     pub sat_clauses: usize,
 }
 
-/// Bookkeeping for a single in-flight `bitblast_bv` call. Pushed at entry,
-/// popped at exit; child calls suspend the parent's accumulator and resume
-/// it after returning so exclusive cost is correctly attributed per term.
-struct BitblastCostFrame {
-    term: BvTerm,
-    /// SAT counters at the moment this frame was last (re)started — used
-    /// to compute "work done since" on suspend / final exit.
-    start_v: usize,
-    start_c: usize,
-    /// Cumulative exclusive work attributed to this frame so far (gets
-    /// flushed into `bitblast_cost` on pop).
-    acc_v: usize,
-    acc_c: usize,
+/// A `mk_mux` that produced a real AIG mux structure (no fold applied).
+/// Held until flush; converted into a public [`IteGate`] iff the output
+/// node actually got materialized to CNF.
+#[derive(Copy, Clone)]
+struct PendingIte {
+    sel: AigRef,
+    t: AigRef,
+    e: AigRef,
+    out: AigRef,
+    src: Option<BvTerm>,
+}
+
+/// Shape classification for an And node during CNF emission. See
+/// [`SmtSolver::detect_shape`].
+#[derive(Copy, Clone)]
+enum NodeShape {
+    /// `node ≡ x ⊕ y`.
+    Xor(AigRef, AigRef),
+    /// `node ≡ ¬mux(s, t, e)` — note the negation: the mux VALUE is the
+    /// complement of the matched And node.
+    NotMux { s: AigRef, t: AigRef, e: AigRef },
 }
 
 pub struct SmtSolver {
     pub ctx: BvContext,
     sat: Solver,
 
+    /// The bitblaster's intermediate representation. All Boolean structure
+    /// lands here; CNF is emitted lazily by `lit_of` for the cone reachable
+    /// from asserted roots.
+    aig: Aig,
+
+    /// AIG node idx → SAT lit of the node's positive output. `None` until
+    /// the node is materialized by `lit_of`. Dense Vec keyed by node index.
+    aig_lit: Vec<Option<Lit>>,
+
+    /// Reverse map: SAT var idx → AIG node idx (`u32::MAX` = none). Needed
+    /// so CNF preprocessing can un-bind eliminated gate variables from
+    /// their AIG nodes (a later consumer then re-materializes the node
+    /// under a fresh variable with fresh defining clauses).
+    lit_node: Vec<u32>,
+
+    /// When `Some`, clause emission is buffered here instead of going to
+    /// the SAT core — active during `flush_pending` so the whole batch can
+    /// be preprocessed (subsumption + bounded variable elimination) before
+    /// commitment. `None` = direct mode (model probes, assumptions,
+    /// named assertions).
+    cnf_buffer: Option<Vec<Vec<Lit>>>,
+
+    /// Cumulative preprocessing counters (vars eliminated / clauses
+    /// subsumed / literals strengthened) — exposed via [`sat_stats`].
+    pp_eliminated: u64,
+    pp_subsumed: u64,
+    pp_strengthened: u64,
+
     // Bitblast caches: each BV/Bool term is translated exactly once and the
     // result reused on subsequent references. Critical for shared DAGs —
     // without this, a shared subterm could be re-encoded combinatorially
     // many times.
-    bv_cache: HashMap<BvTerm, Vec<Lit>>,
-    bool_cache: HashMap<BoolTerm, Lit>,
+    bv_cache: HashMap<BvTerm, Vec<AigRef>>,
+    bool_cache: HashMap<BoolTerm, AigRef>,
 
-    // SAT-literal encoding for symbolic variables. Populated lazily on first
-    // use so we don't allocate SAT vars for unused symbols.
-    bv_var_lits: HashMap<u32, Vec<Lit>>,
-    bool_var_lits: HashMap<u32, Lit>,
+    // AIG input encoding for symbolic variables. Populated lazily on first
+    // use so we don't allocate SAT vars for unused symbols. Each bit is an
+    // `Aig::input` wrapping a freshly-allocated SAT literal.
+    bv_var_refs: HashMap<u32, Vec<AigRef>>,
+    bool_var_refs: HashMap<u32, AigRef>,
 
     // Union-find over BV / Bool variable ids. After `alias_bv_vars(x, y)`,
-    // both BvVar(x_id) and BvVar(y_id) resolve to the same SAT literals, so
+    // both BvVar(x_id) and BvVar(y_id) resolve to the same AIG inputs, so
     // `(= x y)` becomes a free no-op. Populated lazily from the SMT-LIB
     // layer when `(assert (= X Y))` is seen with X and Y both declared vars.
     bv_var_parent: Vec<u32>,
     bool_var_parent: Vec<u32>,
 
-    // AIG-style gate caches: structurally identical gates share a single
-    // output literal and one set of SAT clauses. On a symbex workload this
-    // roughly halves the SAT-variable count — our bitblaster previously
-    // emitted a fresh gate for every call regardless of whether the same
-    // Tseitin fan-in had been encoded before.
-    // Keys are canonicalized: (min, max) for commutative ops.
-    and_cache: HashMap<(Lit, Lit), Lit>,
-    or_cache: HashMap<(Lit, Lit), Lit>,
-    xor_cache: HashMap<(Lit, Lit), Lit>,
-    mux_cache: HashMap<(Lit, Lit, Lit), Lit>,
-
-    // Reusable single SAT lit pinned to true — used as the `true` constant,
-    // and its negation is the `false` constant.
+    // Reusable single SAT lit pinned to true — only needed when a constant
+    // AIG ref must appear in a clause (e.g. `(assert true)` roots). All
+    // other constant handling folds inside the AIG.
     true_lit: Option<Lit>,
 
     // Stack of "activation literals" — one per open `push` scope. Every
@@ -194,33 +250,41 @@ pub struct SmtSolver {
     // variable `i` is for — a BV input bit, a gate output, an activation
     // literal, etc. Populated at allocation time.
     var_origin: Vec<VarOrigin>,
-    // While bitblasting a given BV term, this holds its handle so that aux
-    // vars allocated during the translation can be tagged with the enclosing
-    // term. Push/pop via save-and-restore in `bitblast_bv`.
+    // While bitblasting a given BV term, this holds its handle so that AIG
+    // nodes created during the translation can be tagged with the enclosing
+    // term (`Aig::tag_src`). Push/pop via save-and-restore in `bitblast_bv`.
     current_bv_ctx: Option<BvTerm>,
 
     // --- Bitblast cost attribution ----------------------------------------
-    // Opt-in: when `bitblast_cost_enabled` is true, each call to
-    // `bitblast_bv` is bracketed by a stack frame that snapshots the SAT
-    // var / clause counters. Recursive child calls suspend the parent's
-    // accumulation so each term's recorded cost is *exclusive* of its
-    // (already-charged) subterms. Useful for "which SMT operation produced
-    // the most SAT formula" profiling — see `bitblast_cost_report()`.
+    // Opt-in: when `bitblast_cost_enabled` is true, every SAT var / clause
+    // emitted during materialization is charged to the BV term recorded in
+    // the AIG node's `src_terms` tag. Because tagging is first-writer-wins
+    // at node creation, shared subterms keep their cost on their own row —
+    // the report is exclusive per term by construction.
     bitblast_cost_enabled: bool,
     bitblast_cost: HashMap<BvTerm, (usize, usize)>,
-    bitblast_cost_stack: Vec<BitblastCostFrame>,
 
-    // Every ITE gate emitted by `mk_mux`, in insertion order.
+    // Deferred ITE-gate records. `mk_mux` can't hand out SAT lits (nothing
+    // is materialized during bitblasting), so it queues the AigRefs here;
+    // `flush_pending` converts records whose output node got a lit into
+    // public `IteGate`s.
+    pending_ite_gates: Vec<PendingIte>,
+    // Deferred VSIDS boosts for ITE selectors: (sel, out). Applied at flush
+    // for every record whose `out` was materialized — mirrors the old
+    // behaviour of boosting once per mk_mux call on live muxes.
+    pending_sel_boosts: Vec<(AigRef, AigRef)>,
+
+    // Every ITE gate whose CNF was emitted, in flush order.
     ite_gates: Vec<IteGate>,
     // Reverse index: for each SAT literal that's an ITE output, which gate
     // (by index into `ite_gates`) produced it.
     ite_out_to_gate: HashMap<Lit, usize>,
 
-    // When true (the default), each ITE gate emitted bumps its `sel`
-    // variable's VSIDS activity. This steers the SAT solver toward
-    // branching on selectors first — a single decision on `sel` resolves
-    // the whole ITE subtree, which is a huge win on symex memory reads
-    // that are encoded as deep ITE chains over the address variable.
+    // When true (the default), each live ITE gate bumps its `sel`
+    // variable's VSIDS activity at flush time. This steers the SAT solver
+    // toward branching on selectors first — a single decision on `sel`
+    // resolves the whole ITE subtree, which is a huge win on symex memory
+    // reads that are encoded as deep ITE chains over the address variable.
     ite_branching_hints: bool,
 }
 
@@ -229,16 +293,19 @@ impl SmtSolver {
         SmtSolver {
             ctx: BvContext::new(),
             sat: Solver::new(),
+            aig: Aig::new(),
+            aig_lit: Vec::new(),
+            lit_node: Vec::new(),
+            cnf_buffer: None,
+            pp_eliminated: 0,
+            pp_subsumed: 0,
+            pp_strengthened: 0,
             bv_cache: HashMap::default(),
             bool_cache: HashMap::default(),
-            bv_var_lits: HashMap::default(),
-            bool_var_lits: HashMap::default(),
+            bv_var_refs: HashMap::default(),
+            bool_var_refs: HashMap::default(),
             bv_var_parent: Vec::new(),
             bool_var_parent: Vec::new(),
-            and_cache: HashMap::default(),
-            or_cache: HashMap::default(),
-            xor_cache: HashMap::default(),
-            mux_cache: HashMap::default(),
             true_lit: None,
             activation_stack: Vec::new(),
             pending: vec![Vec::new()],
@@ -248,7 +315,8 @@ impl SmtSolver {
             current_bv_ctx: None,
             bitblast_cost_enabled: false,
             bitblast_cost: HashMap::default(),
-            bitblast_cost_stack: Vec::new(),
+            pending_ite_gates: Vec::new(),
+            pending_sel_boosts: Vec::new(),
             ite_gates: Vec::new(),
             ite_out_to_gate: HashMap::default(),
             ite_branching_hints: true,
@@ -256,9 +324,9 @@ impl SmtSolver {
     }
 
     /// Enable or disable the ITE-aware branching hint. On (the default)
-    /// means every `mk_mux` call boosts its selector's VSIDS activity;
-    /// off disables that boost entirely. Useful to benchmark the impact
-    /// of the heuristic on a given workload.
+    /// means every live ITE gate boosts its selector's VSIDS activity at
+    /// flush; off disables that boost entirely. Useful to benchmark the
+    /// impact of the heuristic on a given workload.
     pub fn set_ite_branching_hints(&mut self, on: bool) {
         self.ite_branching_hints = on;
     }
@@ -417,7 +485,7 @@ impl SmtSolver {
         if self.ctx.width_of(x) != self.ctx.width_of(y) {
             return false;
         }
-        if self.bv_var_lits.contains_key(&xid) || self.bv_var_lits.contains_key(&yid) {
+        if self.bv_var_refs.contains_key(&xid) || self.bv_var_refs.contains_key(&yid) {
             return false;
         }
         self.union_bv_var_ids(xid, yid);
@@ -431,7 +499,7 @@ impl SmtSolver {
         else {
             return false;
         };
-        if self.bool_var_lits.contains_key(&xid) || self.bool_var_lits.contains_key(&yid) {
+        if self.bool_var_refs.contains_key(&xid) || self.bool_var_refs.contains_key(&yid) {
             return false;
         }
         self.union_bool_var_ids(xid, yid);
@@ -522,7 +590,8 @@ impl SmtSolver {
     /// identifies which names are needed.
     pub fn assert_named(&mut self, name: impl Into<String>, t: BoolTerm) {
         self.last_result = None;
-        let phi = self.bitblast_bool(t);
+        let phi_ref = self.bitblast_bool(t);
+        let phi = self.lit_of(phi_ref);
         let control = self.new_sat_lit_tagged(VarOrigin::Activation);
         // Clause: `(¬control ∨ phi)` — with any push-scope activation
         // folded in so named assertions respect scoping too.
@@ -584,10 +653,7 @@ impl SmtSolver {
 
     pub fn solve_under_assumptions(&mut self, assumptions: &[BoolTerm]) -> SmtResult {
         self.flush_pending();
-        let mut extras = Vec::with_capacity(assumptions.len());
-        for &t in assumptions {
-            extras.push(self.bitblast_bool(t));
-        }
+        let extras = self.build_assumption_lits(assumptions);
         let asmps = self.built_assumptions(&extras);
         let result = match self.sat.solve_under_assumptions(&asmps) {
             SolveResult::Sat => SmtResult::Sat,
@@ -595,6 +661,21 @@ impl SmtSolver {
         };
         self.last_result = Some(result);
         result
+    }
+
+    /// Bitblast each assumption to an AigRef, then materialize its SAT lit.
+    /// Runs AFTER `flush_pending` so assumption expressions get their CNF
+    /// emitted before the SAT call.
+    fn build_assumption_lits(&mut self, assumptions: &[BoolTerm]) -> Vec<Lit> {
+        let mut refs: Vec<AigRef> = Vec::with_capacity(assumptions.len());
+        for &t in assumptions {
+            refs.push(self.bitblast_bool(t));
+        }
+        let mut lits = Vec::with_capacity(refs.len());
+        for r in refs {
+            lits.push(self.lit_of(r));
+        }
+        lits
     }
 
     /// Bounded variant of [`solve_under_assumptions`]: returns `None` once
@@ -608,21 +689,13 @@ impl SmtSolver {
     /// A `Some(SmtResult::Unsat)` return is a genuine UNSAT proof over the
     /// formula + assumptions, not a budget-driven approximation — the
     /// budget only converts still-searching states into `None`.
-    ///
-    /// Do not call this with `max_conflicts = 0` when the SAT problem is
-    /// known-intractable; prefer [`solve_under_assumptions`] which panics
-    /// would not be raised, rather than the `.expect()` in the unbounded
-    /// path. In practice the two are identical at budget 0.
     pub fn solve_under_assumptions_bounded(
         &mut self,
         assumptions: &[BoolTerm],
         max_conflicts: u64,
     ) -> Option<SmtResult> {
         self.flush_pending();
-        let mut extras = Vec::with_capacity(assumptions.len());
-        for &t in assumptions {
-            extras.push(self.bitblast_bool(t));
-        }
+        let extras = self.build_assumption_lits(assumptions);
         let asmps = self.built_assumptions(&extras);
         match self
             .sat
@@ -647,20 +720,14 @@ impl SmtSolver {
     ///
     /// Use this when a symbex runner wants a real-time ceiling on per-query
     /// cost (e.g. `Duration::from_millis(250)` for branch-feasibility
-    /// probes). The deadline is checked on every conflict — a few
-    /// nanoseconds of `Instant::now()` overhead per conflict, negligible
-    /// for all but the hottest conflict-per-microsecond workloads, where
-    /// [`solve_under_assumptions_bounded`] is the alternative.
+    /// probes).
     pub fn solve_under_assumptions_timed(
         &mut self,
         assumptions: &[BoolTerm],
         timeout: std::time::Duration,
     ) -> Option<SmtResult> {
         self.flush_pending();
-        let mut extras = Vec::with_capacity(assumptions.len());
-        for &t in assumptions {
-            extras.push(self.bitblast_bool(t));
-        }
+        let extras = self.build_assumption_lits(assumptions);
         let asmps = self.built_assumptions(&extras);
         match self.sat.solve_under_assumptions_timed(&asmps, timeout)? {
             SolveResult::Sat => {
@@ -754,17 +821,19 @@ impl SmtSolver {
         Some(self.bit_hunt(&bits, |i| i != msb))
     }
 
-    /// Shared opt-query setup: flush, bitblast the target term (so its
-    /// SAT lits exist and the formula incorporates all its clauses), and
-    /// do the initial feasibility check. Returns `None` when unsat (and
-    /// updates `last_result` accordingly); returns the LSB-first SAT lits
-    /// of `x` when sat, with `last_result = Sat`.
+    /// Shared opt-query setup: flush, bitblast + materialize the target
+    /// term (so its SAT lits exist and the formula incorporates all its
+    /// clauses), and do the initial feasibility check. Returns `None` when
+    /// unsat (and updates `last_result` accordingly); returns the LSB-first
+    /// SAT lits of `x` when sat, with `last_result = Sat`.
     fn opt_prologue(&mut self, x: BvTerm) -> Option<Vec<Lit>> {
         self.flush_pending();
-        // bitblast BEFORE the initial solve so the feasibility check sees
-        // any clauses the bitblaster adds for `x` — otherwise a sat model
-        // from the smaller formula could be falsified by the extra gates.
-        let bits = self.bitblast_bv(x);
+        // Materialize BEFORE the initial solve so the feasibility check
+        // sees any clauses the target term's cone adds — otherwise a sat
+        // model from the smaller formula could be falsified by the extra
+        // gates.
+        let refs = self.bitblast_bv(x);
+        let bits: Vec<Lit> = refs.iter().map(|&r| self.lit_of(r)).collect();
         let asmps = self.built_assumptions(&[]);
         match self.sat.solve_under_assumptions(&asmps) {
             SolveResult::Sat => {
@@ -832,22 +901,33 @@ impl SmtSolver {
     fn assert_toplevel_direct(&mut self, t: BoolTerm, act_lit: Option<Lit>) {
         let op = self.ctx.bool_nodes[t.0 as usize];
         if let BoolOp::Eq(a, b) = op {
-            // Skip width-1: mk_xor already short-circuits to the other lit
-            // when one side is a constant, and the general path emits a
-            // single biconditional anyway. Only the wide case wins here.
+            // Skip width-1: the AIG folds 1-bit equality to an XNOR (or a
+            // direct ref when one side is constant) — the general path
+            // emits at most one gate there anyway. Only the wide case wins.
             let w = self.ctx.width_of(a);
             if w >= 2 {
                 let ab = self.bitblast_bv(a);
                 let bb = self.bitblast_bv(b);
+                // Materialize side a fully, then side b, then emit the
+                // biconditionals — matches the variable-allocation order of
+                // the pre-AIG encoder (which bitblasted each side to
+                // completion before touching the clauses). Interleaving
+                // per-bit shuffles SAT var numbering, which perturbs VSIDS
+                // tie-breaking / watch selection enough to flip near-cliff
+                // instances.
+                let als: Vec<Lit> = ab.iter().map(|&r| self.lit_of(r)).collect();
+                let bls: Vec<Lit> = bb.iter().map(|&r| self.lit_of(r)).collect();
                 for i in 0..ab.len() {
+                    let al = als[i];
+                    let bl = bls[i];
                     match act_lit {
                         None => {
-                            self.sat.add_clause(vec![!ab[i], bb[i]]);
-                            self.sat.add_clause(vec![ab[i], !bb[i]]);
+                            self.emit_clause(vec![!al, bl]);
+                            self.emit_clause(vec![al, !bl]);
                         }
                         Some(act) => {
-                            self.sat.add_clause(vec![!act, !ab[i], bb[i]]);
-                            self.sat.add_clause(vec![!act, ab[i], !bb[i]]);
+                            self.emit_clause(vec![!act, !al, bl]);
+                            self.emit_clause(vec![!act, al, !bl]);
                         }
                     }
                 }
@@ -858,56 +938,199 @@ impl SmtSolver {
             if let BoolOp::Eq(a, b) = self.ctx.bool_nodes[inner.0 as usize] {
                 let w = self.ctx.width_of(a);
                 if w >= 2 {
-                    // `¬(x = y)` = some bit differs. Build per-bit XOR lits
-                    // and OR them in one clause. Gate vars still needed, but
-                    // we skip the AND chain on top.
+                    // `¬(x = y)` = some bit differs. Build per-bit XOR refs
+                    // and OR them in one clause. Gate vars still needed for
+                    // symbolic bit pairs, but we skip the AND chain on top.
                     let ab = self.bitblast_bv(a);
                     let bb = self.bitblast_bv(b);
+                    // Same ordering rationale as the Eq path above: fully
+                    // materialize each side before the xor outputs.
+                    for &r in &ab {
+                        let _ = self.lit_of(r);
+                    }
+                    for &r in &bb {
+                        let _ = self.lit_of(r);
+                    }
                     let mut clause = Vec::with_capacity(ab.len() + 1);
                     if let Some(act) = act_lit {
                         clause.push(!act);
                     }
                     for i in 0..ab.len() {
                         let x = self.mk_xor(ab[i], bb[i]);
-                        clause.push(x);
+                        let xl = self.lit_of(x);
+                        clause.push(xl);
                     }
-                    self.sat.add_clause(clause);
+                    self.emit_clause(clause);
                     return;
                 }
             }
         }
-        // General path: one Tseitin lit for the whole assertion.
-        let lit = self.bitblast_bool(t);
+        // General path: bitblast to one AIG root, materialize, emit unit.
+        let r = self.bitblast_bool(t);
+        let lit = self.lit_of(r);
         match act_lit {
             None => {
-                self.sat.add_clause(vec![lit]);
+                self.emit_clause(vec![lit]);
             }
             Some(act) => {
-                self.sat.add_clause(vec![!act, lit]);
+                self.emit_clause(vec![!act, lit]);
             }
         }
     }
 
-    /// Bitblast every pending assertion, emitting SAT clauses. After flush,
-    /// the pending queues for every scope are empty and all those assertions
-    /// live in the SAT core (guarded by activation literals for scopes ≥ 1).
+    /// Bitblast every pending assertion, emitting SAT clauses for the AIG
+    /// cone each assertion actually reaches. After flush, the pending queues
+    /// for every scope are empty and all those assertions live in the SAT
+    /// core (guarded by activation literals for scopes ≥ 1).
     fn flush_pending(&mut self) {
-        for depth in 0..self.pending.len() {
-            let terms = std::mem::take(&mut self.pending[depth]);
-            if terms.is_empty() {
+        let has_work = self.pending.iter().any(|q| !q.is_empty());
+        if has_work {
+            // Variables at or above this index were allocated by (and are
+            // only visible to) this batch — eligible for elimination if
+            // they're gate outputs. Everything older may be referenced by
+            // clauses already in the SAT core and must survive.
+            let batch_start_var = self.sat.num_vars();
+            self.cnf_buffer = Some(Vec::new());
+            for depth in 0..self.pending.len() {
+                let terms = std::mem::take(&mut self.pending[depth]);
+                if terms.is_empty() {
+                    continue;
+                }
+                let act_lit = if depth == 0 {
+                    None
+                } else {
+                    Some(self.activation_stack[depth - 1])
+                };
+                for t in terms {
+                    self.assert_toplevel_direct(t, act_lit);
+                }
+            }
+            let buffer = self.cnf_buffer.take().unwrap_or_default();
+            // Resolve ITE metadata + selector boosts BEFORE the batch is
+            // preprocessed: bounded VE may dissolve a live mux's output
+            // var entirely (a good outcome — its function got resolved
+            // into the neighbours), but the gate was real and its selector
+            // still deserves the branching hint.
+            self.resolve_pending_ites();
+            self.commit_batch(buffer, batch_start_var);
+        }
+        self.resolve_pending_ites();
+    }
+
+    /// Promote deferred ITE-gate records into the Lit-keyed public
+    /// registry, and apply queued selector VSIDS boosts. Only gates whose
+    /// output actually got materialized (i.e. reachable from an asserted
+    /// root) are registered — dead-code muxes don't pollute the
+    /// introspection view. `try_lit_of` on the operands keeps this
+    /// metadata-only: if an operand lacks a lit (its cone materialized
+    /// through a non-pattern path), the record is skipped rather than
+    /// forcing CNF emission for bookkeeping. Note: a registered gate's
+    /// output var may later be dissolved by CNF preprocessing.
+    fn resolve_pending_ites(&mut self) {
+        let pending_ites = std::mem::take(&mut self.pending_ite_gates);
+        for rec in pending_ites {
+            let Some(o) = self.try_lit_of(rec.out) else { continue };
+            if self.ite_out_to_gate.contains_key(&o) {
                 continue;
             }
-            let act_lit = if depth == 0 {
-                None
-            } else {
-                Some(self.activation_stack[depth - 1])
+            let (Some(sel), Some(t), Some(e)) = (
+                self.try_lit_of(rec.sel),
+                self.try_lit_of(rec.t),
+                self.try_lit_of(rec.e),
+            ) else {
+                continue;
             };
-            for t in terms {
-                self.assert_toplevel_direct(t, act_lit);
+            let idx = self.ite_gates.len();
+            self.ite_gates.push(IteGate {
+                sel,
+                t,
+                e,
+                o,
+                source_term: rec.src,
+            });
+            self.ite_out_to_gate.insert(o, idx);
+        }
+
+        // Apply queued VSIDS boosts for ITE selectors whose gate is live.
+        let boosts = std::mem::take(&mut self.pending_sel_boosts);
+        for (sel, out) in boosts {
+            if self.try_lit_of(out).is_none() {
+                continue; // dead mux — never reached an asserted root
+            }
+            if let Some(sel_lit) = self.try_lit_of(sel) {
+                self.sat.boost_var_activity(sel_lit.var());
             }
         }
     }
 
+    /// Preprocess one flush batch (subsumption + bounded variable
+    /// elimination via [`crate::preprocess`]) and commit the survivors to
+    /// the SAT core.
+    ///
+    /// Frozen (non-eliminable) variables: anything allocated before this
+    /// batch (older clauses in the SAT core may mention it) and anything
+    /// that isn't a Tseitin gate output — input bits are read by model
+    /// evaluation, activation literals by push/pop and unsat cores, the
+    /// true-lit by its pinned unit. Freshly-allocated gate variables are
+    /// invisible outside the batch, so eliminating them is sound: their
+    /// AIG-node binding is dropped, and any later consumer re-materializes
+    /// the node under a fresh variable with fresh defining clauses.
+    fn commit_batch(&mut self, buffer: Vec<Vec<Lit>>, batch_start_var: usize) {
+        if buffer.is_empty() {
+            return;
+        }
+        // Pre-filter against root-level facts already in the SAT core
+        // (notably the pinned true-lit): drop satisfied clauses, strip
+        // false literals. `value_fixed` ignores stale search-trail
+        // assignments above level 0.
+        let mut clauses: Vec<Vec<Lit>> = Vec::with_capacity(buffer.len());
+        'clause: for mut c in buffer {
+            let mut w = 0;
+            for i in 0..c.len() {
+                match self.sat.value_fixed(c[i]) {
+                    LBool::True => continue 'clause,
+                    LBool::False => {}
+                    LBool::Undef => {
+                        c[w] = c[i];
+                        w += 1;
+                    }
+                }
+            }
+            c.truncate(w);
+            clauses.push(c);
+        }
+
+        let num_vars = self.sat.num_vars();
+        let mut frozen: Vec<bool> = Vec::with_capacity(num_vars);
+        for v in 0..num_vars {
+            let f = v < batch_start_var
+                || !matches!(self.var_origin[v], VarOrigin::GateOut { .. });
+            frozen.push(f);
+        }
+
+        let result = crate::preprocess::Preprocessor::new(clauses, num_vars, frozen).run();
+        self.pp_eliminated += result.eliminated.len() as u64;
+        self.pp_subsumed += result.subsumed as u64;
+        self.pp_strengthened += result.strengthened as u64;
+
+        // Un-bind eliminated gate vars from their AIG nodes so later
+        // consumers re-materialize them freshly instead of referencing
+        // variables whose defining clauses no longer exist.
+        for v in &result.eliminated {
+            let node = self.lit_node[*v as usize];
+            if node != u32::MAX {
+                self.aig_lit[node as usize] = None;
+                self.lit_node[*v as usize] = u32::MAX;
+            }
+            // The variable has no clauses left — exclude it from branching
+            // so model completion doesn't pay a decision for it.
+            self.sat.set_decision_var(Var(*v), false);
+        }
+
+        for c in result.clauses {
+            self.sat.add_clause(c);
+        }
+    }
 
     /// Returns true iff the solver currently holds a valid SAT model —
     /// i.e. the most recent operation was a `solve*` that returned SAT and
@@ -946,24 +1169,31 @@ impl SmtSolver {
             bool_aliased,
             bv_var_total: self.ctx.bv_var_widths.len(),
             bv_nodes_total: self.ctx.bv_nodes.len(),
-            bv_vars_bitblasted: self.bv_var_lits.len(),
+            bv_vars_bitblasted: self.bv_var_refs.len(),
+            pp_eliminated: self.pp_eliminated,
+            pp_subsumed: self.pp_subsumed,
+            pp_strengthened: self.pp_strengthened,
         }
+    }
+
+    /// Number of AIG nodes currently in the bitblaster's graph (including
+    /// the constant sentinel). Useful for measuring structural dedup.
+    pub fn aig_nodes(&self) -> usize {
+        self.aig.num_nodes()
     }
 
     // ---------- Metadata accessors ----------
 
-    /// Turn on bitblast cost attribution. From this point onward every
-    /// `bitblast_bv` call records how many SAT variables and clauses it
-    /// emitted, *exclusive* of any subterms (those are charged to their
-    /// own rows). Cheap to leave on — adds a per-call snapshot + a small
-    /// HashMap update. Call [`bitblast_cost_report`] after solving to read
-    /// out a ranked table.
+    /// Turn on bitblast cost attribution. From this point onward every SAT
+    /// var / clause emitted during CNF materialization is charged to the BV
+    /// term whose bitblast first created the corresponding AIG node.
+    /// Cheap to leave on — one HashMap update per emitted gate. Call
+    /// [`bitblast_cost_report`] after solving to read out a ranked table.
     ///
     /// Calling this resets any previously-collected data.
     pub fn enable_bitblast_cost_tracking(&mut self) {
         self.bitblast_cost_enabled = true;
         self.bitblast_cost.clear();
-        self.bitblast_cost_stack.clear();
     }
 
     /// Snapshot of the bitblast cost map, sorted by clause count
@@ -1030,6 +1260,8 @@ impl SmtSolver {
         a
     }
 
+    // ---------- Model reads (AIG evaluation) ----------
+
     /// Read a BV value out of the current SAT model. Widths up to 64 are
     /// safe; for wider BVs the upper bits are truncated — use
     /// [`get_bv_value_u128`] for the full range.
@@ -1040,9 +1272,10 @@ impl SmtSolver {
     /// Full-precision model read: supports widths up to 128.
     pub fn get_bv_value_u128(&mut self, t: BvTerm) -> u128 {
         let bits = self.bitblast_bv(t);
+        let vals = self.eval_refs(&bits);
         let mut v = 0u128;
-        for (i, &lit) in bits.iter().enumerate() {
-            if self.sat.value_of(lit) == LBool::True {
+        for (i, &bit) in vals.iter().enumerate() {
+            if bit {
                 v |= 1u128 << i;
             }
         }
@@ -1053,10 +1286,11 @@ impl SmtSolver {
     /// for any BV width including those exceeding 128 bits.
     pub fn get_bv_value_limbs(&mut self, t: BvTerm) -> Vec<u64> {
         let bits = self.bitblast_bv(t);
+        let vals = self.eval_refs(&bits);
         let nlimbs = (bits.len() + 63) / 64;
         let mut limbs = vec![0u64; nlimbs];
-        for (i, &lit) in bits.iter().enumerate() {
-            if self.sat.value_of(lit) == LBool::True {
+        for (i, &bit) in vals.iter().enumerate() {
+            if bit {
                 limbs[i / 64] |= 1u64 << (i % 64);
             }
         }
@@ -1064,52 +1298,96 @@ impl SmtSolver {
     }
 
     pub fn get_bool_value(&mut self, t: BoolTerm) -> bool {
-        let lit = self.bitblast_bool(t);
-        self.sat.value_of(lit) != LBool::False
+        let r = self.bitblast_bool(t);
+        self.eval_refs(&[r])[0]
     }
 
-    // ---------- Bitblasting ----------
+    /// Evaluate AIG refs under the current SAT model *without* forcing any
+    /// CNF emission. Nodes with an assigned materialized lit read straight
+    /// from the model (and don't recurse — Tseitin consistency guarantees
+    /// the stored value matches the recomputed one); everything else is
+    /// computed structurally from the inputs. Unassigned inputs (vars
+    /// created after the last solve) default to false, matching a "model
+    /// completion with 0" convention.
+    fn eval_refs(&self, refs: &[AigRef]) -> Vec<bool> {
+        let mut memo: HashMap<u32, bool> = HashMap::default();
+        let mut out = Vec::with_capacity(refs.len());
+        let mut stack: Vec<u32> = Vec::new();
+        for &r in refs {
+            let idx = r.node_idx();
+            if !memo.contains_key(&idx) {
+                stack.push(idx);
+                while let Some(&top) = stack.last() {
+                    if memo.contains_key(&top) {
+                        stack.pop();
+                        continue;
+                    }
+                    // Materialized + assigned: read the model directly.
+                    if let Some(Some(l)) = self.aig_lit.get(top as usize) {
+                        let v = self.sat.value_of(*l);
+                        if v != LBool::Undef {
+                            memo.insert(top, v == LBool::True);
+                            stack.pop();
+                            continue;
+                        }
+                    }
+                    match self.aig.node(top) {
+                        AigNode::ConstTrue => {
+                            memo.insert(top, true);
+                            stack.pop();
+                        }
+                        AigNode::Input(l) => {
+                            memo.insert(top, self.sat.value_of(l) == LBool::True);
+                            stack.pop();
+                        }
+                        AigNode::And(a, b) => {
+                            let ai = a.node_idx();
+                            let bi = b.node_idx();
+                            match (memo.get(&ai).copied(), memo.get(&bi).copied()) {
+                                (Some(av), Some(bv)) => {
+                                    let av = av ^ a.is_negated();
+                                    let bv = bv ^ b.is_negated();
+                                    memo.insert(top, av && bv);
+                                    stack.pop();
+                                }
+                                (None, _) => stack.push(ai),
+                                (_, None) => stack.push(bi),
+                            }
+                        }
+                    }
+                }
+            }
+            let base = memo[&idx];
+            out.push(base ^ r.is_negated());
+        }
+        out
+    }
 
-    /// Produce N SAT literals (LSB-first) representing the bits of `t`.
-    fn bitblast_bv(&mut self, t: BvTerm) -> Vec<Lit> {
+    // ---------- Bitblasting (term → AIG) ----------
+
+    /// Produce N AIG refs (LSB-first) representing the bits of `t`. No CNF
+    /// is emitted — materialization happens at flush via `lit_of`.
+    fn bitblast_bv(&mut self, t: BvTerm) -> Vec<AigRef> {
         if let Some(cached) = self.bv_cache.get(&t) {
             return cached.clone();
         }
-        // --- Bitblast cost attribution (opt-in via enable_bitblast_cost_tracking) ---
-        // Suspend the parent frame's accumulator so its recorded delta
-        // only counts work emitted *before* our recursion. Then push a
-        // fresh frame for this term.
-        if self.bitblast_cost_enabled {
-            let v_now = self.sat.num_vars();
-            let c_now = self.sat.num_clauses();
-            if let Some(parent) = self.bitblast_cost_stack.last_mut() {
-                parent.acc_v += v_now - parent.start_v;
-                parent.acc_c += c_now - parent.start_c;
-            }
-            self.bitblast_cost_stack.push(BitblastCostFrame {
-                term: t,
-                start_v: v_now,
-                start_c: c_now,
-                acc_v: 0,
-                acc_c: 0,
-            });
-        }
-        // Record the current BV term so aux vars created inside gate helpers
-        // (mk_and, mk_mux, ripple_carry_add, …) inherit it as their origin
-        // context. Save / restore so recursive bitblast calls see their own
-        // enclosing term.
+        // Record the current BV term so AIG nodes created inside gate
+        // helpers (mk_and, mk_mux, ripple_carry_add, …) inherit it as their
+        // source tag. Save / restore so recursive bitblast calls see their
+        // own enclosing term.
         let prev_ctx = self.current_bv_ctx;
         self.current_bv_ctx = Some(t);
         let node = self.ctx.bv_nodes[t.0 as usize];
         let bits = match node.op {
             BvOp::Var(id) => self.get_or_make_bv_var(id, node.width),
             BvOp::Const => {
-                let tl = self.get_true_lit();
                 if node.wide == crate::bv::WIDE_NONE {
                     // Fast path: value lives inline as a u128.
                     let value = node.value;
                     (0..node.width)
-                        .map(|i| if (value >> i) & 1 == 1 { tl } else { !tl })
+                        .map(|i| {
+                            if (value >> i) & 1 == 1 { AigRef::TRUE } else { AigRef::FALSE }
+                        })
                         .collect()
                 } else {
                     // Wide path: read bit-i from the context's limb pool.
@@ -1118,14 +1396,14 @@ impl SmtSolver {
                         .map(|i| {
                             let li = (i as usize) / 64;
                             let bi = i % 64;
-                            if (limbs[li] >> bi) & 1 == 1 { tl } else { !tl }
+                            if (limbs[li] >> bi) & 1 == 1 { AigRef::TRUE } else { AigRef::FALSE }
                         })
                         .collect()
                 }
             }
             BvOp::Not(x) => {
                 let xb = self.bitblast_bv(x);
-                xb.iter().map(|&l| !l).collect()
+                xb.iter().map(|&r| !r).collect()
             }
             BvOp::And(x, y) => {
                 let xb = self.bitblast_bv(x);
@@ -1145,16 +1423,14 @@ impl SmtSolver {
             BvOp::Add(x, y) => {
                 let xb = self.bitblast_bv(x);
                 let yb = self.bitblast_bv(y);
-                let cin = !self.get_true_lit();
-                self.ripple_carry_add(&xb, &yb, cin).0
+                self.ripple_carry_add(&xb, &yb, AigRef::FALSE).0
             }
             BvOp::Sub(x, y) => {
                 // a - b = a + ~b + 1
                 let xb = self.bitblast_bv(x);
                 let yb = self.bitblast_bv(y);
-                let y_neg: Vec<Lit> = yb.iter().map(|&l| !l).collect();
-                let cin = self.get_true_lit();
-                self.ripple_carry_add(&xb, &y_neg, cin).0
+                let y_neg: Vec<AigRef> = yb.iter().map(|&r| !r).collect();
+                self.ripple_carry_add(&xb, &y_neg, AigRef::TRUE).0
             }
             BvOp::Neg(x) => {
                 let xb = self.bitblast_bv(x);
@@ -1189,9 +1465,8 @@ impl SmtSolver {
                 let yb = self.bitblast_bv(y);
                 let (q, _r) = self.mk_udivmod(&xb, &yb);
                 // bvudiv(x, 0) = all ones (SMT-LIB).
-                let yb2 = self.bitblast_bv(y);
-                let y_is_zero = self.mk_all_zero(&yb2);
-                let ones = vec![self.get_true_lit(); q.len()];
+                let y_is_zero = self.mk_all_zero(&yb);
+                let ones = vec![AigRef::TRUE; q.len()];
                 self.mux_vec(y_is_zero, &ones, &q)
             }
             BvOp::Urem(x, y) => {
@@ -1199,10 +1474,8 @@ impl SmtSolver {
                 let yb = self.bitblast_bv(y);
                 let (_q, r) = self.mk_udivmod(&xb, &yb);
                 // bvurem(x, 0) = x.
-                let yb2 = self.bitblast_bv(y);
-                let xb2 = self.bitblast_bv(x);
-                let y_is_zero = self.mk_all_zero(&yb2);
-                self.mux_vec(y_is_zero, &xb2, &r)
+                let y_is_zero = self.mk_all_zero(&yb);
+                self.mux_vec(y_is_zero, &xb, &r)
             }
             BvOp::Sdiv(x, y) => {
                 let xb = self.bitblast_bv(x);
@@ -1231,12 +1504,11 @@ impl SmtSolver {
             }
             BvOp::Lshr(x, y) => {
                 let xb = self.bitblast_bv(x);
-                let zero_fill = !self.get_true_lit();
                 if let Some(amt) = self.const_shift_amt(y) {
-                    self.mk_shr_const(&xb, amt, zero_fill)
+                    self.mk_shr_const(&xb, amt, AigRef::FALSE)
                 } else {
                     let yb = self.bitblast_bv(y);
-                    self.mk_shr(&xb, &yb, zero_fill)
+                    self.mk_shr(&xb, &yb, AigRef::FALSE)
                 }
             }
             BvOp::Ashr(x, y) => {
@@ -1264,9 +1536,8 @@ impl SmtSolver {
             BvOp::ZeroExtend(x, n) => {
                 let xb = self.bitblast_bv(x);
                 let mut result = xb;
-                let zero = !self.get_true_lit();
                 for _ in 0..n {
-                    result.push(zero);
+                    result.push(AigRef::FALSE);
                 }
                 result
             }
@@ -1301,23 +1572,23 @@ impl SmtSolver {
                 // at the same decision level.
                 let table = self.ctx.select_tables[idx as usize].clone();
                 let default_bits = self.bitblast_bv(table.default);
-                let sel_lits: Vec<Lit> = table
+                let sel_refs: Vec<AigRef> = table
                     .selectors
                     .iter()
                     .map(|&s| self.bitblast_bool(s))
                     .collect();
-                let value_bit_vecs: Vec<Vec<Lit>> = table
+                let value_bit_vecs: Vec<Vec<AigRef>> = table
                     .values
                     .iter()
                     .map(|&v| self.bitblast_bv(v))
                     .collect();
                 let n_bits = default_bits.len();
-                let mut output: Vec<Lit> = default_bits.clone();
+                let mut output: Vec<AigRef> = default_bits.clone();
                 // Walk right-to-left so the FIRST (outermost) selector ends
                 // up taking priority — mux(sel_i, val_i, acc) means "if
                 // sel_i, val_i, else whatever the tail produced".
-                for i in (0..sel_lits.len()).rev() {
-                    let sel = sel_lits[i];
+                for i in (0..sel_refs.len()).rev() {
+                    let sel = sel_refs[i];
                     let value = &value_bit_vecs[i];
                     for bit in 0..n_bits {
                         output[bit] = self.mk_mux(sel, value[bit], output[bit]);
@@ -1350,98 +1621,63 @@ impl SmtSolver {
             }
         };
         self.current_bv_ctx = prev_ctx;
-        // Finalize the cost frame: flush the accumulated exclusive cost
-        // (acc + final tail since the last suspend) into the cost map,
-        // then re-baseline the parent so its next interval starts here.
-        if self.bitblast_cost_enabled {
-            let v_now = self.sat.num_vars();
-            let c_now = self.sat.num_clauses();
-            let frame = self.bitblast_cost_stack.pop()
-                .expect("bitblast_cost_stack underflow");
-            debug_assert_eq!(frame.term, t);
-            let dv = frame.acc_v + (v_now - frame.start_v);
-            let dc = frame.acc_c + (c_now - frame.start_c);
-            let entry = self.bitblast_cost.entry(t).or_insert((0, 0));
-            entry.0 += dv;
-            entry.1 += dc;
-            if let Some(parent) = self.bitblast_cost_stack.last_mut() {
-                parent.start_v = v_now;
-                parent.start_c = c_now;
-            }
-        }
         self.bv_cache.insert(t, bits.clone());
         bits
     }
 
-    /// Produce a single SAT literal for `t`.
-    fn bitblast_bool(&mut self, t: BoolTerm) -> Lit {
+    /// Produce a single AIG ref for `t`.
+    fn bitblast_bool(&mut self, t: BoolTerm) -> AigRef {
         if let Some(&cached) = self.bool_cache.get(&t) {
             return cached;
         }
         let op = self.ctx.bool_nodes[t.0 as usize];
-        let lit = match op {
-            BoolOp::True => self.get_true_lit(),
-            BoolOp::False => !self.get_true_lit(),
+        let r = match op {
+            BoolOp::True => AigRef::TRUE,
+            BoolOp::False => AigRef::FALSE,
             BoolOp::Var(id) => {
                 let id = self.find_bool_var_root(id);
-                if let Some(&cached) = self.bool_var_lits.get(&id) {
+                if let Some(&cached) = self.bool_var_refs.get(&id) {
                     cached
                 } else {
                     let l = self.new_sat_lit_tagged(VarOrigin::Bool { term: t });
-                    self.bool_var_lits.insert(id, l);
-                    l
+                    let input = self.aig.input(l);
+                    self.set_node_lit(input.node_idx(), l);
+                    self.bool_var_refs.insert(id, input);
+                    input
                 }
             }
             BoolOp::Not(x) => {
-                let xl = self.bitblast_bool(x);
-                !xl
+                let xr = self.bitblast_bool(x);
+                !xr
             }
             BoolOp::And(x, y) => {
-                let xl = self.bitblast_bool(x);
-                let yl = self.bitblast_bool(y);
-                self.mk_and(xl, yl)
+                let xr = self.bitblast_bool(x);
+                let yr = self.bitblast_bool(y);
+                self.mk_and(xr, yr)
             }
             BoolOp::Or(x, y) => {
-                let xl = self.bitblast_bool(x);
-                let yl = self.bitblast_bool(y);
-                self.mk_or(xl, yl)
+                let xr = self.bitblast_bool(x);
+                let yr = self.bitblast_bool(y);
+                self.mk_or(xr, yr)
             }
             BoolOp::Implies(x, y) => {
-                let xl = self.bitblast_bool(x);
-                let yl = self.bitblast_bool(y);
-                self.mk_or(!xl, yl)
+                let xr = self.bitblast_bool(x);
+                let yr = self.bitblast_bool(y);
+                self.mk_or(!xr, yr)
             }
             BoolOp::Eq(a, b) => {
-                // Width-1 fast path: equality between two 1-bit values is
-                // either a direct literal reuse or a single XNOR — skip the
-                // O(w) bit-for-bit loop and its temporary vector alloc.
-                // In particular `(= x (_ bv1 1))` where x is BV1 is a pure
-                // lift of x's single bit to Bool: no new gate, no clause.
+                // Width-1 fast path: 1-bit equality is a single XNOR, and
+                // the AIG folds constants on either side for free (e.g.
+                // `(= x (_ bv1 1))` is a pure lift of x's bit — no node).
                 if self.ctx.width_of(a) == 1 {
-                    let a_lit = self.bitblast_bv(a)[0];
-                    let b_lit = self.bitblast_bv(b)[0];
-                    let tl = self.get_true_lit();
-                    if b_lit == tl {
-                        return a_lit;
-                    }
-                    if b_lit == !tl {
-                        return !a_lit;
-                    }
-                    if a_lit == tl {
-                        return b_lit;
-                    }
-                    if a_lit == !tl {
-                        return !b_lit;
-                    }
-                    // Two non-trivial 1-bit vars: single XNOR gate is cheaper
-                    // than the generic mk_bitwise_eq path.
-                    let n_and = self.mk_and(!a_lit, !b_lit);
-                    let both = self.mk_and(a_lit, b_lit);
-                    return self.mk_or(n_and, both);
+                    let ar = self.bitblast_bv(a)[0];
+                    let br = self.bitblast_bv(b)[0];
+                    !self.mk_xor(ar, br)
+                } else {
+                    let ab = self.bitblast_bv(a);
+                    let bb = self.bitblast_bv(b);
+                    self.mk_bitwise_eq(&ab, &bb)
                 }
-                let ab = self.bitblast_bv(a);
-                let bb = self.bitblast_bv(b);
-                self.mk_bitwise_eq(&ab, &bb)
             }
             BoolOp::Ult(a, b) => {
                 let ab = self.bitblast_bv(a);
@@ -1476,16 +1712,14 @@ impl SmtSolver {
                 // Overflow bit = final carry-out of plain ripple-carry add.
                 let ab = self.bitblast_bv(a);
                 let bb = self.bitblast_bv(b);
-                let cin = !self.get_true_lit();
-                let (_sum, cout) = self.ripple_carry_add(&ab, &bb, cin);
+                let (_sum, cout) = self.ripple_carry_add(&ab, &bb, AigRef::FALSE);
                 cout
             }
             BoolOp::SaddOverflow(a, b) => {
                 // Signed add overflows iff: sign(a) == sign(b) && sign(sum) != sign(a).
                 let ab = self.bitblast_bv(a);
                 let bb = self.bitblast_bv(b);
-                let cin = !self.get_true_lit();
-                let (sum, _) = self.ripple_carry_add(&ab, &bb, cin);
+                let (sum, _) = self.ripple_carry_add(&ab, &bb, AigRef::FALSE);
                 let a_sign = ab[ab.len() - 1];
                 let b_sign = bb[bb.len() - 1];
                 let s_sign = sum[sum.len() - 1];
@@ -1503,9 +1737,8 @@ impl SmtSolver {
                 // Signed sub overflows iff: sign(a) != sign(b) && sign(a-b) != sign(a).
                 let ab = self.bitblast_bv(a);
                 let bb = self.bitblast_bv(b);
-                let b_neg: Vec<Lit> = bb.iter().map(|&l| !l).collect();
-                let cin = self.get_true_lit();
-                let (diff, _) = self.ripple_carry_add(&ab, &b_neg, cin);
+                let b_neg: Vec<AigRef> = bb.iter().map(|&r| !r).collect();
+                let (diff, _) = self.ripple_carry_add(&ab, &b_neg, AigRef::TRUE);
                 let a_sign = ab[ab.len() - 1];
                 let b_sign = bb[bb.len() - 1];
                 let d_sign = diff[diff.len() - 1];
@@ -1530,7 +1763,7 @@ impl SmtSolver {
                 // Expected high bits: all replicas of lo's MSB (sign of the
                 // truncated product). Overflow iff any differ.
                 let sign_of_lo = lo[lo.len() - 1];
-                let diffs: Vec<Lit> =
+                let diffs: Vec<AigRef> =
                     hi.iter().map(|&h| self.mk_xor(h, sign_of_lo)).collect();
                 self.mk_any_set(&diffs)
             }
@@ -1538,14 +1771,9 @@ impl SmtSolver {
                 // -x overflows iff x = INT_MIN = sign-bit-set, all-others-zero.
                 let ab = self.bitblast_bv(a);
                 let n = ab.len();
-                let mut conds = Vec::with_capacity(n);
-                conds.push(ab[n - 1]); // MSB must be 1
+                let mut acc = ab[n - 1]; // MSB must be 1
                 for i in 0..n - 1 {
-                    conds.push(!ab[i]); // others must be 0
-                }
-                let mut acc = conds[0];
-                for c in conds.iter().skip(1) {
-                    acc = self.mk_and(acc, *c);
+                    acc = self.mk_and(acc, !ab[i]); // others must be 0
                 }
                 acc
             }
@@ -1567,11 +1795,244 @@ impl SmtSolver {
                 self.mk_and(a_is_min, b_is_minus_one)
             }
         };
-        self.bool_cache.insert(t, lit);
-        lit
+        self.bool_cache.insert(t, r);
+        r
     }
 
-    // ---------- Low-level SAT helpers ----------
+    // ---------- CNF materialization (AIG → clauses) ----------
+
+    /// Materialize an AIG ref to a SAT literal, emitting Tseitin clauses for
+    /// every not-yet-emitted node in its cone. Iterative post-order walk —
+    /// never recurses, so arbitrarily deep AIGs are fine.
+    ///
+    /// Shape-aware emission: an And node whose structure matches the 3-node
+    /// XOR / MUX patterns produced by `Aig::xor` / `Aig::mux` gets the
+    /// direct 4-clause single-var encoding over the pattern's *operands*;
+    /// the two interior And nodes are skipped entirely (they get their own
+    /// vars only if some other consumer independently materializes them).
+    /// This keeps CNF size at parity with a hand-written Tseitin encoder
+    /// while everything still flows through one AIG.
+    fn lit_of(&mut self, r: AigRef) -> Lit {
+        let root_idx = r.node_idx();
+        if self.node_lit(root_idx).is_none() {
+            let mut worklist: Vec<u32> = vec![root_idx];
+            while let Some(&top) = worklist.last() {
+                if self.node_lit(top).is_some() {
+                    worklist.pop();
+                    continue;
+                }
+                match self.aig.node(top) {
+                    AigNode::ConstTrue => {
+                        let tl = self.get_true_lit();
+                        self.set_node_lit(top, tl);
+                        worklist.pop();
+                    }
+                    AigNode::Input(lit) => {
+                        self.set_node_lit(top, lit);
+                        worklist.pop();
+                    }
+                    AigNode::And(a, b) => {
+                        // Plain-And shortcut: if both children already have
+                        // lits, the 3-clause encoding is the cheapest form —
+                        // don't bother pattern-matching.
+                        let a_lit = self.node_lit(a.node_idx());
+                        let b_lit = self.node_lit(b.node_idx());
+                        if let (Some(al_base), Some(bl_base)) = (a_lit, b_lit) {
+                            let al = if a.is_negated() { !al_base } else { al_base };
+                            let bl = if b.is_negated() { !bl_base } else { bl_base };
+                            self.emit_and_gate(top, al, bl);
+                            worklist.pop();
+                            continue;
+                        }
+                        // Pattern-mapped shapes bypass the interior nodes.
+                        if let Some(shape) = self.detect_shape(top) {
+                            let needed: [Option<AigRef>; 3] = match shape {
+                                NodeShape::Xor(x, y) => [Some(x), Some(y), None],
+                                NodeShape::NotMux { s, t, e } => {
+                                    [Some(s), Some(t), Some(e)]
+                                }
+                            };
+                            let mut missing = false;
+                            for opnd in needed.iter().flatten() {
+                                if self.node_lit(opnd.node_idx()).is_none() {
+                                    worklist.push(opnd.node_idx());
+                                    missing = true;
+                                }
+                            }
+                            if missing {
+                                continue;
+                            }
+                            match shape {
+                                NodeShape::Xor(x, y) => {
+                                    let xl = self.ref_lit(x);
+                                    let yl = self.ref_lit(y);
+                                    self.emit_xor_gate(top, xl, yl);
+                                }
+                                NodeShape::NotMux { s, t, e } => {
+                                    let sl = self.ref_lit(s);
+                                    let tl = self.ref_lit(t);
+                                    let el = self.ref_lit(e);
+                                    self.emit_mux_gate(top, sl, tl, el);
+                                }
+                            }
+                            worklist.pop();
+                            continue;
+                        }
+                        // Plain And: make sure both children are materialized.
+                        let mut missing = false;
+                        if a_lit.is_none() {
+                            worklist.push(a.node_idx());
+                            missing = true;
+                        }
+                        if b_lit.is_none() {
+                            worklist.push(b.node_idx());
+                            missing = true;
+                        }
+                        if missing {
+                            continue;
+                        }
+                        unreachable!("both children materialized — handled above");
+                    }
+                }
+            }
+        }
+        let base = self.node_lit(root_idx).expect("cone materialized");
+        if r.is_negated() { !base } else { base }
+    }
+
+    /// `lit_of` that returns `None` if the node hasn't been materialized
+    /// yet, instead of doing so. Used for model readback and deferred
+    /// metadata resolution where forcing CNF emission would be wrong.
+    fn try_lit_of(&self, r: AigRef) -> Option<Lit> {
+        self.aig_lit
+            .get(r.node_idx() as usize)
+            .copied()
+            .flatten()
+            .map(|base| if r.is_negated() { !base } else { base })
+    }
+
+    #[inline]
+    fn node_lit(&self, idx: u32) -> Option<Lit> {
+        self.aig_lit.get(idx as usize).copied().flatten()
+    }
+
+    #[inline]
+    fn set_node_lit(&mut self, idx: u32, l: Lit) {
+        if self.aig_lit.len() <= idx as usize {
+            self.aig_lit.resize(idx as usize + 1, None);
+        }
+        self.aig_lit[idx as usize] = Some(l);
+        self.lit_node[l.var_idx()] = idx;
+    }
+
+    /// Signed lookup: the node behind `r` must already have a lit.
+    #[inline]
+    fn ref_lit(&self, r: AigRef) -> Lit {
+        let base = self.node_lit(r.node_idx()).expect("operand materialized");
+        if r.is_negated() { !base } else { base }
+    }
+
+    /// Classify an And node as one of the compound shapes worth a direct
+    /// encoding. Both children must be negated And nodes; then:
+    ///   - XOR: the grandchild pairs are elementwise complementary —
+    ///     `n = ¬(x∧y) ∧ ¬(¬x∧¬y) ≡ x ⊕ y`.
+    ///   - MUX: exactly one grandchild pair is complementary (the selector)
+    ///     — `n = ¬(s∧t) ∧ ¬(¬s∧e) ≡ ¬mux(s, t, e)`.
+    fn detect_shape(&self, idx: u32) -> Option<NodeShape> {
+        let AigNode::And(a, b) = self.aig.node(idx) else {
+            return None;
+        };
+        if !a.is_negated() || !b.is_negated() {
+            return None;
+        }
+        let AigNode::And(x0, x1) = self.aig.node(a.node_idx()) else {
+            return None;
+        };
+        let AigNode::And(y0, y1) = self.aig.node(b.node_idx()) else {
+            return None;
+        };
+        // XOR first — it's the fully-complementary special case of MUX and
+        // we want it tagged/encoded as XOR.
+        if (y0 == !x0 && y1 == !x1) || (y0 == !x1 && y1 == !x0) {
+            return Some(NodeShape::Xor(x0, x1));
+        }
+        if y0 == !x0 {
+            return Some(NodeShape::NotMux { s: x0, t: x1, e: y1 });
+        }
+        if y1 == !x0 {
+            return Some(NodeShape::NotMux { s: x0, t: x1, e: y0 });
+        }
+        if y0 == !x1 {
+            return Some(NodeShape::NotMux { s: x1, t: x0, e: y1 });
+        }
+        if y1 == !x1 {
+            return Some(NodeShape::NotMux { s: x1, t: x0, e: y0 });
+        }
+        None
+    }
+
+    /// Emit `o ↔ (al ∧ bl)` for node `idx` (3 clauses, 1 var).
+    fn emit_and_gate(&mut self, idx: u32, al: Lit, bl: Lit) {
+        let origin = VarOrigin::GateOut {
+            gate: GateKind::And,
+            term: self.aig.src_term(idx),
+        };
+        let o = self.new_sat_lit_tagged(origin);
+        self.emit_clause(vec![!al, !bl, o]);
+        self.emit_clause(vec![al, !o]);
+        self.emit_clause(vec![bl, !o]);
+        self.set_node_lit(idx, o);
+        self.charge_cost(idx, 1, 3);
+    }
+
+    /// Emit `o ↔ (xl ⊕ yl)` for node `idx` (4 clauses, 1 var). The node
+    /// itself IS the xor of the operands (see `detect_shape`).
+    fn emit_xor_gate(&mut self, idx: u32, xl: Lit, yl: Lit) {
+        let origin = VarOrigin::GateOut {
+            gate: GateKind::Xor,
+            term: self.aig.src_term(idx),
+        };
+        let o = self.new_sat_lit_tagged(origin);
+        self.emit_clause(vec![!xl, !yl, !o]);
+        self.emit_clause(vec![xl, yl, !o]);
+        self.emit_clause(vec![xl, !yl, o]);
+        self.emit_clause(vec![!xl, yl, o]);
+        self.set_node_lit(idx, o);
+        self.charge_cost(idx, 1, 4);
+    }
+
+    /// Emit a mux gate for node `idx`, which satisfies `idx ≡ ¬mux(s,t,e)`.
+    /// The fresh var `o` encodes the mux VALUE; the node's stored lit is
+    /// therefore `¬o`. (4 clauses, 1 var.)
+    fn emit_mux_gate(&mut self, idx: u32, sl: Lit, tl: Lit, el: Lit) {
+        let origin = VarOrigin::GateOut {
+            gate: GateKind::Ite,
+            term: self.aig.src_term(idx),
+        };
+        let o = self.new_sat_lit_tagged(origin);
+        self.emit_clause(vec![!sl, !tl, o]);
+        self.emit_clause(vec![!sl, tl, !o]);
+        self.emit_clause(vec![sl, !el, o]);
+        self.emit_clause(vec![sl, el, !o]);
+        self.set_node_lit(idx, !o);
+        self.charge_cost(idx, 1, 4);
+    }
+
+    /// Charge emitted CNF to the BV term tagged on the AIG node, if cost
+    /// tracking is on.
+    #[inline]
+    fn charge_cost(&mut self, idx: u32, vars: usize, clauses: usize) {
+        if !self.bitblast_cost_enabled {
+            return;
+        }
+        if let Some(term) = self.aig.src_term(idx) {
+            let entry = self.bitblast_cost.entry(term).or_insert((0, 0));
+            entry.0 += vars;
+            entry.1 += clauses;
+        }
+    }
+
+    // ---------- Low-level helpers ----------
 
     /// Allocate a fresh SAT literal tagged with the given metadata.
     fn new_sat_lit_tagged(&mut self, origin: VarOrigin) -> Lit {
@@ -1579,14 +2040,27 @@ impl SmtSolver {
         // Keep var_origin aligned 1-to-1 with SAT variables.
         debug_assert_eq!(self.var_origin.len(), v.idx());
         self.var_origin.push(origin);
+        self.lit_node.push(u32::MAX);
         Lit::new(v, false)
     }
 
+    /// Route a clause to the active sink: the flush buffer when
+    /// preprocessing is collecting a batch, the SAT core otherwise.
+    #[inline]
+    fn emit_clause(&mut self, c: Vec<Lit>) {
+        match self.cnf_buffer.as_mut() {
+            Some(buf) => buf.push(c),
+            None => {
+                self.sat.add_clause(c);
+            }
+        }
+    }
 
-    fn get_or_make_bv_var(&mut self, id: u32, width: u32) -> Vec<Lit> {
-        // Route through the union-find root: aliased vars share SAT literals.
+    fn get_or_make_bv_var(&mut self, id: u32, width: u32) -> Vec<AigRef> {
+        // Route through the union-find root: aliased vars share SAT literals
+        // (and therefore AIG input nodes).
         let id = self.find_bv_var_root(id);
-        if let Some(cached) = self.bv_var_lits.get(&id) {
+        if let Some(cached) = self.bv_var_refs.get(&id) {
             return cached.clone();
         }
         // We need the BvTerm handle to tag each bit. Look it up by scanning
@@ -1603,21 +2077,26 @@ impl SmtSolver {
             }
             found
         };
-        let bits: Vec<Lit> = (0..width)
+        let refs: Vec<AigRef> = (0..width)
             .map(|bit| {
                 let origin = match term {
                     Some(t) => VarOrigin::BvBit { term: t, bit },
                     None => VarOrigin::Unknown,
                 };
-                self.new_sat_lit_tagged(origin)
+                let l = self.new_sat_lit_tagged(origin);
+                let input = self.aig.input(l);
+                self.set_node_lit(input.node_idx(), l);
+                input
             })
             .collect();
-        self.bv_var_lits.insert(id, bits.clone());
-        bits
+        self.bv_var_refs.insert(id, refs.clone());
+        refs
     }
 
     /// A literal pinned to true. Allocated once on first use, backed by a
-    /// unit clause; every reference to "false" uses its negation.
+    /// unit clause. Only needed when a constant AIG ref must appear in an
+    /// emitted clause (constant roots / constant bits of a direct-encoded
+    /// equality); all other constant handling folds inside the AIG.
     fn get_true_lit(&mut self) -> Lit {
         if let Some(l) = self.true_lit {
             return l;
@@ -1625,206 +2104,101 @@ impl SmtSolver {
         let l = self.new_sat_lit_tagged(VarOrigin::TrueLit);
         self.sat.add_clause(vec![l]);
         self.true_lit = Some(l);
+        // The ConstTrue node is index 0; pin its lit so `lit_of` on
+        // constants resolves without re-entering this path.
+        self.set_node_lit(0, l);
         l
     }
 
-    fn zipwith<F>(&mut self, a: &[Lit], b: &[Lit], mut f: F) -> Vec<Lit>
+    fn zipwith<F>(&mut self, a: &[AigRef], b: &[AigRef], mut f: F) -> Vec<AigRef>
     where
-        F: FnMut(&mut Self, Lit, Lit) -> Lit,
+        F: FnMut(&mut Self, AigRef, AigRef) -> AigRef,
     {
         assert_eq!(a.len(), b.len());
         (0..a.len()).map(|i| f(self, a[i], b[i])).collect()
     }
 
-    /// Allocate an output literal for a freshly-emitted gate, tagging it
-    /// with metadata for later introspection. Uses the currently-enclosing
-    /// BV term (if any) to group gate outputs back to their source.
-    fn new_gate_lit(&mut self, kind: GateKind) -> Lit {
-        let origin = VarOrigin::GateOut {
-            gate: kind,
-            term: self.current_bv_ctx,
-        };
-        self.new_sat_lit_tagged(origin)
+    /// AND gate — delegates to the AIG (construction-time folds + hash-
+    /// cons). No CNF is emitted here. Tags the node with the enclosing BV
+    /// term for metadata / cost attribution.
+    fn mk_and(&mut self, a: AigRef, b: AigRef) -> AigRef {
+        let r = self.aig.and(a, b);
+        if let Some(term) = self.current_bv_ctx {
+            self.aig.tag_src(r, term);
+        }
+        r
     }
 
-    /// AND gate.  o ↔ (a ∧ b).  Encodes the biconditional with 3 clauses.
-    /// Fast paths: trivial identities, and the pinned-`true_lit` constants
-    /// (critical — bitblasting BV constants generates a flood of `mk_and(x, T)`
-    /// and `mk_and(x, F)` calls that would otherwise each allocate a gate).
-    fn mk_and(&mut self, a: Lit, b: Lit) -> Lit {
-        if a == b { return a; }
-        if a == !b { return !self.get_true_lit(); }
-        if let Some(tl) = self.true_lit {
-            if a == tl { return b; }            // T ∧ b = b
-            if b == tl { return a; }            // a ∧ T = a
-            if a == !tl { return !tl; }         // F ∧ b = F
-            if b == !tl { return !tl; }         // a ∧ F = F
+    /// OR gate — `¬and(¬a, ¬b)`.
+    fn mk_or(&mut self, a: AigRef, b: AigRef) -> AigRef {
+        let r = self.aig.or(a, b);
+        if let Some(term) = self.current_bv_ctx {
+            self.aig.tag_src(r, term);
         }
-        let key = if a.0 <= b.0 { (a, b) } else { (b, a) };
-        if let Some(&cached) = self.and_cache.get(&key) {
-            return cached;
-        }
-        // De Morgan cross-cache: `and(a, b) = ¬or(¬a, ¬b)`. If we already
-        // emitted the corresponding OR gate, reuse its negated output and
-        // avoid a duplicate AND gate + 3 clauses.
-        let neg_key = {
-            let na = !a;
-            let nb = !b;
-            if na.0 <= nb.0 { (na, nb) } else { (nb, na) }
-        };
-        if let Some(&cached) = self.or_cache.get(&neg_key) {
-            let o = !cached;
-            self.and_cache.insert(key, o);
-            return o;
-        }
-        let o = self.new_gate_lit(GateKind::And);
-        self.sat.add_clause(vec![!a, !b, o]);
-        self.sat.add_clause(vec![a, !o]);
-        self.sat.add_clause(vec![b, !o]);
-        self.and_cache.insert(key, o);
-        self.or_cache.insert(neg_key, !o);
-        o
+        r
     }
 
-    /// OR gate.  o ↔ (a ∨ b).
-    fn mk_or(&mut self, a: Lit, b: Lit) -> Lit {
-        if a == b { return a; }
-        if a == !b { return self.get_true_lit(); }
-        if let Some(tl) = self.true_lit {
-            if a == tl { return tl; }           // T ∨ b = T
-            if b == tl { return tl; }           // a ∨ T = T
-            if a == !tl { return b; }           // F ∨ b = b
-            if b == !tl { return a; }           // a ∨ F = a
+    /// XOR gate — the 3-node AIG shape; `lit_of` recognizes it at emission
+    /// time and produces the direct 4-clause encoding.
+    fn mk_xor(&mut self, a: AigRef, b: AigRef) -> AigRef {
+        let r = self.aig.xor(a, b);
+        if let Some(term) = self.current_bv_ctx {
+            self.aig.tag_src(r, term);
         }
-        let key = if a.0 <= b.0 { (a, b) } else { (b, a) };
-        if let Some(&cached) = self.or_cache.get(&key) {
-            return cached;
-        }
-        // De Morgan cross-cache: `or(a, b) = ¬and(¬a, ¬b)`.
-        let neg_key = {
-            let na = !a;
-            let nb = !b;
-            if na.0 <= nb.0 { (na, nb) } else { (nb, na) }
-        };
-        if let Some(&cached) = self.and_cache.get(&neg_key) {
-            let o = !cached;
-            self.or_cache.insert(key, o);
-            return o;
-        }
-        let o = self.new_gate_lit(GateKind::Or);
-        self.sat.add_clause(vec![a, b, !o]);
-        self.sat.add_clause(vec![!a, o]);
-        self.sat.add_clause(vec![!b, o]);
-        self.or_cache.insert(key, o);
-        self.and_cache.insert(neg_key, !o);
-        o
+        r
     }
 
-    /// XOR gate.  o ↔ (a ⊕ b).
-    fn mk_xor(&mut self, a: Lit, b: Lit) -> Lit {
-        if a == b { return !self.get_true_lit(); }
-        if a == !b { return self.get_true_lit(); }
-        if let Some(tl) = self.true_lit {
-            if a == tl { return !b; }           // T ⊕ b = ¬b
-            if b == tl { return !a; }           // a ⊕ T = ¬a
-            if a == !tl { return b; }           // F ⊕ b = b
-            if b == !tl { return a; }           // a ⊕ F = a
+    /// 2:1 MUX. Structural folds happen at the AIG level; a genuine mux
+    /// gets queued for ITE metadata + the selector VSIDS boost, resolved at
+    /// flush for gates that actually reach an asserted root.
+    fn mk_mux(&mut self, sel: AigRef, t: AigRef, e: AigRef) -> AigRef {
+        // Replicate the AIG's folds up front so we can tell "real mux
+        // structure" apart from a degenerate case — only the former gets
+        // ITE-gate metadata and branching hints.
+        if t == e {
+            return t;
         }
-        // XOR under polarity: xor(a,b) = xor(¬a,¬b), and xor(a,b) = ¬xor(¬a,b).
-        // Canonicalize so the first arg is always positive polarity; if we
-        // had to flip exactly one, negate the cached output.
-        let (ca, cb, flip) = {
-            let a_pos = (a.0 & 1) == 0;
-            let b_pos = (b.0 & 1) == 0;
-            match (a_pos, b_pos) {
-                (true, true) | (false, false) => {
-                    // Both same polarity: strip to positives (or keep as-is)
-                    let pa = Lit(a.0 & !1);
-                    let pb = Lit(b.0 & !1);
-                    (pa, pb, false)
-                }
-                (true, false) => (a, !b, true),
-                (false, true) => (!a, b, true),
-            }
-        };
-        let key = if ca.0 <= cb.0 { (ca, cb) } else { (cb, ca) };
-        if let Some(&cached) = self.xor_cache.get(&key) {
-            return if flip { !cached } else { cached };
+        if sel == AigRef::TRUE {
+            return t;
         }
-        let o = self.new_gate_lit(GateKind::Xor);
-        self.sat.add_clause(vec![!a, !b, !o]);
-        self.sat.add_clause(vec![a, b, !o]);
-        self.sat.add_clause(vec![a, !b, o]);
-        self.sat.add_clause(vec![!a, b, o]);
-        // Cache the "positive form" output: with ca, cb both positive,
-        // xor(ca, cb) would be an o' whose clauses are the positive form.
-        // But the `o` we just emitted uses the original (a, b). They're
-        // structurally the same gate. The trick: for the canonical key, we
-        // want xor(ca, cb) = o when flip=false, and !o when flip=true.
-        let canonical_out = if flip { !o } else { o };
-        self.xor_cache.insert(key, canonical_out);
-        o
-    }
-
-    /// 2:1 MUX.  o ↔ (sel ∧ t) ∨ (¬sel ∧ e).
-    /// Registers the gate in `ite_gates` so future ITE-aware passes can
-    /// find it without scanning clauses.
-    fn mk_mux(&mut self, sel: Lit, t: Lit, e: Lit) -> Lit {
-        if t == e { return t; }
-        if let Some(tl) = self.true_lit {
-            if sel == tl { return t; }          // const-true sel
-            if sel == !tl { return e; }         // const-false sel
+        if sel == AigRef::FALSE {
+            return e;
         }
-        // Also handle mux degenerates involving constants on branches.
-        if let Some(tl) = self.true_lit {
-            if t == tl && e == !tl { return sel; }       // mux(s, T, F) = s
-            if t == !tl && e == tl { return !sel; }      // mux(s, F, T) = ¬s
-            if t == sel { /* mux(s, s, e) = s ∨ e */
-                return self.mk_or(sel, e);
-            }
-            if e == !sel { /* mux(s, t, ¬s) = s ∧ t */
-                return self.mk_and(sel, t);
-            }
-            let _ = tl;
+        if t == AigRef::TRUE && e == AigRef::FALSE {
+            return sel;
         }
-        // Canonicalize sel to positive polarity: mux(¬s, t, e) = mux(s, e, t).
-        let (csel, ct, ce) = if (sel.0 & 1) == 1 {
-            (!sel, e, t)
-        } else {
-            (sel, t, e)
-        };
-        let key = (csel, ct, ce);
-        if let Some(&cached) = self.mux_cache.get(&key) {
-            return cached;
+        if t == AigRef::FALSE && e == AigRef::TRUE {
+            return !sel;
         }
-        let o = self.new_gate_lit(GateKind::Ite);
-        self.sat.add_clause(vec![!sel, !t, o]);
-        self.sat.add_clause(vec![!sel, t, !o]);
-        self.sat.add_clause(vec![sel, !e, o]);
-        self.sat.add_clause(vec![sel, e, !o]);
-        // Record the structural gate.
-        let idx = self.ite_gates.len();
-        self.ite_gates.push(IteGate {
+        if t == sel {
+            return self.mk_or(sel, e);
+        }
+        if e == !sel {
+            return self.mk_and(sel, t);
+        }
+        let out = self.aig.mux(sel, t, e);
+        if let Some(term) = self.current_bv_ctx {
+            self.aig.tag_src(out, term);
+        }
+        self.pending_ite_gates.push(PendingIte {
             sel,
             t,
             e,
-            o,
-            source_term: self.current_bv_ctx,
+            out,
+            src: self.current_bv_ctx,
         });
-        self.ite_out_to_gate.insert(o, idx);
-        self.mux_cache.insert(key, o);
-        // Branching hint: deciding `sel` resolves the whole ITE subtree,
-        // so bump its VSIDS activity once per gate. Width-N ITEs naturally
-        // stack N bumps onto the same selector, giving deep / wide ITE
-        // fan-outs a proportionally strong priority.
+        // Branching hint: deciding `sel` resolves the whole ITE subtree.
+        // Width-N ITEs naturally stack N queued boosts onto the same
+        // selector, giving deep / wide ITE fan-outs a proportionally
+        // strong priority once their gates go live.
         if self.ite_branching_hints {
-            self.sat.boost_var_activity(sel.var());
+            self.pending_sel_boosts.push((sel, out));
         }
-        o
+        out
     }
 
     /// Bit-parallel MUX: pick `t[i]` when `sel` is true, else `e[i]`.
-    fn mux_vec(&mut self, sel: Lit, t: &[Lit], e: &[Lit]) -> Vec<Lit> {
+    fn mux_vec(&mut self, sel: AigRef, t: &[AigRef], e: &[AigRef]) -> Vec<AigRef> {
         assert_eq!(t.len(), e.len());
         (0..t.len()).map(|i| self.mk_mux(sel, t[i], e[i])).collect()
     }
@@ -1832,7 +2206,7 @@ impl SmtSolver {
     /// Full adder for one bit. Returns (sum, cout).
     ///   sum = a ⊕ b ⊕ cin
     ///   cout = majority(a, b, cin)
-    fn mk_full_adder(&mut self, a: Lit, b: Lit, cin: Lit) -> (Lit, Lit) {
+    fn mk_full_adder(&mut self, a: AigRef, b: AigRef, cin: AigRef) -> (AigRef, AigRef) {
         let a_xor_b = self.mk_xor(a, b);
         let sum = self.mk_xor(a_xor_b, cin);
         let a_and_b = self.mk_and(a, b);
@@ -1848,16 +2222,13 @@ impl SmtSolver {
     /// compression — three bits in a column → one sum bit (same column) +
     /// one carry bit (next column) via a full adder — drives every column
     /// down to ≤2 rows. A final ripple-carry add combines the two rows.
-    /// Total ≈ W full adders for the compression + log(W) for the final
-    /// add — about 2-3× cheaper than the divide-and-conquer tree the
-    /// builder used to compose at the BV layer.
-    fn mk_popcount(&mut self, inputs: &[Lit], out_width: usize) -> Vec<Lit> {
+    fn mk_popcount(&mut self, inputs: &[AigRef], out_width: usize) -> Vec<AigRef> {
         if inputs.is_empty() {
-            return vec![!self.get_true_lit(); out_width];
+            return vec![AigRef::FALSE; out_width];
         }
         if inputs.len() == 1 {
             // 1-bit popcount is the bit itself, zero-extended.
-            let mut out = vec![!self.get_true_lit(); out_width];
+            let mut out = vec![AigRef::FALSE; out_width];
             out[0] = inputs[0];
             return out;
         }
@@ -1866,12 +2237,12 @@ impl SmtSolver {
         // pushes (sum, carry) into the next round's columns. Leftover bits
         // (0 to 2 per column per round) pass through. Loop ends when every
         // column has ≤ 2 rows.
-        let mut columns: Vec<Vec<Lit>> = vec![inputs.to_vec()];
+        let mut columns: Vec<Vec<AigRef>> = vec![inputs.to_vec()];
         loop {
             let mut any_above_two = false;
             // Allocate one extra slot at the top for carries out of the
             // highest current column.
-            let mut next: Vec<Vec<Lit>> = vec![Vec::new(); columns.len() + 1];
+            let mut next: Vec<Vec<AigRef>> = vec![Vec::new(); columns.len() + 1];
             for k in 0..columns.len() {
                 let col = std::mem::take(&mut columns[k]);
                 let mut i = 0;
@@ -1901,19 +2272,18 @@ impl SmtSolver {
         }
         // Pad each column out to two rows (with constant zeros where
         // missing) and ripple-carry-add.
-        let false_lit = !self.get_true_lit();
         let n_cols = columns.len();
-        let mut row1: Vec<Lit> = Vec::with_capacity(n_cols);
-        let mut row2: Vec<Lit> = Vec::with_capacity(n_cols);
+        let mut row1: Vec<AigRef> = Vec::with_capacity(n_cols);
+        let mut row2: Vec<AigRef> = Vec::with_capacity(n_cols);
         for k in 0..n_cols {
             match columns[k].len() {
                 0 => {
-                    row1.push(false_lit);
-                    row2.push(false_lit);
+                    row1.push(AigRef::FALSE);
+                    row2.push(AigRef::FALSE);
                 }
                 1 => {
                     row1.push(columns[k][0]);
-                    row2.push(false_lit);
+                    row2.push(AigRef::FALSE);
                 }
                 2 => {
                     row1.push(columns[k][0]);
@@ -1922,80 +2292,70 @@ impl SmtSolver {
                 _ => unreachable!("post-compression column has > 2 bits"),
             }
         }
-        let (sum, cout) = self.ripple_carry_add(&row1, &row2, false_lit);
+        let (sum, cout) = self.ripple_carry_add(&row1, &row2, AigRef::FALSE);
         // Combine sum + overflow into one output vector, then fit to out_width.
         let mut result = sum;
         result.push(cout);
         if result.len() < out_width {
-            result.resize(out_width, false_lit);
+            result.resize(out_width, AigRef::FALSE);
         } else if result.len() > out_width {
             result.truncate(out_width);
         }
         result
     }
 
-    /// CLZ via `popcount(~(x | x>>1 | x>>2 | ... | x>>(w/2)))` at the lit
-    /// level. The shifts are structural (just slot-shift the input lit
-    /// vector with `false_lit` filling the gaps), and the OR / NOT are
-    /// per-bit at lit level — so the only real gates come from the final
-    /// popcount Wallace tree.
-    fn mk_clz(&mut self, inputs: &[Lit], out_width: usize) -> Vec<Lit> {
+    /// CLZ via `popcount(~(x | x>>1 | x>>2 | ... | x>>(w/2)))` at the AIG
+    /// level. The shifts are structural (just slot-shift the ref vector
+    /// with FALSE filling the gaps), so the only real gates come from the
+    /// OR-fold and the final popcount Wallace tree.
+    fn mk_clz(&mut self, inputs: &[AigRef], out_width: usize) -> Vec<AigRef> {
         let w = inputs.len();
         if w == 0 {
-            return vec![!self.get_true_lit(); out_width];
+            return vec![AigRef::FALSE; out_width];
         }
         if w == 1 {
             // clz of a 1-bit value is just !x.
-            let mut out = vec![!self.get_true_lit(); out_width];
+            let mut out = vec![AigRef::FALSE; out_width];
             out[0] = !inputs[0];
             return out;
         }
-        let false_lit = !self.get_true_lit();
         // OR-fold: every bit at-or-below the highest set bit becomes 1.
         // Shifts are by 1, 2, 4, ... up to < w. Bit i of `y >>L k` is
         // y[i+k] for i+k < w, else false.
-        let mut y: Vec<Lit> = inputs.to_vec();
+        let mut y: Vec<AigRef> = inputs.to_vec();
         let mut k = 1usize;
         while k < w {
-            let shifted: Vec<Lit> = (0..w)
-                .map(|i| if i + k < w { y[i + k] } else { false_lit })
+            let shifted: Vec<AigRef> = (0..w)
+                .map(|i| if i + k < w { y[i + k] } else { AigRef::FALSE })
                 .collect();
             for i in 0..w {
                 y[i] = self.mk_or(y[i], shifted[i]);
             }
             k <<= 1;
         }
-        let ny: Vec<Lit> = y.iter().map(|&l| !l).collect();
+        let ny: Vec<AigRef> = y.iter().map(|&r| !r).collect();
         self.mk_popcount(&ny, out_width)
     }
 
-    /// CTZ via `popcount(~x & (x - 1))` at the lit level. The mask
+    /// CTZ via `popcount(~x & (x - 1))` at the AIG level. The mask
     /// `~x & (x - 1)` has exactly one bit set for each trailing zero of `x`
     /// (and is all-ones when `x == 0`, giving the SMT-LIB convention of
     /// `ctz(0) = width`).
-    fn mk_ctz(&mut self, inputs: &[Lit], out_width: usize) -> Vec<Lit> {
+    fn mk_ctz(&mut self, inputs: &[AigRef], out_width: usize) -> Vec<AigRef> {
         let w = inputs.len();
         if w == 0 {
-            return vec![!self.get_true_lit(); out_width];
+            return vec![AigRef::FALSE; out_width];
         }
         if w == 1 {
-            let mut out = vec![!self.get_true_lit(); out_width];
+            let mut out = vec![AigRef::FALSE; out_width];
             out[0] = !inputs[0];
             return out;
         }
-        let true_lit = self.get_true_lit();
-        let false_lit = !true_lit;
-        // Build the constant `1` as a bit-vector of the right width.
-        let mut one_bits: Vec<Lit> = vec![false_lit; w];
-        one_bits[0] = true_lit;
-        // x - 1 is x + (~1) + 1 — but easier to just call ripple_carry_add
-        // with the negation. Specifically: x - 1 = x + 2^w - 1, i.e., add
-        // all-ones with no carry in, and discard the overflow. Equivalent
-        // to flipping the input to all-ones and ripple-adding.
-        let all_ones: Vec<Lit> = vec![true_lit; w];
-        let (xm1, _cout) = self.ripple_carry_add(inputs, &all_ones, false_lit);
+        // x - 1 = x + all-ones (mod 2^w) with no carry-in.
+        let all_ones: Vec<AigRef> = vec![AigRef::TRUE; w];
+        let (xm1, _cout) = self.ripple_carry_add(inputs, &all_ones, AigRef::FALSE);
         // m = ~x & (x - 1)
-        let m: Vec<Lit> = (0..w)
+        let m: Vec<AigRef> = (0..w)
             .map(|i| self.mk_and(!inputs[i], xm1[i]))
             .collect();
         self.mk_popcount(&m, out_width)
@@ -2050,7 +2410,12 @@ impl SmtSolver {
         }
     }
 
-    fn ripple_carry_add(&mut self, a: &[Lit], b: &[Lit], cin: Lit) -> (Vec<Lit>, Lit) {
+    fn ripple_carry_add(
+        &mut self,
+        a: &[AigRef],
+        b: &[AigRef],
+        cin: AigRef,
+    ) -> (Vec<AigRef>, AigRef) {
         assert_eq!(a.len(), b.len());
         let mut sum = Vec::with_capacity(a.len());
         let mut carry = cin;
@@ -2062,10 +2427,10 @@ impl SmtSolver {
         (sum, carry)
     }
 
-    fn mk_bitwise_eq(&mut self, a: &[Lit], b: &[Lit]) -> Lit {
+    fn mk_bitwise_eq(&mut self, a: &[AigRef], b: &[AigRef]) -> AigRef {
         assert_eq!(a.len(), b.len());
         if a.is_empty() {
-            return self.get_true_lit();
+            return AigRef::TRUE;
         }
         let mut eq = !self.mk_xor(a[0], b[0]);
         for i in 1..a.len() {
@@ -2077,16 +2442,15 @@ impl SmtSolver {
 
     /// Unsigned less-than via the borrow of `a - b` = `a + ~b + 1`. If the
     /// final carry-out is 0, `a < b` (a borrow happened); if 1, `a >= b`.
-    fn mk_ult(&mut self, a: &[Lit], b: &[Lit]) -> Lit {
+    fn mk_ult(&mut self, a: &[AigRef], b: &[AigRef]) -> AigRef {
         assert_eq!(a.len(), b.len());
-        let b_neg: Vec<Lit> = b.iter().map(|&l| !l).collect();
-        let cin = self.get_true_lit();
-        let (_sum, cout) = self.ripple_carry_add(a, &b_neg, cin);
+        let b_neg: Vec<AigRef> = b.iter().map(|&r| !r).collect();
+        let (_sum, cout) = self.ripple_carry_add(a, &b_neg, AigRef::TRUE);
         !cout
     }
 
-    /// OR-reduction: returns 1 iff all bits are zero.
-    fn mk_all_zero(&mut self, bits: &[Lit]) -> Lit {
+    /// AND-reduction: returns 1 iff all bits are zero.
+    fn mk_all_zero(&mut self, bits: &[AigRef]) -> AigRef {
         assert!(!bits.is_empty());
         let mut z = !bits[0];
         for i in 1..bits.len() {
@@ -2096,7 +2460,7 @@ impl SmtSolver {
     }
 
     /// OR-reduction: returns 1 iff any bit is set.
-    fn mk_any_set(&mut self, bits: &[Lit]) -> Lit {
+    fn mk_any_set(&mut self, bits: &[AigRef]) -> AigRef {
         assert!(!bits.is_empty());
         let mut any = bits[0];
         for i in 1..bits.len() {
@@ -2105,7 +2469,7 @@ impl SmtSolver {
         any
     }
 
-    /// If `t` is a BV constant, return its raw 64-bit value (already masked
+    /// If `t` is a BV constant, return its raw value (already masked
     /// to the term's width at construction time in `BvContext::bv_const`).
     fn const_bv_value(&self, t: BvTerm) -> Option<u128> {
         let node = self.ctx.bv_nodes[t.0 as usize];
@@ -2117,13 +2481,10 @@ impl SmtSolver {
     }
 
     /// Sparse shift-and-add multiplication with one constant operand. Runs
-    /// through only the 1-bits of `c`, which is the big win: for a common
-    /// case like `x * 3` on 64-bit BVs, we emit 2 ripple-carry adds
-    /// (popcount=2) instead of 64 — and each bit-AND gate collapses via the
-    /// mk_and short-circuits.
-    fn mk_mul_const(&mut self, a: &[Lit], c: u128, n: usize) -> Vec<Lit> {
-        let zero = !self.get_true_lit();
-        let one = self.get_true_lit();
+    /// through only the non-zero NAF digits of `c`: for a common case like
+    /// `x * 3` on 64-bit BVs, we emit 2 ripple-carry adds instead of 64 —
+    /// and each bit-AND collapses via the AIG constant folds.
+    fn mk_mul_const(&mut self, a: &[AigRef], c: u128, n: usize) -> Vec<AigRef> {
         // Canonical Signed Digit (NAF) recoding of `c`: represents the
         // constant as a sum of ±(powers of 2) with at most half as many
         // non-zero terms as the raw binary form in the worst case — long
@@ -2136,22 +2497,23 @@ impl SmtSolver {
         // bits of `c` (the caller only ever passes a u64-sized constant).
         let max_bit = n.min(64);
         let digits = naf_recode(c & mask_u128(max_bit as u32), n as u32);
-        let mut result: Vec<Lit> = vec![zero; n];
+        let mut result: Vec<AigRef> = vec![AigRef::FALSE; n];
         for (sign, pos) in digits {
             let pos = pos as usize;
             // Build `a << pos`, truncated to n bits.
-            let shifted: Vec<Lit> = (0..n)
-                .map(|j| if j < pos { zero } else { a[j - pos] })
+            let shifted: Vec<AigRef> = (0..n)
+                .map(|j| if j < pos { AigRef::FALSE } else { a[j - pos] })
                 .collect();
             if sign > 0 {
-                let (new_result, _) = self.ripple_carry_add(&result, &shifted, zero);
+                let (new_result, _) =
+                    self.ripple_carry_add(&result, &shifted, AigRef::FALSE);
                 result = new_result;
             } else {
                 // `result - shifted = result + (¬shifted) + 1`. The bit
-                // inversions are polarity flips on the literal — no gates.
-                let neg_shifted: Vec<Lit> = shifted.iter().map(|&l| !l).collect();
+                // inversions are polarity flips on the refs — no gates.
+                let neg_shifted: Vec<AigRef> = shifted.iter().map(|&r| !r).collect();
                 let (new_result, _) =
-                    self.ripple_carry_add(&result, &neg_shifted, one);
+                    self.ripple_carry_add(&result, &neg_shifted, AigRef::TRUE);
                 result = new_result;
             }
         }
@@ -2197,18 +2559,17 @@ impl SmtSolver {
     }
 
     /// Constant-amount left shift: zero new gates, just rewiring.
-    fn mk_shl_const(&mut self, a: &[Lit], amt: usize) -> Vec<Lit> {
+    fn mk_shl_const(&mut self, a: &[AigRef], amt: usize) -> Vec<AigRef> {
         let n = a.len();
-        let zero = !self.get_true_lit();
         let amt = amt.min(n); // ≥width clears the vector
         (0..n)
-            .map(|i| if i < amt { zero } else { a[i - amt] })
+            .map(|i| if i < amt { AigRef::FALSE } else { a[i - amt] })
             .collect()
     }
 
     /// Constant-amount right shift with explicit fill (zero for lshr, sign
     /// bit for ashr).
-    fn mk_shr_const(&mut self, a: &[Lit], amt: usize, fill: Lit) -> Vec<Lit> {
+    fn mk_shr_const(&mut self, a: &[AigRef], amt: usize, fill: AigRef) -> Vec<AigRef> {
         let n = a.len();
         let amt = amt.min(n);
         (0..n)
@@ -2222,29 +2583,28 @@ impl SmtSolver {
     /// Unsigned left shift with variable amount. Log-layer barrel shifter:
     /// at stage i, conditionally shift by 2^i iff bit i of the amount is set.
     /// If the amount is >= width, the result is all zeros.
-    fn mk_shl(&mut self, a: &[Lit], amt: &[Lit]) -> Vec<Lit> {
+    fn mk_shl(&mut self, a: &[AigRef], amt: &[AigRef]) -> Vec<AigRef> {
         let n = a.len();
         assert_eq!(amt.len(), n);
-        let zero = !self.get_true_lit();
         let log_n = ceil_log2(n);
 
         let mut cur = a.to_vec();
         for i in 0..log_n {
             let shift = 1usize << i;
             if shift >= n { break; }
-            let shifted: Vec<Lit> = (0..n)
-                .map(|j| if j < shift { zero } else { cur[j - shift] })
+            let shifted: Vec<AigRef> = (0..n)
+                .map(|j| if j < shift { AigRef::FALSE } else { cur[j - shift] })
                 .collect();
             cur = self.mux_vec(amt[i], &shifted, &cur);
         }
 
         // Overflow: if any of amt[log_n..n] is set the shift ≥ n, so clear.
-        self.maybe_zero_on_overflow(&cur, amt, log_n, zero)
+        self.maybe_fill_on_overflow(&cur, amt, log_n, AigRef::FALSE)
     }
 
     /// Right shift (logical or arithmetic) with variable amount. The
-    /// `fill` literal determines what streams in from the top.
-    fn mk_shr(&mut self, a: &[Lit], amt: &[Lit], fill: Lit) -> Vec<Lit> {
+    /// `fill` ref determines what streams in from the top.
+    fn mk_shr(&mut self, a: &[AigRef], amt: &[AigRef], fill: AigRef) -> Vec<AigRef> {
         let n = a.len();
         assert_eq!(amt.len(), n);
         let log_n = ceil_log2(n);
@@ -2253,7 +2613,7 @@ impl SmtSolver {
         for i in 0..log_n {
             let shift = 1usize << i;
             if shift >= n { break; }
-            let shifted: Vec<Lit> = (0..n)
+            let shifted: Vec<AigRef> = (0..n)
                 .map(|j| if j + shift < n { cur[j + shift] } else { fill })
                 .collect();
             cur = self.mux_vec(amt[i], &shifted, &cur);
@@ -2265,31 +2625,14 @@ impl SmtSolver {
     }
 
     /// After the main barrel stages, if any high bit of `amt` is set the
-    /// requested shift was >= width — zero out the result in that case.
-    fn maybe_zero_on_overflow(
-        &mut self,
-        cur: &[Lit],
-        amt: &[Lit],
-        log_n: usize,
-        zero: Lit,
-    ) -> Vec<Lit> {
-        if log_n >= amt.len() {
-            return cur.to_vec();
-        }
-        let high = &amt[log_n..];
-        let any_high = self.mk_any_set(high);
-        cur.iter()
-            .map(|&bit| self.mk_mux(any_high, zero, bit))
-            .collect()
-    }
-
+    /// requested shift was >= width — replace the result with `fill`.
     fn maybe_fill_on_overflow(
         &mut self,
-        cur: &[Lit],
-        amt: &[Lit],
+        cur: &[AigRef],
+        amt: &[AigRef],
         log_n: usize,
-        fill: Lit,
-    ) -> Vec<Lit> {
+        fill: AigRef,
+    ) -> Vec<AigRef> {
         if log_n >= amt.len() {
             return cur.to_vec();
         }
@@ -2314,29 +2657,31 @@ impl SmtSolver {
     ///      through unchanged.
     ///   3. After log_{3/2}(N/2) rounds every column has at most 2 bits —
     ///      do a single ripple-carry add for the final result.
-    fn mk_mul(&mut self, a: &[Lit], b: &[Lit]) -> Vec<Lit> {
+    fn mk_mul(&mut self, a: &[AigRef], b: &[AigRef]) -> Vec<AigRef> {
         let n = a.len();
         assert_eq!(b.len(), n);
-        let zero = !self.get_true_lit();
 
         // Step 1: partial products collected by output column. Skip any
-        // product whose operand is the false literal — these are the bits
+        // product whose operand is constant-false — these are the bits
         // that zero-extensions, masked-away positions, and bits-known folds
-        // reduce to at bitblast time. Pushing the false lit would correctly
+        // reduce to at bitblast time. Pushing FALSE would correctly
         // short-circuit through `mk_and` but needlessly inflates column
         // lengths, causing extra 3:2 compressions in the Wallace reduction
         // below. Skipping at source keeps columns as tight as they can be.
-        let mut columns: Vec<Vec<Lit>> = (0..n).map(|_| Vec::new()).collect();
+        let mut columns: Vec<Vec<AigRef>> = (0..n).map(|_| Vec::new()).collect();
         for i in 0..n {
-            if b[i] == zero {
+            if b[i] == AigRef::FALSE {
                 continue; // entire "row" shifted by i contributes nothing
             }
             for j in i..n {
                 let ajm = a[j - i];
-                if ajm == zero {
+                if ajm == AigRef::FALSE {
                     continue; // this single partial product is zero
                 }
-                columns[j].push(self.mk_and(ajm, b[i]));
+                let pp = self.mk_and(ajm, b[i]);
+                if pp != AigRef::FALSE {
+                    columns[j].push(pp);
+                }
             }
         }
 
@@ -2346,7 +2691,7 @@ impl SmtSolver {
             if max_len <= 2 {
                 break;
             }
-            let mut next: Vec<Vec<Lit>> = (0..n).map(|_| Vec::new()).collect();
+            let mut next: Vec<Vec<AigRef>> = (0..n).map(|_| Vec::new()).collect();
             for k in 0..n {
                 let col = std::mem::take(&mut columns[k]);
                 let mut i = 0;
@@ -2368,16 +2713,15 @@ impl SmtSolver {
         }
 
         // Step 3: final ripple-carry add of the (≤ 2) remaining rows.
-        let row0: Vec<Lit> = columns
+        let row0: Vec<AigRef> = columns
             .iter()
-            .map(|c| if c.is_empty() { zero } else { c[0] })
+            .map(|c| if c.is_empty() { AigRef::FALSE } else { c[0] })
             .collect();
-        let row1: Vec<Lit> = columns
+        let row1: Vec<AigRef> = columns
             .iter()
-            .map(|c| if c.len() < 2 { zero } else { c[1] })
+            .map(|c| if c.len() < 2 { AigRef::FALSE } else { c[1] })
             .collect();
-        let cin = zero;
-        self.ripple_carry_add(&row0, &row1, cin).0
+        self.ripple_carry_add(&row0, &row1, AigRef::FALSE).0
     }
 
     /// Unsigned division + remainder via non-restoring division. Returns
@@ -2391,26 +2735,25 @@ impl SmtSolver {
     /// the sign keeps the shifted remainder `2*prev_r` from overflowing
     /// when `|prev_r|` approaches `|b|` near `2^N`. Division-by-zero is
     /// handled in the callers.
-    fn mk_udivmod(&mut self, a: &[Lit], b: &[Lit]) -> (Vec<Lit>, Vec<Lit>) {
+    fn mk_udivmod(&mut self, a: &[AigRef], b: &[AigRef]) -> (Vec<AigRef>, Vec<AigRef>) {
         let n = a.len();
         assert_eq!(b.len(), n);
-        let zero = !self.get_true_lit();
 
         // N+2 bits: one sign bit plus one slack bit for the `2 * r` step.
         let ext = n + 2;
-        let mut r: Vec<Lit> = vec![zero; ext];
-        let mut b_ext: Vec<Lit> = b.to_vec();
-        b_ext.push(zero); // sign bit = 0 (b is always non-negative)
-        b_ext.push(zero); // slack bit
+        let mut r: Vec<AigRef> = vec![AigRef::FALSE; ext];
+        let mut b_ext: Vec<AigRef> = b.to_vec();
+        b_ext.push(AigRef::FALSE); // sign bit = 0 (b is always non-negative)
+        b_ext.push(AigRef::FALSE); // slack bit
 
-        let mut q: Vec<Lit> = vec![zero; n];
+        let mut q: Vec<AigRef> = vec![AigRef::FALSE; n];
 
         for i in (0..n).rev() {
             // r := (r << 1) | a[i]  — shift up by one, introduce next
             // bit of the dividend at the LSB. Width stays N+2 (top bit
             // falls off, but since we picked ext = n + 2, the worst-case
             // |2*r| ≤ 2*b < 2^(n+1) still fits as signed).
-            let mut shifted = vec![zero; ext];
+            let mut shifted = vec![AigRef::FALSE; ext];
             shifted[0] = a[i];
             for j in 1..ext {
                 shifted[j] = r[j - 1];
@@ -2422,7 +2765,7 @@ impl SmtSolver {
             // encodes the choice without any mux.
             let sign = r[ext - 1];
             let not_sign = !sign;
-            let effective_b: Vec<Lit> =
+            let effective_b: Vec<AigRef> =
                 b_ext.iter().map(|&bb| self.mk_xor(bb, not_sign)).collect();
             let (new_r, _cout) = self.ripple_carry_add(&r, &effective_b, not_sign);
             r = new_r;
@@ -2433,8 +2776,7 @@ impl SmtSolver {
 
         // Final restoration: if r went negative, add b back once.
         let final_sign = r[ext - 1];
-        let cin = zero;
-        let (restored, _cout) = self.ripple_carry_add(&r, &b_ext, cin);
+        let (restored, _cout) = self.ripple_carry_add(&r, &b_ext, AigRef::FALSE);
         let r_final = self.mux_vec(final_sign, &restored, &r);
 
         // Truncate remainder back to N bits (high bits are zero after
@@ -2444,41 +2786,26 @@ impl SmtSolver {
 
     /// High N bits of the unsigned 2N-bit product of two N-bit operands.
     /// Used by unsigned-multiplication overflow detection.
-    fn mk_umul_hi(&mut self, a: &[Lit], b: &[Lit]) -> Vec<Lit> {
+    fn mk_umul_hi(&mut self, a: &[AigRef], b: &[AigRef]) -> Vec<AigRef> {
         let n = a.len();
         assert_eq!(b.len(), n);
-        let zero = !self.get_true_lit();
         let double_n = 2 * n;
 
-        // Zero-extend both operands to 2N bits and run the same shift-and-add
-        // we use for regular multiplication. Keep the top N bits.
+        // Zero-extend both operands to 2N bits and multiply via the same
+        // Wallace tree used for regular multiplication. Keep the top N bits.
         let mut a_ext = a.to_vec();
-        a_ext.resize(double_n, zero);
+        a_ext.resize(double_n, AigRef::FALSE);
         let mut b_ext = b.to_vec();
-        b_ext.resize(double_n, zero);
+        b_ext.resize(double_n, AigRef::FALSE);
 
-        let mut result: Vec<Lit> = vec![zero; double_n];
-        for i in 0..double_n {
-            let partial: Vec<Lit> = (0..double_n)
-                .map(|j| {
-                    if j < i {
-                        zero
-                    } else {
-                        self.mk_and(a_ext[j - i], b_ext[i])
-                    }
-                })
-                .collect();
-            let cin = zero;
-            let (new_result, _) = self.ripple_carry_add(&result, &partial, cin);
-            result = new_result;
-        }
-        result[n..].to_vec()
+        let prod = self.mk_mul(&a_ext, &b_ext);
+        prod[n..].to_vec()
     }
 
     /// Full 2N-bit signed product: (low N bits, high N bits). Sign-extends
     /// both operands to 2N bits then multiplies. Used by signed-multiplication
     /// overflow detection.
-    fn mk_smul_full(&mut self, a: &[Lit], b: &[Lit]) -> (Vec<Lit>, Vec<Lit>) {
+    fn mk_smul_full(&mut self, a: &[AigRef], b: &[AigRef]) -> (Vec<AigRef>, Vec<AigRef>) {
         let n = a.len();
         assert_eq!(b.len(), n);
         let double_n = 2 * n;
@@ -2497,15 +2824,14 @@ impl SmtSolver {
     }
 
     /// Two's-complement negation: `-x = ~x + 1`.
-    fn mk_neg(&mut self, x: &[Lit]) -> Vec<Lit> {
-        let neg: Vec<Lit> = x.iter().map(|&l| !l).collect();
-        let zero: Vec<Lit> = vec![!self.get_true_lit(); x.len()];
-        let cin = self.get_true_lit();
-        self.ripple_carry_add(&zero, &neg, cin).0
+    fn mk_neg(&mut self, x: &[AigRef]) -> Vec<AigRef> {
+        let neg: Vec<AigRef> = x.iter().map(|&r| !r).collect();
+        let zero: Vec<AigRef> = vec![AigRef::FALSE; x.len()];
+        self.ripple_carry_add(&zero, &neg, AigRef::TRUE).0
     }
 
     /// Absolute value of a signed BV: returns `-x` if x's MSB is set, else x.
-    fn mk_abs(&mut self, x: &[Lit]) -> Vec<Lit> {
+    fn mk_abs(&mut self, x: &[AigRef]) -> Vec<AigRef> {
         let sign = *x.last().unwrap();
         let neg = self.mk_neg(x);
         self.mux_vec(sign, &neg, x)
@@ -2515,7 +2841,7 @@ impl SmtSolver {
     /// does an unsigned divide, then flips the sign of the result when
     /// exactly one operand was negative. Division-by-zero follows from the
     /// underlying udiv-by-zero (all-ones) case-split.
-    fn mk_sdiv(&mut self, a: &[Lit], b: &[Lit]) -> Vec<Lit> {
+    fn mk_sdiv(&mut self, a: &[AigRef], b: &[AigRef]) -> Vec<AigRef> {
         let n = a.len();
         let a_sign = a[n - 1];
         let b_sign = b[n - 1];
@@ -2531,11 +2857,10 @@ impl SmtSolver {
 
         // Divide-by-zero: sdiv(x, 0) = 1 if x signed-negative, else ~0.
         let b_zero = self.mk_all_zero(b);
-        let tl = self.get_true_lit();
-        let all_ones = vec![tl; n];
+        let all_ones = vec![AigRef::TRUE; n];
         // Constant 1 of width n.
-        let mut one = vec![!tl; n];
-        one[0] = tl;
+        let mut one = vec![AigRef::FALSE; n];
+        one[0] = AigRef::TRUE;
         let dz = self.mux_vec(a_sign, &one, &all_ones);
 
         self.mux_vec(b_zero, &dz, &q)
@@ -2543,7 +2868,7 @@ impl SmtSolver {
 
     /// Signed remainder — sign of result follows the dividend.
     /// Division-by-zero: srem(x, 0) = x (following SMT-LIB).
-    fn mk_srem(&mut self, a: &[Lit], b: &[Lit]) -> Vec<Lit> {
+    fn mk_srem(&mut self, a: &[AigRef], b: &[AigRef]) -> Vec<AigRef> {
         let n = a.len();
         let a_sign = a[n - 1];
 
@@ -2562,7 +2887,7 @@ impl SmtSolver {
     /// Definition: `smod(a, b) = ite(r == 0, 0, ite(sign(a) == sign(b), r, r + b))`
     /// where `r = srem(a, b)` (before the sign adjustment).
     /// Division-by-zero: smod(x, 0) = x.
-    fn mk_smod(&mut self, a: &[Lit], b: &[Lit]) -> Vec<Lit> {
+    fn mk_smod(&mut self, a: &[AigRef], b: &[AigRef]) -> Vec<AigRef> {
         let n = a.len();
         let a_sign = a[n - 1];
         let b_sign = b[n - 1];
@@ -2580,15 +2905,12 @@ impl SmtSolver {
 
         // When sign(a) != sign(b), add b to push the result into the
         // divisor's sign half-plane.
-        let r_plus_b = {
-            let cin = !self.get_true_lit();
-            self.ripple_carry_add(&r_srem, b, cin).0
-        };
+        let r_plus_b = self.ripple_carry_add(&r_srem, b, AigRef::FALSE).0;
         let sign_diff = self.mk_xor(a_sign, b_sign);
         let adjusted = self.mux_vec(sign_diff, &r_plus_b, &r_srem);
 
         // If the raw remainder was zero, the answer is zero.
-        let zero = vec![!self.get_true_lit(); n];
+        let zero = vec![AigRef::FALSE; n];
         let with_zero = self.mux_vec(r_is_zero, &zero, &adjusted);
 
         let b_zero = self.mk_all_zero(b);
@@ -2603,7 +2925,7 @@ impl Default for SmtSolver {
 }
 
 /// Flip the sign bit (MSB) of a bitblasted BV — used for signed comparisons.
-fn flip_msb(bits: &[Lit]) -> Vec<Lit> {
+fn flip_msb(bits: &[AigRef]) -> Vec<AigRef> {
     let mut r = bits.to_vec();
     let last = r.len() - 1;
     r[last] = !r[last];

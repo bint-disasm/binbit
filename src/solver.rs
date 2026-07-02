@@ -327,6 +327,12 @@ pub struct Solver {
     // === Warm — touched during analyze() and branch picking. ===
     activity: Vec<f64>,
     polarity: Vec<bool>, // phase saving
+    // Branching eligibility. Variables whose clauses were all removed by
+    // CNF preprocessing (eliminated gate outputs) are flagged off so model
+    // completion doesn't waste a decision per dead variable on every
+    // restart. A non-decision var is never picked by pick_branch_lit and
+    // never re-enters the order heap on backtrack.
+    decision: Vec<bool>,
     order_heap: OrderHeap,
     seen: Vec<bool>,
     lbd_stamp: Vec<u64>,
@@ -401,6 +407,7 @@ impl Solver {
             watches: Vec::new(),
             activity: Vec::new(),
             polarity: Vec::new(),
+            decision: Vec::new(),
             order_heap: OrderHeap::new(),
             seen: Vec::new(),
             lbd_stamp: Vec::new(),
@@ -448,6 +455,7 @@ impl Solver {
         self.reason.reserve(num_vars);
         self.activity.reserve(num_vars);
         self.polarity.reserve(num_vars);
+        self.decision.reserve(num_vars);
         self.seen.reserve(num_vars);
         self.lbd_stamp.reserve(num_vars);
         self.order_heap.reserve(num_vars);
@@ -480,6 +488,7 @@ impl Solver {
         self.reason.push(Reason::Decision);
         self.activity.push(0.0);
         self.polarity.push(false);
+        self.decision.push(true);
         self.seen.push(false);
         self.lbd_stamp.push(0);
         // One unified watch list per literal — two per variable. Prime each
@@ -511,6 +520,24 @@ impl Solver {
         // both `lit` and `!lit` are direct loads. Maintained in lockstep
         // with `assigns` at every assign / unassign site.
         self.lit_value[l.0 as usize]
+    }
+
+    /// Value of `l` only if it is a root-level (level 0) fact — i.e. a
+    /// consequence of the clause set itself, valid in every model. Returns
+    /// `Undef` for unassigned literals AND for literals only assigned by
+    /// the current (possibly stale) search trail above level 0. Safe to
+    /// call between solves without cancelling the trail.
+    #[inline]
+    pub fn value_fixed(&self, l: Lit) -> LBool {
+        let v = self.lit_value[l.0 as usize];
+        if v == LBool::Undef {
+            return LBool::Undef;
+        }
+        if self.level[l.var_idx()] == 0 {
+            v
+        } else {
+            LBool::Undef
+        }
     }
 
     #[inline]
@@ -1205,7 +1232,9 @@ impl Solver {
             self.lit_value[pos | 1] = LBool::Undef;
             self.level[vi] = -1;
             self.reason[vi] = Reason::Decision;
-            self.order_heap.insert(lit.var().0, &self.activity);
+            if self.decision[vi] {
+                self.order_heap.insert(lit.var().0, &self.activity);
+            }
         }
         self.trail.truncate(target);
         self.trail_lim.truncate(level as usize);
@@ -1228,6 +1257,19 @@ impl Solver {
     /// variables they know are structurally important, like ITE selectors.
     pub fn boost_var_activity(&mut self, v: Var) {
         self.bump_var_activity(v);
+    }
+
+    /// Include / exclude a variable from branching. Intended for variables
+    /// whose every clause was resolved away by CNF preprocessing — they can
+    /// never be forced and don't need a value for any consumer, so deciding
+    /// them is pure waste. Turning a var back on re-inserts it into the
+    /// order heap.
+    pub fn set_decision_var(&mut self, v: Var, on: bool) {
+        let vi = v.idx();
+        self.decision[vi] = on;
+        if on && self.value_of_var(v) == LBool::Undef {
+            self.order_heap.insert(v.0, &self.activity);
+        }
     }
 
     /// Rescales every variable activity to keep them out of the floating-point
@@ -1334,7 +1376,9 @@ impl Solver {
 
     fn pick_branch_lit(&mut self) -> Option<Lit> {
         while let Some(v) = self.order_heap.pop(&self.activity) {
-            if self.lit_value[(v as usize) << 1] == LBool::Undef {
+            if self.decision[v as usize]
+                && self.lit_value[(v as usize) << 1] == LBool::Undef
+            {
                 let lit = Lit::new(Var(v), !self.polarity[v as usize]);
                 return Some(lit);
             }

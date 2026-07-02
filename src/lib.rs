@@ -1,7 +1,9 @@
+pub mod aig;
 pub mod bv;
 pub mod clause;
 pub mod dimacs;
 pub mod lit;
+pub mod preprocess;
 pub mod smt;
 pub mod smtlib;
 pub mod solver;

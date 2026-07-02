@@ -33,6 +33,22 @@ fn solve_one(input: &str) -> Result<(SolveResult, Solver), String> {
 }
 
 fn main() {
+    // Term construction, bitblasting and the SMT-LIB parser all recurse on
+    // expression depth, and real symbex traces contain single assertions
+    // with 10⁵+ nested ops — enough to blow the default 8MB main stack.
+    // Run the actual work on a thread with a large reservation (virtual
+    // memory only; pages are committed on touch).
+    let child = std::thread::Builder::new()
+        .stack_size(1 << 30) // 1 GiB reserve
+        .spawn(real_main)
+        .expect("failed to spawn main thread");
+    let code = child.join().unwrap_or(2);
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+fn real_main() -> i32 {
     let args: Vec<String> = std::env::args().collect();
 
     // --smt <file.smt2> : run an SMT-LIB 2 script through the BV solver.
@@ -85,6 +101,8 @@ fn main() {
                     eprintln!("c bool_aliased: {}", s.bool_aliased);
                     eprintln!("c bv_nodes    : {}", s.bv_nodes_total);
                     eprintln!("c bv_blasted  : {}", s.bv_vars_bitblasted);
+                    eprintln!("c pp_elim     : {}", s.pp_eliminated);
+                    eprintln!("c pp_subsumed : {}", s.pp_subsumed);
                 }
             }
             Err(e) => {
@@ -92,7 +110,7 @@ fn main() {
                 std::process::exit(2);
             }
         }
-        return;
+        return 0;
     }
 
     // --batch <dir-or-files...> : solve many instances in one process, print
@@ -143,7 +161,7 @@ fn main() {
             "c mean per-instance  : {:.3}ms",
             elapsed.as_secs_f64() * 1000.0 / files.len().max(1) as f64
         );
-        return;
+        return 0;
     }
 
     // Single-instance mode: read from a file if given, otherwise stdin.
@@ -202,4 +220,5 @@ fn main() {
     eprintln!("c reductions  : {}", solver.stats_reductions);
     eprintln!("c min removed : {}", solver.stats_min_removed);
     eprintln!("c cpu time    : {:.3}s", elapsed.as_secs_f64());
+    0
 }
