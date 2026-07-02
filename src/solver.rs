@@ -679,6 +679,20 @@ impl Solver {
         let qhead_start = *qhead;
         let mut conflict: Option<PropConflict> = None;
 
+        // Hoist the fixed-size per-variable tables from `Vec` to slices ONCE.
+        // Inside the loop these are indexed several times per watcher visit;
+        // because `Vec` has no inherent `get_unchecked`, `lit_value.
+        // get_unchecked(i)` first calls `<Vec as Deref>::deref` to produce a
+        // `&[LBool]` and *then* indexes — so the deref runs on every access.
+        // Converting up front makes the inner accesses direct slice indexing
+        // with the base pointer held in a register. Safe because none of
+        // these are resized during propagate: `new_var` (the only thing that
+        // grows them) is never called mid-solve, and `cancel_until` only
+        // truncates `trail` / `trail_lim`, not the per-variable tables.
+        let lit_value: &mut [LBool] = lit_value.as_mut_slice();
+        let level: &mut [i32] = level.as_mut_slice();
+        let reason: &mut [Reason] = reason.as_mut_slice();
+
         'queue: while *qhead < trail.len() {
             // SAFETY: the loop guard just established `*qhead < trail.len()`.
             let p = unsafe { *trail.get_unchecked(*qhead) };
