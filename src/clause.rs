@@ -97,14 +97,30 @@ impl ClauseArena {
         self.data[h + 3] = (bits >> 32) as u32;
     }
 
+    // The next four accessors are on the unit-propagation hot path (called
+    // per clause visit) and use `get_unchecked`: a live `ClauseRef` always
+    // has its header + `len` body words in bounds by construction (see
+    // `alloc`), and callers pass `i < len`. Safe indexing here compiled to
+    // an `Index → Deref → &[u32] → bounds-check` sequence that showed up as
+    // `<Vec as Deref>::deref` in propagate profiles; dropping the bounds
+    // check also lets the compiler keep `data`'s base pointer in a register
+    // across the loop. Pure plumbing — identical behaviour, no propagation-
+    // order change. `debug_assert`s keep the invariant checked in dev/test.
+
     #[inline]
     pub fn len(&self, c: ClauseRef) -> usize {
-        self.data[c.0 as usize + 4] as usize
+        let idx = c.0 as usize + 4;
+        debug_assert!(idx < self.data.len(), "clause len read out of bounds");
+        // SAFETY: a live clause header occupies words [c.0 .. c.0 + HDR).
+        unsafe { *self.data.get_unchecked(idx) as usize }
     }
 
     #[inline]
     pub fn get_lit(&self, c: ClauseRef, i: usize) -> Lit {
-        Lit(self.data[c.0 as usize + HDR + i])
+        let idx = c.0 as usize + HDR + i;
+        debug_assert!(idx < self.data.len(), "clause lit read out of bounds");
+        // SAFETY: i < len ⇒ header + i is within the clause body.
+        Lit(unsafe { *self.data.get_unchecked(idx) })
     }
 
     /// Borrow the clause's literals as a slice. Zero-copy — the underlying
@@ -112,10 +128,14 @@ impl ClauseArena {
     #[inline]
     pub fn lits(&self, c: ClauseRef) -> &[Lit] {
         let h = c.0 as usize;
-        let len = self.data[h + 4] as usize;
+        debug_assert!(h + 4 < self.data.len(), "clause header out of bounds");
+        // SAFETY: header word `h+4` is in bounds for any live clause.
+        let len = unsafe { *self.data.get_unchecked(h + 4) as usize };
         let start = h + HDR;
+        debug_assert!(start + len <= self.data.len(), "clause body out of bounds");
         // SAFETY: Lit is #[repr(transparent)] around u32, so a &[u32] can be
-        // reinterpreted as &[Lit] with identical layout and alignment.
+        // reinterpreted as &[Lit] with identical layout and alignment; the
+        // body words [start .. start+len) are in bounds by construction.
         unsafe {
             std::slice::from_raw_parts(self.data.as_ptr().add(start) as *const Lit, len)
         }
@@ -124,7 +144,13 @@ impl ClauseArena {
     #[inline]
     pub fn swap_lits(&mut self, c: ClauseRef, a: usize, b: usize) {
         let base = c.0 as usize + HDR;
-        self.data.swap(base + a, base + b);
+        let (ia, ib) = (base + a, base + b);
+        debug_assert!(ia < self.data.len() && ib < self.data.len(), "swap out of bounds");
+        // SAFETY: both a and b are < len, so ia/ib are within the clause body.
+        unsafe {
+            let p = self.data.as_mut_ptr();
+            std::ptr::swap(p.add(ia), p.add(ib));
+        }
     }
 
     /// Walk every non-deleted clause and pass its literals (as a slice) to
