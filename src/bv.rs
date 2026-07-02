@@ -2872,6 +2872,38 @@ pub fn power_of_two_exp(v: u128) -> Option<u32> {
     }
 }
 
+/// Modular inverse of an odd constant `a` in the ring Z/2^w, for w ≤ 128.
+/// Returns `Some(a^{-1} mod 2^w)` such that `a · a^{-1} ≡ 1 (mod 2^w)`, or
+/// `None` when `a` is even (even elements are zero divisors mod 2^w and
+/// have no inverse).
+///
+/// Uses Hensel lifting / Newton iteration: for odd `a`, `x_{k+1} = x_k·(2 −
+/// a·x_k)` doubles the number of correct low bits each step, starting from
+/// the fact that any odd `a` is its own inverse mod 8. Seven iterations
+/// cover all 128 bits (1 → 2 → 4 → … → 128 correct bits).
+///
+/// Used by term-level Gaussian elimination to pivot on odd coefficients
+/// when solving linear equation systems over bitvectors.
+#[inline]
+pub fn mod_inverse_pow2(a: u128, w: u32) -> Option<u128> {
+    let m = mask(w);
+    let a = a & m;
+    if a & 1 == 0 {
+        return None; // even ⇒ not a unit mod 2^w
+    }
+    // Newton iteration. Seed correct to 3 bits (odd ⇒ a ≡ a^{-1} mod 8).
+    let mut x = a; // a·a ≡ 1 mod 8, so a is its own inverse to 3 bits
+    // Each step doubles precision: 3 → 6 → 12 → 24 → 48 → 96 → 128+.
+    for _ in 0..7 {
+        // x = x * (2 - a*x), all mod 2^w.
+        let ax = a.wrapping_mul(x) & m;
+        let two_minus = 2u128.wrapping_sub(ax) & m;
+        x = x.wrapping_mul(two_minus) & m;
+    }
+    debug_assert_eq!(a.wrapping_mul(x) & m, 1 & m);
+    Some(x)
+}
+
 /// Granlund-Montgomery magic constants for unsigned division by a constant.
 ///
 /// Given divisor `d` (must be > 1 and not a power of two) and bitwidth `w`
@@ -2928,5 +2960,42 @@ pub fn sign_extend_to_i128(value: u128, width: u32) -> i128 {
         (v | !m) as i128
     } else {
         v as i128
+    }
+}
+
+#[cfg(test)]
+mod inverse_tests {
+    use super::{mask, mod_inverse_pow2};
+
+    #[test]
+    fn odd_constants_have_inverses_across_widths() {
+        for &w in &[1u32, 4, 8, 16, 32, 64, 100, 128] {
+            let m = mask(w);
+            for &a in &[1u128, 3, 5, 7, 9, 127, 255, 12345, u128::MAX] {
+                let a = a & m;
+                if a & 1 == 0 {
+                    continue;
+                }
+                let inv = mod_inverse_pow2(a, w).expect("odd ⇒ invertible");
+                assert_eq!(a.wrapping_mul(inv) & m, 1 & m, "w={} a={}", w, a);
+            }
+        }
+    }
+
+    #[test]
+    fn even_constants_have_no_inverse() {
+        for &w in &[8u32, 16, 32, 64] {
+            for &a in &[0u128, 2, 4, 6, 256, 1024] {
+                assert_eq!(mod_inverse_pow2(a, w), None, "w={} a={}", w, a);
+            }
+        }
+    }
+
+    #[test]
+    fn known_inverse_values() {
+        // 3^{-1} mod 256 = 171 (3·171 = 513 = 2·256+1).
+        assert_eq!(mod_inverse_pow2(3, 8), Some(171));
+        // 5^{-1} mod 256 = 205 (5·205 = 1025 = 4·256+1).
+        assert_eq!(mod_inverse_pow2(5, 8), Some(205));
     }
 }

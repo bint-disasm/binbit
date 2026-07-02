@@ -1109,6 +1109,374 @@ impl SmtSolver {
         false
     }
 
+    /// Gaussian elimination over Z/2^w on the batch's top-level linear
+    /// equalities. Solves coupled systems that single-variable substitution
+    /// can't — `x + y = a, x - y = b` has no side in `x = t` form, but the
+    /// system determines both `x` and `y`.
+    ///
+    /// Each eligible `(= lhs rhs)` becomes a row `Σ cᵢ·varᵢ = k (mod 2^w)`;
+    /// rows are grouped by width (a bvadd chain is single-width, and a
+    /// variable has one width, so widths never mix within a row). Forward
+    /// elimination pivots only on *odd* coefficients — odd constants are the
+    /// units of Z/2^w and the only ones with a modular inverse; a variable
+    /// appearing solely with even coefficients can't be cleanly solved and
+    /// its row is left for the SAT core.
+    ///
+    /// Solved variables are installed into `bv_var_subst` (so model reads
+    /// stay consistent) and their defining equality is dropped from the
+    /// batch. A row that reduces to `0 = nonzero` proves the whole formula
+    /// UNSAT. Only runs at scope depth 0 (like substitution) — a popped
+    /// scope must not leave permanent solutions behind.
+    ///
+    /// Returns `true` if an inconsistent row was found (caller emits the
+    /// empty clause).
+    fn gaussian_eliminate(&mut self, batch: &mut [(usize, Vec<BoolTerm>)]) -> bool {
+        // Cap the system size — real linear cores here are tiny (tens of
+        // rows); this only guards against a pathological blow-up.
+        const MAX_ROWS: usize = 4096;
+
+        struct Row {
+            coeffs: std::collections::BTreeMap<BvTerm, u128>,
+            rhs: u128,
+            src: BoolTerm,
+            w: u32,
+        }
+
+        // Collect candidate rows from depth-0 equality roots.
+        let mut rows: Vec<Row> = Vec::new();
+        for (depth, ts) in batch.iter() {
+            if *depth != 0 {
+                continue;
+            }
+            for &t in ts {
+                if rows.len() >= MAX_ROWS {
+                    break;
+                }
+                let BoolOp::Eq(a, b) = self.ctx.bool_op(t) else { continue };
+                let w = self.ctx.width_of(a);
+                if w > 128 {
+                    continue;
+                }
+                let mut coeffs = std::collections::BTreeMap::new();
+                let mut konst = 0u128;
+                // lhs − rhs: move both sides into one coefficient map.
+                if !self.flatten_linear(a, 1, w, &mut coeffs, &mut konst) {
+                    continue;
+                }
+                let neg1 = mask(w); // −1 mod 2^w
+                if !self.flatten_linear(b, neg1, w, &mut coeffs, &mut konst) {
+                    continue;
+                }
+                // Row is `Σ coeff·atom = −konst` (everything moved left, so
+                // the constant flips to the RHS).
+                let m = mask(w);
+                coeffs.retain(|_, c| {
+                    *c &= m;
+                    *c != 0
+                });
+                let rhs = 0u128.wrapping_sub(konst) & m;
+                // A row with a lone solvable variable is already handled by
+                // plain substitution; only keep rows worth GE (≥1 solvable
+                // var, and either coupled or with a non-unit-ready form).
+                if coeffs.is_empty() {
+                    // 0 = rhs: redundant (rhs==0) or inconsistent.
+                    if rhs != 0 {
+                        return true; // UNSAT
+                    }
+                    continue;
+                }
+                rows.push(Row { coeffs, rhs, src: t, w });
+            }
+        }
+        if rows.is_empty() {
+            return false;
+        }
+
+        // Group row indices by width.
+        let mut by_width: HashMap<u32, Vec<usize>> = HashMap::default();
+        for (i, r) in rows.iter().enumerate() {
+            by_width.entry(r.w).or_default().push(i);
+        }
+
+        let mut consumed: std::collections::HashSet<BoolTerm> =
+            std::collections::HashSet::new();
+        let mut solved: Vec<(u32, BvTerm, u128, std::collections::BTreeMap<BvTerm, u128>)> =
+            Vec::new(); // (root_id, pivot_var_term, rhs, other coeffs) — normalized so pivot coeff = 1
+
+        for (w, idxs) in by_width.iter() {
+            let w = *w;
+            let m = mask(w);
+            // Working copies (owned) of this group's rows.
+            let mut group: Vec<(std::collections::BTreeMap<BvTerm, u128>, u128, BoolTerm)> =
+                idxs.iter()
+                    .map(|&i| (rows[i].coeffs.clone(), rows[i].rhs, rows[i].src))
+                    .collect();
+
+            let mut pivot_rows: Vec<usize> = Vec::new(); // indices into `group`
+            let mut used_pivot_var: std::collections::HashSet<BvTerm> =
+                std::collections::HashSet::new();
+
+            for i in 0..group.len() {
+                // Find a solvable pivot variable with an odd coefficient in row i.
+                let pivot = {
+                    let (coeffs, _, _) = &group[i];
+                    let mut found: Option<(BvTerm, u128)> = None;
+                    for (&atom, &c) in coeffs.iter() {
+                        if c & 1 == 1
+                            && !used_pivot_var.contains(&atom)
+                            && self.is_solvable_var(atom)
+                        {
+                            found = Some((atom, c));
+                            break;
+                        }
+                    }
+                    found
+                };
+                let Some((pvar, pc)) = pivot else { continue };
+                let inv = match crate::bv::mod_inverse_pow2(pc, w) {
+                    Some(v) => v,
+                    None => continue, // even — unreachable (odd checked), defensive
+                };
+                // Normalize row i so the pivot coefficient becomes 1.
+                {
+                    let (coeffs, rhs, _) = &mut group[i];
+                    for c in coeffs.values_mut() {
+                        *c = c.wrapping_mul(inv) & m;
+                    }
+                    *rhs = rhs.wrapping_mul(inv) & m;
+                }
+                used_pivot_var.insert(pvar);
+                pivot_rows.push(i);
+
+                // Eliminate `pvar` from every other row in the group.
+                let (pcoeffs, prhs) = {
+                    let (c, r, _) = &group[i];
+                    (c.clone(), *r)
+                };
+                for j in 0..group.len() {
+                    if j == i {
+                        continue;
+                    }
+                    let factor = group[j].0.get(&pvar).copied().unwrap_or(0) & m;
+                    if factor == 0 {
+                        continue;
+                    }
+                    let (cj, rj, _) = &mut group[j];
+                    for (&atom, &pc2) in pcoeffs.iter() {
+                        let sub = factor.wrapping_mul(pc2) & m;
+                        let e = cj.entry(atom).or_insert(0);
+                        *e = e.wrapping_sub(sub) & m;
+                    }
+                    cj.retain(|_, c| *c != 0);
+                    *rj = rj.wrapping_sub(factor.wrapping_mul(prhs)) & m;
+                }
+            }
+
+            // Read out results.
+            for (i, (coeffs, rhs, src)) in group.iter().enumerate() {
+                if pivot_rows.contains(&i) {
+                    // Pivot row: pivot var (coeff 1) = rhs − Σ others.
+                    // Find the pivot var (the one solvable var with coeff 1
+                    // that's in used set for this row — it's the atom we
+                    // normalized). Recover it as the solvable var with
+                    // coeff 1; there is exactly one we pivoted on.
+                    let pvar = coeffs
+                        .iter()
+                        .find(|&(atom, &c)| c == 1 && used_pivot_var.contains(atom))
+                        .map(|(&a, _)| a);
+                    let Some(pvar) = pvar else { continue };
+                    let mut others = coeffs.clone();
+                    others.remove(&pvar);
+                    let BvOp::Var(id) = self.ctx.bv_op(pvar) else { continue };
+                    let root = self.find_bv_var_root(id);
+                    solved.push((root, pvar, *rhs, others));
+                    consumed.insert(*src);
+                } else if coeffs.is_empty() {
+                    if *rhs != 0 {
+                        return true; // 0 = nonzero ⇒ UNSAT
+                    }
+                    consumed.insert(*src); // 0 = 0 ⇒ redundant, drop
+                }
+            }
+        }
+
+        // Install solved variables, guarding against cycles. Build the RHS
+        // expression `rhs − Σ cᵢ·atomᵢ` with the term builders.
+        for (root, _pvar, rhs, others) in solved {
+            if self.bv_var_refs.contains_key(&root) || self.bv_var_subst.contains_key(&root) {
+                continue;
+            }
+            let w = self.ctx.bv_var_widths[root as usize];
+            let expr = self.build_linear_expr(rhs, &others, w);
+            if self.subst_occurs(root, expr) {
+                continue; // would form a cycle — leave the equation to SAT
+            }
+            self.bv_var_subst.insert(root, expr);
+            self.pp_substituted += 1;
+        }
+
+        // Drop consumed equalities from the batch.
+        if !consumed.is_empty() {
+            for (depth, ts) in batch.iter_mut() {
+                if *depth == 0 {
+                    ts.retain(|t| !consumed.contains(t));
+                }
+            }
+        }
+        false
+    }
+
+    /// Is `t` a bare variable that can still be solved for — i.e. not yet
+    /// bitblasted (nothing outside the batch references its bits) and not
+    /// already substituted?
+    fn is_solvable_var(&mut self, t: BvTerm) -> bool {
+        let BvOp::Var(id) = self.ctx.bv_op(t) else { return false };
+        let root = self.find_bv_var_root(id);
+        !self.bv_var_refs.contains_key(&root) && !self.bv_var_subst.contains_key(&root)
+    }
+
+    /// Flatten `t·coeff` into a linear coefficient map + constant over
+    /// Z/2^w. Returns `false` if `t` contains any non-linear or opaque
+    /// subterm (shift, extract, ite, mul-of-two-vars, …). Substituted
+    /// variables are expanded so rows are stated over live atoms. Iterative
+    /// (DAG-aware) to stay linear on deep shared add chains.
+    fn flatten_linear(
+        &mut self,
+        t: BvTerm,
+        coeff: u128,
+        w: u32,
+        coeffs: &mut std::collections::BTreeMap<BvTerm, u128>,
+        konst: &mut u128,
+    ) -> bool {
+        let m = mask(w);
+        let mut work = vec![(t, coeff & m)];
+        while let Some((cur, c)) = work.pop() {
+            if c == 0 {
+                continue;
+            }
+            match self.ctx.bv_op(cur) {
+                BvOp::Const => {
+                    let node = &self.ctx.bv_nodes[cur.0 as usize];
+                    if node.wide != crate::bv::WIDE_NONE {
+                        return false; // wide const — outside u128 coefficient math
+                    }
+                    *konst = konst.wrapping_add(c.wrapping_mul(node.value)) & m;
+                }
+                BvOp::Var(id) => {
+                    let root = self.find_bv_var_root(id);
+                    if let Some(&sub) = self.bv_var_subst.get(&root) {
+                        work.push((sub, c));
+                    } else {
+                        let e = coeffs.entry(cur).or_insert(0);
+                        *e = e.wrapping_add(c) & m;
+                    }
+                }
+                BvOp::Add(x, y) => {
+                    work.push((x, c));
+                    work.push((y, c));
+                }
+                BvOp::Sub(x, y) => {
+                    work.push((x, c));
+                    work.push((y, 0u128.wrapping_sub(c) & m));
+                }
+                BvOp::Neg(x) => work.push((x, 0u128.wrapping_sub(c) & m)),
+                BvOp::Not(x) => {
+                    // ~x = −x − 1
+                    *konst = konst.wrapping_sub(c) & m;
+                    work.push((x, 0u128.wrapping_sub(c) & m));
+                }
+                BvOp::Mul(x, y) => {
+                    if let Some(v) = self.ctx.try_bv_const_value(y) {
+                        work.push((x, c.wrapping_mul(v) & m));
+                    } else if let Some(v) = self.ctx.try_bv_const_value(x) {
+                        work.push((y, c.wrapping_mul(v) & m));
+                    } else {
+                        return false; // var·var — non-linear
+                    }
+                }
+                BvOp::Shl(x, y) => {
+                    // Constant left shift is linear: `x << k = x · 2^k`.
+                    // k ≥ w shifts everything out (→ 0).
+                    let Some(k) = self.ctx.try_bv_const_value(y) else {
+                        return false; // variable shift amount — non-linear
+                    };
+                    if k >= w as u128 {
+                        continue; // shifted entirely out: contributes 0
+                    }
+                    let scale = 1u128 << k;
+                    work.push((x, c.wrapping_mul(scale) & m));
+                }
+                BvOp::Concat(hi, lo) => {
+                    // The constant-left-shift builder lowers `x << k` to
+                    // `concat(extract(x, w-1-k, 0), 0_k)` (structural, zero
+                    // gates). That concatenation equals `x · 2^k (mod 2^w)`
+                    // — the extract drops exactly the bits the shift pushes
+                    // out — so recover the power-of-two coefficient instead
+                    // of treating it as opaque. Only the shl shape (zero in
+                    // the LOW part) is linear; lshr's `concat(0, extract…)`
+                    // drops low bits and is not.
+                    let wlo = self.ctx.width_of(lo);
+                    if self.ctx.try_bv_const_value(lo) == Some(0) {
+                        if let BvOp::Extract(src, ehi, elo) = self.ctx.bv_op(hi) {
+                            if elo == 0
+                                && self.ctx.width_of(src) == w
+                                && ehi == w - wlo - 1
+                            {
+                                let scale = 1u128 << wlo;
+                                work.push((src, c.wrapping_mul(scale) & m));
+                                continue;
+                            }
+                        }
+                    }
+                    return false; // general concat — not linear
+                }
+                _ => return false, // opaque / non-linear
+            }
+        }
+        true
+    }
+
+    /// Build the term `rhs − Σ cᵢ·atomᵢ (mod 2^w)` for a solved variable.
+    fn build_linear_expr(
+        &mut self,
+        rhs: u128,
+        others: &std::collections::BTreeMap<BvTerm, u128>,
+        w: u32,
+    ) -> BvTerm {
+        let m = mask(w);
+        let mut acc: Option<BvTerm> = None;
+        for (&atom, &c) in others.iter() {
+            let neg = 0u128.wrapping_sub(c) & m; // −cᵢ
+            if neg == 0 {
+                continue;
+            }
+            let scaled = if neg == 1 {
+                atom
+            } else if neg == m {
+                self.ctx.bv_neg(atom)
+            } else {
+                let cc = self.ctx.bv_const(neg, w);
+                self.ctx.bv_mul(atom, cc)
+            };
+            acc = Some(match acc {
+                None => scaled,
+                Some(prev) => self.ctx.bv_add(prev, scaled),
+            });
+        }
+        let rhs = rhs & m;
+        match acc {
+            None => self.ctx.bv_const(rhs, w),
+            Some(sum) => {
+                if rhs == 0 {
+                    sum
+                } else {
+                    let cc = self.ctx.bv_const(rhs, w);
+                    self.ctx.bv_add(sum, cc)
+                }
+            }
+        }
+    }
+
     /// Push the BV children of a Bool term (and recurse through its Bool
     /// structure) onto an occurs-check stack.
     fn push_bool_bv_children(
@@ -1450,8 +1818,20 @@ impl SmtSolver {
             // only sound outside push scopes — a popped scope must not
             // leave permanent substitutions behind.
             if self.activation_stack.is_empty() {
-                let installed = self.collect_substitutions(&batch);
-                if installed > 0 {
+                let before = self.bv_var_subst.len();
+                self.collect_substitutions(&batch);
+                // Gaussian elimination catches coupled linear systems that
+                // single-variable substitution leaves untouched. Runs on
+                // the equalities that survived collect_substitutions.
+                let ge_unsat = self.gaussian_eliminate(&mut batch);
+                if ge_unsat {
+                    // A linear row reduced to `0 = nonzero`: the formula is
+                    // unconditionally UNSAT. Commit the empty clause so
+                    // every later solve returns UNSAT, and skip the rest.
+                    self.sat.add_clause(vec![]);
+                    return;
+                }
+                if self.bv_var_subst.len() != before {
                     // New substitutions invalidate prior rewrites.
                     self.subst_bool_memo.clear();
                     self.subst_bv_memo.clear();

@@ -27,8 +27,11 @@ fn cost_tracking_records_terms_after_solve() {
     let y = s.bv_var(32);
     let sum = s.bv_add(x, y);
     let zero = s.bv_const(0, 32);
-    let eq = s.bv_eq(sum, zero);
-    s.assert(eq);
+    // Inequality, not equality: `(= sum 0)` would be solved by Gaussian
+    // elimination (x = -y) and dropped before bitblasting, leaving nothing
+    // to attribute cost to. `bvule` forces the adder to bitblast.
+    let le = s.bv_ule(sum, zero);
+    s.assert(le);
     let _ = s.solve();
 
     let report = s.bitblast_cost_report();
@@ -60,8 +63,9 @@ fn cost_is_exclusive_of_subterms() {
     let inner = s.bv_add(x, y);
     let outer = s.bv_add(inner, z);
     let zero = s.bv_const(0, 32);
-    let eq = s.bv_eq(outer, zero);
-    s.assert(eq);
+    // Inequality so GE doesn't solve the sum away (see note above).
+    let le = s.bv_ule(outer, zero);
+    s.assert(le);
     let _ = s.solve();
 
     let report = s.bitblast_cost_report();
@@ -93,10 +97,12 @@ fn hashconsed_subterm_charged_only_once() {
     let sum = s.bv_add(x, y);
     let zero = s.bv_const(0, 32);
     let one = s.bv_const(1, 32);
-    let eq_zero = s.bv_eq(sum, zero); // uses sum
-    let eq_one = s.bv_eq(sum, one);   // uses sum again — cached
-    s.assert(eq_zero);
-    s.assert(eq_one);
+    // Inequalities so GE leaves the sum in place; both reference `sum` so
+    // hash-consing must charge its bitblast exactly once.
+    let le_zero = s.bv_ule(sum, zero); // uses sum
+    let ge_one = s.bv_ule(one, sum);   // uses sum again — cached
+    s.assert(le_zero);
+    s.assert(ge_one);
     let _ = s.solve();
 
     let report = s.bitblast_cost_report();
