@@ -57,11 +57,26 @@ fn real_main() -> i32 {
     if args.len() >= 2 && args[1] == "--smt" {
         let mut want_stats = false;
         let mut path: Option<&str> = None;
+        // Preprocessing ablation flags (all passes on by default). Let us
+        // bisect which pass helps or hurts a given instance without a
+        // recompile: --no-norm --no-subst --no-gauss --no-bve, or
+        // --no-preprocess to turn off everything at once.
+        let (mut norm, mut subst, mut gauss, mut bve) = (true, true, true, true);
         for a in &args[2..] {
-            if a == "--stats" {
-                want_stats = true;
-            } else if path.is_none() {
-                path = Some(a.as_str());
+            match a.as_str() {
+                "--stats" => want_stats = true,
+                "--no-norm" => norm = false,
+                "--no-subst" => subst = false,
+                "--no-gauss" => gauss = false,
+                "--no-bve" => bve = false,
+                "--no-preprocess" => {
+                    norm = false;
+                    subst = false;
+                    gauss = false;
+                    bve = false;
+                }
+                _ if path.is_none() => path = Some(a.as_str()),
+                _ => {}
             }
         }
         let input = match path {
@@ -83,6 +98,10 @@ fn real_main() -> i32 {
         };
         let t0 = Instant::now();
         let mut solver = binbit::SmtSolver::new();
+        solver.set_normalization(norm);
+        solver.set_substitution(subst);
+        solver.set_gaussian(gauss);
+        solver.set_bve(bve);
         match binbit::run_script_with(&mut solver, &input) {
             Ok(out) => {
                 print!("{}", out);

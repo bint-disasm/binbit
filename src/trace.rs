@@ -166,7 +166,13 @@ impl<'a> Printer<'a> {
             }
             BoolOp::NegOverflow(a) => self.visit_bv(a),
         }
-        let lbl = self.fresh("p");
+        // Interior bool nodes use the two-char prefix `pn` (p-node), NOT
+        // `p`: bool VARIABLES are named `p{var_id}`, and a fresh-counter
+        // label `p{counter}` collides with them whenever `counter` equals
+        // some variable id (near-certain — both number from 0). The `pn`
+        // prefix can never match a `p{digits}` variable name, mirroring how
+        // interior BV nodes use `bv` to stay clear of `v{id}` BV variables.
+        let lbl = self.fresh("pn");
         self.bool_label.insert(t, lbl);
         self.order.push(OrderEntry::Bool(t));
     }

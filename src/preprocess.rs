@@ -63,6 +63,14 @@ impl Clause {
     fn new(mut lits: Vec<Lit>) -> Self {
         lits.sort_by_key(|l| l.0);
         lits.dedup();
+        Self::from_sorted(lits)
+    }
+
+    /// Build from literals already sorted ascending by `Lit.0` and free of
+    /// duplicates — skips the sort/dedup. `resolve` produces exactly this
+    /// form, so resolvents avoid a redundant re-sort.
+    fn from_sorted(lits: Vec<Lit>) -> Self {
+        debug_assert!(lits.windows(2).all(|w| w[0].0 < w[1].0));
         let sig = lits.iter().fold(0u64, |s, l| s | 1u64 << (l.var_idx() & 63));
         Clause { lits, sig, deleted: false }
     }
@@ -571,20 +579,22 @@ impl Preprocessor {
     // ---------- bookkeeping ----------
 
     /// Verified live occurrences of `l`: clauses that are not deleted and
-    /// still contain `l`. Also compacts the occurrence list in passing.
+    /// still contain `l`. Compacts the stored occurrence list in passing
+    /// (drops stale entries left by deletion / strengthening).
+    ///
+    /// No dedup needed: each clause pushes to a literal's occurrence list
+    /// exactly once at creation (its literals are distinct), so the list
+    /// never holds a duplicate index — the old `out.contains` guard was
+    /// O(n²) for nothing.
     fn live_occ(&mut self, l: Lit) -> Vec<u32> {
         let li = l.0 as usize;
-        let mut out = Vec::new();
-        let list = std::mem::take(&mut self.occ[li]);
-        for ci in list {
+        let mut list = std::mem::take(&mut self.occ[li]);
+        list.retain(|&ci| {
             let c = &self.clauses[ci as usize];
-            if !c.deleted && c.lits.binary_search_by_key(&l.0, |x| x.0).is_ok() {
-                if !out.contains(&ci) {
-                    out.push(ci);
-                }
-            }
-        }
-        self.occ[li] = out.clone();
+            !c.deleted && c.lits.binary_search_by_key(&l.0, |x| x.0).is_ok()
+        });
+        let out = list.clone();
+        self.occ[li] = list;
         out
     }
 
@@ -601,8 +611,10 @@ impl Preprocessor {
         }
     }
 
+    /// Add a resolvent produced by `resolve` — already sorted ascending and
+    /// duplicate-free, so it skips `Clause::new`'s sort/dedup.
     fn add_clause(&mut self, lits: Vec<Lit>) {
-        let c = Clause::new(lits);
+        let c = Clause::from_sorted(lits);
         match c.lits.len() {
             0 => {
                 self.unsat = true;

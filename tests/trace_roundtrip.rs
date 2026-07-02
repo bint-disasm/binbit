@@ -78,6 +78,61 @@ fn roundtrip_mixed_ops() {
     assert_roundtrip(SmtResult::Sat, &dump);
 }
 
+/// The emitted script must be valid for *external* consumers (z3,
+/// bitwuzla), which reject redefining a declared symbol. binbit's own
+/// parser tolerates redefinition, so a roundtrip through `run_script`
+/// wouldn't catch a name collision — assert the structural invariant
+/// directly: no symbol is both `declare-fun`'d and `define-fun`'d.
+///
+/// Regression for the `p{var_id}` (bool variable) vs `p{counter}` (interior
+/// bool node) namespace collision, where e.g. `p2` was both a declared
+/// variable and a defined node.
+#[test]
+fn dump_has_no_declared_and_defined_name_collision() {
+    // Mirrors the symex `bv = ite(p, 1bv1, 0bv1)` pattern: many bool vars,
+    // BV ITEs selecting on them, and interior bool structure to advance the
+    // node counter into the variable-id range.
+    let (_r, dump) = solve_direct(|s| {
+        let mut asserts = Vec::new();
+        let mut prev: Option<binbit::BoolTerm> = None;
+        for _ in 0..8 {
+            let p = s.bool_var();
+            let one = s.bv_const(1, 1);
+            let zero = s.bv_const(0, 1);
+            let sel = s.bv_ite(p, one, zero);
+            let ext = s.bv_zero_extend(sel, 7);
+            let v = s.bv_var(8);
+            let eq = s.bv_eq(v, ext);
+            asserts.push(eq);
+            if let Some(pp) = prev {
+                let a = s.bool_and(pp, p);
+                asserts.push(a);
+            }
+            prev = Some(p);
+        }
+        asserts
+    });
+
+    let names = |kw: &str| -> std::collections::HashSet<String> {
+        dump.lines()
+            .filter_map(|line| {
+                let line = line.trim_start();
+                let rest = line.strip_prefix(&format!("({} ", kw))?;
+                rest.split_whitespace().next().map(|s| s.to_string())
+            })
+            .collect()
+    };
+    let declared = names("declare-fun");
+    let defined = names("define-fun");
+    let clash: Vec<_> = declared.intersection(&defined).collect();
+    assert!(
+        clash.is_empty(),
+        "symbols both declared and defined (invalid for z3/bitwuzla): {:?}\n\ndump:\n{}",
+        clash,
+        dump
+    );
+}
+
 #[test]
 fn roundtrip_bool_combinators() {
     let (r, dump) = solve_direct(|s| {

@@ -211,6 +211,21 @@ pub struct SmtSolver {
     norm_bool_memo: HashMap<BoolTerm, BoolTerm>,
     norm_bv_memo: HashMap<BvTerm, BvTerm>,
 
+    /// Per-pass preprocessing toggles, all on by default. Independent
+    /// switches so a pathological instance can be bisected — variable
+    /// elimination in particular can *hurt* search on some formulas
+    /// (eliminating gate vars that gave the SAT solver short resolution
+    /// proofs, lengthening conflict analysis) even though it shrinks the
+    /// formula. `subst_enabled` gates single-variable `(= x t)`
+    /// substitution; `gauss_enabled` gates the coupled-system Gaussian
+    /// elimination; `bve_enabled` gates the CNF-level bounded variable
+    /// elimination + subsumption pass (subsumption alone is cheap and
+    /// rarely harmful, but they share the `Preprocessor` so the toggle
+    /// covers both).
+    subst_enabled: bool,
+    gauss_enabled: bool,
+    bve_enabled: bool,
+
     /// Cumulative preprocessing counters (vars eliminated / clauses
     /// subsumed / literals strengthened) — exposed via [`sat_stats`].
     pp_eliminated: u64,
@@ -324,6 +339,9 @@ impl SmtSolver {
             normalize_enabled: true,
             norm_bool_memo: HashMap::default(),
             norm_bv_memo: HashMap::default(),
+            subst_enabled: true,
+            gauss_enabled: true,
+            bve_enabled: true,
             pp_eliminated: 0,
             pp_subsumed: 0,
             pp_strengthened: 0,
@@ -354,6 +372,28 @@ impl SmtSolver {
     /// On by default; off is useful for ablation benchmarks.
     pub fn set_normalization(&mut self, on: bool) {
         self.normalize_enabled = on;
+    }
+
+    /// Enable/disable single-variable `(= x t)` substitution. On by default.
+    pub fn set_substitution(&mut self, on: bool) {
+        self.subst_enabled = on;
+    }
+
+    /// Enable/disable Gaussian elimination of coupled linear systems. On by
+    /// default. (Independent of [`set_substitution`], though both feed the
+    /// same substitution map.)
+    pub fn set_gaussian(&mut self, on: bool) {
+        self.gauss_enabled = on;
+    }
+
+    /// Enable/disable the CNF-level preprocessing pass (bounded variable
+    /// elimination + subsumption). On by default. Off makes `commit_batch`
+    /// send clauses straight to the SAT core — useful to check whether
+    /// variable elimination is helping or hurting search on a given
+    /// instance (it can hurt: eliminating gate variables sometimes
+    /// lengthens conflict analysis).
+    pub fn set_bve(&mut self, on: bool) {
+        self.bve_enabled = on;
     }
 
     /// Enable or disable the ITE-aware branching hint. On (the default)
@@ -1819,11 +1859,17 @@ impl SmtSolver {
             // leave permanent substitutions behind.
             if self.activation_stack.is_empty() {
                 let before = self.bv_var_subst.len();
-                self.collect_substitutions(&batch);
+                if self.subst_enabled {
+                    self.collect_substitutions(&batch);
+                }
                 // Gaussian elimination catches coupled linear systems that
                 // single-variable substitution leaves untouched. Runs on
                 // the equalities that survived collect_substitutions.
-                let ge_unsat = self.gaussian_eliminate(&mut batch);
+                let ge_unsat = if self.gauss_enabled {
+                    self.gaussian_eliminate(&mut batch)
+                } else {
+                    false
+                };
                 if ge_unsat {
                     // A linear row reduced to `0 = nonzero`: the formula is
                     // unconditionally UNSAT. Commit the empty clause so
@@ -2012,19 +2058,36 @@ impl SmtSolver {
         if buffer.is_empty() {
             return;
         }
-        // Pre-filter against root-level facts already in the SAT core
-        // (notably the pinned true-lit): drop satisfied clauses, strip
-        // false literals. `value_fixed` ignores stale search-trail
-        // assignments above level 0.
+        // Remap the batch's literals into a compact variable space [0, k)
+        // where k = distinct variables appearing in this batch. Every
+        // preprocessing array (occurrence lists, counts, frozen flags) and
+        // every scan is then O(batch), not O(total variables ever
+        // allocated) — the difference between linear and quadratic cost
+        // across an incremental session that keeps adding small batches.
+        //
+        // The remap is folded into the pre-filter pass that already
+        // rewrites each clause in place: drop clauses satisfied by a
+        // root-level fact (the pinned true-lit especially) and strip
+        // level-0-false literals via `value_fixed`, which ignores stale
+        // search-trail assignments above level 0.
+        let mut to_orig: Vec<u32> = Vec::new(); // compact var id → original
+        let mut to_compact: HashMap<u32, u32> = HashMap::default();
         let mut clauses: Vec<Vec<Lit>> = Vec::with_capacity(buffer.len());
         'clause: for mut c in buffer {
             let mut w = 0;
             for i in 0..c.len() {
-                match self.sat.value_fixed(c[i]) {
+                let l = c[i];
+                match self.sat.value_fixed(l) {
                     LBool::True => continue 'clause,
                     LBool::False => {}
                     LBool::Undef => {
-                        c[w] = c[i];
+                        let ov = l.var().0;
+                        let cv = *to_compact.entry(ov).or_insert_with(|| {
+                            let id = to_orig.len() as u32;
+                            to_orig.push(ov);
+                            id
+                        });
+                        c[w] = Lit::new(Var(cv), l.is_negated());
                         w += 1;
                     }
                 }
@@ -2033,35 +2096,60 @@ impl SmtSolver {
             clauses.push(c);
         }
 
-        let num_vars = self.sat.num_vars();
-        let mut frozen: Vec<bool> = Vec::with_capacity(num_vars);
-        for v in 0..num_vars {
-            let f = v < batch_start_var
-                || !matches!(self.var_origin[v], VarOrigin::GateOut { .. });
+        // BVE disabled: commit the (pre-filtered) clauses directly, mapping
+        // compact lits back to originals. Skips the Preprocessor entirely.
+        if !self.bve_enabled {
+            for c in &clauses {
+                let orig: Vec<Lit> = c
+                    .iter()
+                    .map(|&l| Lit::new(Var(to_orig[l.var_idx()]), l.is_negated()))
+                    .collect();
+                self.sat.add_clause(orig);
+            }
+            return;
+        }
+
+        let k = to_orig.len();
+        // frozen[compact] — a variable survives elimination unless it is a
+        // gate output allocated by THIS batch (older vars may be referenced
+        // by clauses already committed to the SAT core; inputs / activation
+        // lits / the true-lit are read elsewhere).
+        let mut frozen: Vec<bool> = Vec::with_capacity(k);
+        for &ov in &to_orig {
+            let ov = ov as usize;
+            let f = ov < batch_start_var
+                || !matches!(self.var_origin[ov], VarOrigin::GateOut { .. });
             frozen.push(f);
         }
 
-        let result = crate::preprocess::Preprocessor::new(clauses, num_vars, frozen).run();
+        let result = crate::preprocess::Preprocessor::new(clauses, k, frozen).run();
         self.pp_eliminated += result.eliminated.len() as u64;
         self.pp_subsumed += result.subsumed as u64;
         self.pp_strengthened += result.strengthened as u64;
 
         // Un-bind eliminated gate vars from their AIG nodes so later
         // consumers re-materialize them freshly instead of referencing
-        // variables whose defining clauses no longer exist.
-        for v in &result.eliminated {
-            let node = self.lit_node[*v as usize];
+        // variables whose defining clauses no longer exist. Compact ids map
+        // back through `to_orig`.
+        for &cv in &result.eliminated {
+            let ov = to_orig[cv as usize] as usize;
+            let node = self.lit_node[ov];
             if node != u32::MAX {
                 self.aig_lit[node as usize] = None;
-                self.lit_node[*v as usize] = u32::MAX;
+                self.lit_node[ov] = u32::MAX;
             }
             // The variable has no clauses left — exclude it from branching
             // so model completion doesn't pay a decision for it.
-            self.sat.set_decision_var(Var(*v), false);
+            self.sat.set_decision_var(Var(ov as u32), false);
         }
 
-        for c in result.clauses {
-            self.sat.add_clause(c);
+        // Map surviving clauses back to original variable ids and commit.
+        for c in &result.clauses {
+            let orig: Vec<Lit> = c
+                .iter()
+                .map(|&l| Lit::new(Var(to_orig[l.var_idx()]), l.is_negated()))
+                .collect();
+            self.sat.add_clause(orig);
         }
     }
 
