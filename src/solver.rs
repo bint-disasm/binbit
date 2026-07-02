@@ -250,52 +250,76 @@ impl OrderHeap {
         Some(top)
     }
 
+    // sift_up / sift_down are on the branching hot path (every `pop` and
+    // every VSIDS bump). `self.heap[i]` / `self.pos[v]` are `Vec` indexing —
+    // `Index → Deref → bounds-check` per access — which showed up as
+    // `<Vec as Index>::index` under `sift_down` in profiles. Destructuring to
+    // slices once and indexing unchecked removes both the deref and the
+    // check: heap is never resized during a sift (it's a reorder), heap
+    // positions are `< heap.len()`, and every heap value is a valid variable
+    // id `< pos.len() == activity.len()`. `debug_assert`s keep these checked
+    // in dev/test.
     fn sift_up(&mut self, mut i: usize, activity: &[f64]) {
-        let x = self.heap[i];
-        let xa = activity[x as usize];
-        while i > 0 {
-            let parent = (i - 1) / 2;
-            let pv = self.heap[parent];
-            if activity[pv as usize] < xa {
-                self.heap[i] = pv;
-                self.pos[pv as usize] = i as i32;
-                i = parent;
-            } else {
-                break;
+        let OrderHeap { heap, pos } = self;
+        let heap = heap.as_mut_slice();
+        let pos = pos.as_mut_slice();
+        debug_assert!(i < heap.len());
+        // SAFETY: see the note above — all indices are invariants here.
+        unsafe {
+            let x = *heap.get_unchecked(i);
+            let xa = *activity.get_unchecked(x as usize);
+            while i > 0 {
+                let parent = (i - 1) / 2;
+                let pv = *heap.get_unchecked(parent);
+                if *activity.get_unchecked(pv as usize) < xa {
+                    *heap.get_unchecked_mut(i) = pv;
+                    *pos.get_unchecked_mut(pv as usize) = i as i32;
+                    i = parent;
+                } else {
+                    break;
+                }
             }
+            *heap.get_unchecked_mut(i) = x;
+            *pos.get_unchecked_mut(x as usize) = i as i32;
         }
-        self.heap[i] = x;
-        self.pos[x as usize] = i as i32;
     }
 
     fn sift_down(&mut self, mut i: usize, activity: &[f64]) {
-        let len = self.heap.len();
-        let x = self.heap[i];
-        let xa = activity[x as usize];
-        loop {
-            let left = 2 * i + 1;
-            if left >= len {
-                break;
+        let OrderHeap { heap, pos } = self;
+        let heap = heap.as_mut_slice();
+        let pos = pos.as_mut_slice();
+        let len = heap.len();
+        debug_assert!(i < len);
+        // SAFETY: see the note above — all indices are invariants here.
+        unsafe {
+            let x = *heap.get_unchecked(i);
+            let xa = *activity.get_unchecked(x as usize);
+            loop {
+                let left = 2 * i + 1;
+                if left >= len {
+                    break;
+                }
+                let right = left + 1;
+                let child = if right < len
+                    && *activity.get_unchecked(*heap.get_unchecked(right) as usize)
+                        > *activity.get_unchecked(*heap.get_unchecked(left) as usize)
+                {
+                    right
+                } else {
+                    left
+                };
+                let cv = *heap.get_unchecked(child);
+                if *activity.get_unchecked(cv as usize) > xa {
+                    *heap.get_unchecked_mut(i) = cv;
+                    *pos.get_unchecked_mut(cv as usize) = i as i32;
+                    i = child;
+                } else {
+                    break;
+                }
             }
-            let right = left + 1;
-            let child = if right < len
-                && activity[self.heap[right] as usize] > activity[self.heap[left] as usize]
-            {
-                right
-            } else {
-                left
-            };
-            let cv = self.heap[child];
-            if activity[cv as usize] > xa {
-                self.heap[i] = cv;
-                self.pos[cv as usize] = i as i32;
-                i = child;
-            } else {
-                break;
-            }
+            *heap.get_unchecked_mut(i) = x;
+            *pos.get_unchecked_mut(x as usize) = i as i32;
         }
-        self.heap[i] = x;
-        self.pos[x as usize] = i as i32;
     }
 }
 
