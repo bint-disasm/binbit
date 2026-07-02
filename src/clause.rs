@@ -107,12 +107,21 @@ impl ClauseArena {
     // across the loop. Pure plumbing — identical behaviour, no propagation-
     // order change. `debug_assert`s keep the invariant checked in dev/test.
 
+    // These read the arena through `data.as_ptr()` + offset rather than
+    // `data.get_unchecked(idx)`. Both are unchecked, but `get_unchecked` is
+    // a *slice* method, so it first calls `<Vec as Deref>::deref` to
+    // materialize a `&[u32]` — which showed up as a real `deref` frame in
+    // propagate profiles. `Vec::as_ptr` is an *inherent* method that hands
+    // back the buffer pointer with no deref. Same codegen intent, one fewer
+    // call in the hot path. Indices are in bounds for any live clause by
+    // construction (see `alloc`); `debug_assert`s keep that checked in dev.
+
     #[inline]
     pub fn len(&self, c: ClauseRef) -> usize {
         let idx = c.0 as usize + 4;
         debug_assert!(idx < self.data.len(), "clause len read out of bounds");
         // SAFETY: a live clause header occupies words [c.0 .. c.0 + HDR).
-        unsafe { *self.data.get_unchecked(idx) as usize }
+        unsafe { *self.data.as_ptr().add(idx) as usize }
     }
 
     #[inline]
@@ -120,7 +129,7 @@ impl ClauseArena {
         let idx = c.0 as usize + HDR + i;
         debug_assert!(idx < self.data.len(), "clause lit read out of bounds");
         // SAFETY: i < len ⇒ header + i is within the clause body.
-        Lit(unsafe { *self.data.get_unchecked(idx) })
+        Lit(unsafe { *self.data.as_ptr().add(idx) })
     }
 
     /// Borrow the clause's literals as a slice. Zero-copy — the underlying
@@ -129,16 +138,15 @@ impl ClauseArena {
     pub fn lits(&self, c: ClauseRef) -> &[Lit] {
         let h = c.0 as usize;
         debug_assert!(h + 4 < self.data.len(), "clause header out of bounds");
+        let base = self.data.as_ptr();
         // SAFETY: header word `h+4` is in bounds for any live clause.
-        let len = unsafe { *self.data.get_unchecked(h + 4) as usize };
+        let len = unsafe { *base.add(h + 4) as usize };
         let start = h + HDR;
         debug_assert!(start + len <= self.data.len(), "clause body out of bounds");
         // SAFETY: Lit is #[repr(transparent)] around u32, so a &[u32] can be
         // reinterpreted as &[Lit] with identical layout and alignment; the
         // body words [start .. start+len) are in bounds by construction.
-        unsafe {
-            std::slice::from_raw_parts(self.data.as_ptr().add(start) as *const Lit, len)
-        }
+        unsafe { std::slice::from_raw_parts(base.add(start) as *const Lit, len) }
     }
 
     #[inline]

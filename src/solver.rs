@@ -692,6 +692,11 @@ impl Solver {
         let lit_value: &mut [LBool] = lit_value.as_mut_slice();
         let level: &mut [i32] = level.as_mut_slice();
         let reason: &mut [Reason] = reason.as_mut_slice();
+        // The OUTER watch table is likewise fixed-size during propagate:
+        // migrations push onto the INNER lists and the restore reassigns an
+        // inner list, but the outer `Vec<Vec<Watcher>>` never grows here.
+        // Slicing it removes the deref on every `get_unchecked_mut`.
+        let watches: &mut [Vec<Watcher>] = watches.as_mut_slice();
 
         'queue: while *qhead < trail.len() {
             // SAFETY: the loop guard just established `*qhead < trail.len()`.
