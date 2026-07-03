@@ -62,9 +62,25 @@ fn real_main() -> i32 {
         // recompile: --no-norm --no-subst --no-gauss --no-bve, or
         // --no-preprocess to turn off everything at once.
         let (mut norm, mut subst, mut gauss, mut bve) = (true, true, true, true);
+        // FRAIG feasibility probe: after the script runs, random-simulate
+        // the accumulated AIG and report semantic-redundancy candidates.
+        let mut want_fraig_diag = false;
+        // FRAIG sweep: prove + merge equivalent AIG nodes before CNF
+        // emission. Off by default (changes search trajectory).
+        let mut fraig = false;
+        // Two-level AIG rewriting (Brummayer-Biere) in the bitblaster.
+        // Off by default (changes search trajectory).
+        let mut aig2 = false;
+        // Sharing-aware variant: safe build rules + parent-count-gated
+        // post-build substitution pass.
+        let mut aig2_post = false;
         for a in &args[2..] {
             match a.as_str() {
                 "--stats" => want_stats = true,
+                "--fraig-diag" => want_fraig_diag = true,
+                "--fraig" => fraig = true,
+                "--aig2" => aig2 = true,
+                "--aig2-post" => aig2_post = true,
                 "--no-norm" => norm = false,
                 "--no-subst" => subst = false,
                 "--no-gauss" => gauss = false,
@@ -102,6 +118,11 @@ fn real_main() -> i32 {
         solver.set_substitution(subst);
         solver.set_gaussian(gauss);
         solver.set_bve(bve);
+        solver.set_fraig(fraig);
+        solver.set_aig_two_level(aig2);
+        if aig2_post {
+            solver.set_aig_two_level_post(true);
+        }
         match binbit::run_script_with(&mut solver, &input) {
             Ok(out) => {
                 print!("{}", out);
@@ -125,6 +146,44 @@ fn real_main() -> i32 {
                     eprintln!("c pp_subst    : {}", s.pp_substituted);
                     eprintln!("c pp_elim     : {}", s.pp_eliminated);
                     eprintln!("c pp_subsumed : {}", s.pp_subsumed);
+                    eprintln!("c pp_remat    : {}", s.pp_remat);
+                    let (ag, xg, mg) = solver.gate_mix();
+                    eprintln!("c gates_and   : {}", ag);
+                    eprintln!("c gates_xor   : {}", xg);
+                    eprintln!("c gates_mux   : {}", mg);
+                    if aig2_post {
+                        let ps = solver.aig2_post_report();
+                        eprintln!(
+                            "c aig2_post   : applied={} blocked={} folds={} passes={}",
+                            ps.subst_applied, ps.blocked, ps.folds, ps.passes
+                        );
+                    }
+                    if aig2 || aig2_post {
+                        let rw = solver.aig_rw_counts();
+                        eprintln!(
+                            "c aig2_rules  : contra={} subsume={} idem2={} resol={} subst={} idem4={}",
+                            rw[0], rw[1], rw[2], rw[3], rw[4], rw[5]
+                        );
+                    }
+                }
+                if fraig {
+                    let (fs, ft) = solver.fraig_report();
+                    eprintln!("c fraig_cand  : {}", fs.candidates);
+                    eprintln!("c fraig_proven: {}", fs.proven);
+                    eprintln!("c fraig_disprv: {}", fs.disproven);
+                    eprintln!("c fraig_skip  : {}", fs.skipped);
+                    eprintln!("c fraig_cexpr : {}", fs.cex_pruned);
+                    eprintln!("c fraig_query : {}", fs.queries);
+                    eprintln!("c fraig_time  : {:.3}s", ft.as_secs_f64());
+                }
+                if want_fraig_diag {
+                    let d = solver.fraig_diagnostic();
+                    eprintln!("c aig_nodes   : {}", d.num_nodes);
+                    eprintln!("c aig_ands    : {}", d.num_and);
+                    eprintln!("c sim_const   : {}", d.sim_const);
+                    eprintln!("c sim_classes : {}", d.classes);
+                    eprintln!("c sim_redund  : {}", d.redundant);
+                    eprintln!("c sim_maxclass: {}", d.largest_class);
                 }
             }
             Err(e) => {

@@ -2,6 +2,7 @@ pub mod aig;
 pub mod bv;
 pub mod clause;
 pub mod dimacs;
+pub mod fraig;
 pub mod lit;
 pub mod preprocess;
 pub mod smt;

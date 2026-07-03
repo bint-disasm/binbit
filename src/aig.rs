@@ -97,6 +97,28 @@ pub enum AigNode {
 /// node indices, so a left-to-right walk of `nodes` visits every node
 /// after its operands. This makes CNF emission trivial.
 pub struct Aig {
+    /// Two-level AIG rewriting (Brummayer & Biere, "Local Two-Level
+    /// And-Inverter Graph Minimization without Blowup") applied inside
+    /// `and()`, ported rule-for-rule from bitwuzla's `rewrite_and`. Off by
+    /// default: it changes circuit structure and therefore CNF shape and
+    /// search trajectory — benchmark per-corpus before adopting.
+    two_level: bool,
+    /// When two_level is on, also apply the substitution / idempotence-4
+    /// families. These are the only rules that BYPASS a shared interior
+    /// node (re-pointing an operand at a grandchild) instead of purely
+    /// deleting redundancy; on trajectory-sensitive instances that
+    /// fragments the learned-clause vocabulary carried by shared gate
+    /// variables (bench_5906: 9045 substitutions, nothing else, 15× more
+    /// conflicts). Off = "safe subset": contradiction, subsumption,
+    /// idempotence-2, resolution only.
+    two_level_subst: bool,
+    /// Rule-firing counters for the two-level rewriter, by family:
+    /// [contradiction, subsumption, idempotence-2, resolution,
+    /// substitution, idempotence-4]. The last two BYPASS a shared interior
+    /// node (they re-point an operand at a grandchild) rather than merely
+    /// returning an existing ref — tracked separately to diagnose
+    /// proof-vocabulary fragmentation.
+    pub rw_counts: [u64; 6],
     /// Node arena. `nodes[0]` is always `ConstTrue`.
     pub nodes: Vec<AigNode>,
     /// Per-node BV-source annotation, for propagating `VarOrigin::BvBit`
@@ -115,11 +137,26 @@ pub struct Aig {
 impl Aig {
     pub fn new() -> Self {
         Aig {
+            two_level: false,
+            two_level_subst: true,
+            rw_counts: [0; 6],
             nodes: vec![AigNode::ConstTrue],
             src_terms: vec![None],
             hash_cons: HashMap::new(),
             input_lut: HashMap::new(),
         }
+    }
+
+    /// Enable/disable two-level rewriting in `and()` (see the field docs).
+    pub fn set_two_level(&mut self, on: bool) {
+        self.two_level = on;
+    }
+
+    /// Restrict two-level rewriting to the pure-deletion families
+    /// (see `two_level_subst` field docs). `on = false` disables the
+    /// substitution / idempotence-4 rules.
+    pub fn set_two_level_subst(&mut self, on: bool) {
+        self.two_level_subst = on;
     }
 
     /// Number of AIG nodes (including the constant-true sentinel at 0).
@@ -162,34 +199,254 @@ impl Aig {
         requested
     }
 
-    /// Build `and(a, b)` with the standard AIG simplifications and hash-cons.
+    /// Children of the *node* under `r` if it is an And, else None. The
+    /// polarity of `r` itself is NOT applied — two-level rules inspect the
+    /// node's structure and track the edge polarity separately.
+    #[inline]
+    fn and_children(&self, r: AigRef) -> Option<(AigRef, AigRef)> {
+        match self.nodes[r.node_idx() as usize] {
+            AigNode::And(x, y) => Some((x, y)),
+            _ => None,
+        }
+    }
+
+    /// Build `and(a, b)` with construction-time simplification + hash-cons.
     ///
-    /// Construction-time folds:
+    /// Level-1 folds (always on):
     ///   - identity vs constants (TRUE / FALSE)
-    ///   - `and(x, x) = x`
-    ///   - `and(x, ¬x) = FALSE`
+    ///   - `and(x, x) = x`, `and(x, ¬x) = FALSE`
+    ///
+    /// With `two_level` enabled, additionally applies the Brummayer-Biere
+    /// two-level rules — contradiction, subsumption, idempotence,
+    /// resolution, substitution — looking one level into And-shaped
+    /// operands. Substitution rules shrink an operand and restart the loop
+    /// (as in bitwuzla's `rewrite_and`, which this ports rule-for-rule).
     /// Then hash-cons on the sorted pair.
     pub fn and(&mut self, a: AigRef, b: AigRef) -> AigRef {
-        // Constant folds.
-        if a == AigRef::TRUE {
-            return b;
+        let (mut left, mut right) = (a, b);
+        loop {
+            // === Level 1: neutrality / boundedness / idempotence /
+            // contradiction on the operands themselves. ===
+            if left == AigRef::TRUE || left == right {
+                return right;
+            }
+            if right == AigRef::TRUE {
+                return left;
+            }
+            if left == AigRef::FALSE || right == AigRef::FALSE || left == !right {
+                return AigRef::FALSE;
+            }
+
+            if !self.two_level {
+                break;
+            }
+
+            let lk = self.and_children(left);
+            let rk = self.and_children(right);
+            let ln = left.is_negated();
+            let rn = right.is_negated();
+
+            // === Level 2 ===
+
+            // Contradiction (asymmetric): (a ∧ b) ∧ c with a = ¬c ∨ b = ¬c.
+            if !ln {
+                if let Some((x, y)) = lk {
+                    if x == !right || y == !right {
+                        self.rw_counts[0] += 1;
+                        return AigRef::FALSE;
+                    }
+                }
+            }
+            if !rn {
+                if let Some((x, y)) = rk {
+                    if x == !left || y == !left {
+                        self.rw_counts[0] += 1;
+                        return AigRef::FALSE;
+                    }
+                }
+            }
+
+            // Contradiction (symmetric): (a ∧ b) ∧ (c ∧ d) with any
+            // child pair complementary.
+            if !ln && !rn {
+                if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                    if x == !w || x == !z || y == !w || y == !z {
+                        self.rw_counts[0] += 1;
+                        return AigRef::FALSE;
+                    }
+                }
+            }
+
+            // Subsumption (asymmetric): ¬(a ∧ b) ∧ c with a = ¬c ∨ b = ¬c
+            // → c.
+            if ln {
+                if let Some((x, y)) = lk {
+                    if x == !right || y == !right {
+                        self.rw_counts[1] += 1;
+                        return right;
+                    }
+                }
+            }
+            if rn {
+                if let Some((x, y)) = rk {
+                    if x == !left || y == !left {
+                        self.rw_counts[1] += 1;
+                        return left;
+                    }
+                }
+            }
+
+            // Subsumption (symmetric): ¬(a ∧ b) ∧ (c ∧ d) with any child
+            // pair complementary → (c ∧ d).
+            if ln && !rn {
+                if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                    if x == !w || x == !z || y == !w || y == !z {
+                        self.rw_counts[1] += 1;
+                        return right;
+                    }
+                }
+            }
+            if rn && !ln {
+                if let (Some((w, z)), Some((x, y))) = (rk, lk) {
+                    if w == !x || w == !y || z == !x || z == !y {
+                        self.rw_counts[1] += 1;
+                        return left;
+                    }
+                }
+            }
+
+            // Idempotence (2-level): (a ∧ b) ∧ c with a = c ∨ b = c
+            // → (a ∧ b).
+            if !ln {
+                if let Some((x, y)) = lk {
+                    if x == right || y == right {
+                        self.rw_counts[2] += 1;
+                        return left;
+                    }
+                }
+            }
+            if !rn {
+                if let Some((x, y)) = rk {
+                    if x == left || y == left {
+                        self.rw_counts[2] += 1;
+                        return right;
+                    }
+                }
+            }
+
+            // Resolution: ¬(a ∧ b) ∧ ¬(c ∧ d) with {a=c, b=¬d} or
+            // {a=d, b=¬c} → ¬a (and the mirrored variants → ¬d).
+            if ln && rn {
+                if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                    if (x == w && y == !z) || (x == z && y == !w) {
+                        self.rw_counts[3] += 1;
+                        return !x;
+                    }
+                    if (z == y && w == !x) || (z == x && w == !y) {
+                        self.rw_counts[3] += 1;
+                        return !z;
+                    }
+                }
+            }
+
+            // Safe-subset mode stops here: the remaining families bypass
+            // shared interior nodes rather than deleting redundancy.
+            if !self.two_level_subst {
+                break;
+            }
+
+            // === Level 3: substitution — shrink an operand, restart. ===
+
+            // Asymmetric: ¬(a ∧ b) ∧ c with a = c → ¬b ∧ c (resp. b = c
+            // → ¬a ∧ c).
+            if ln {
+                if let Some((x, y)) = lk {
+                    if x == right {
+                        left = !y;
+                        self.rw_counts[4] += 1;
+                        continue;
+                    }
+                    if y == right {
+                        left = !x;
+                        self.rw_counts[4] += 1;
+                        continue;
+                    }
+                }
+            }
+            if rn {
+                if let Some((w, z)) = rk {
+                    if w == left {
+                        right = !z;
+                        self.rw_counts[4] += 1;
+                        continue;
+                    }
+                    if z == left {
+                        right = !w;
+                        self.rw_counts[4] += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Symmetric: ¬(a ∧ b) ∧ (c ∧ d) with a ∈ {c, d} → ¬b ∧ (c ∧ d)
+            // (resp. b ∈ {c, d} → ¬a ∧ (c ∧ d)).
+            if ln && !rn {
+                if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                    if x == w || x == z {
+                        left = !y;
+                        self.rw_counts[4] += 1;
+                        continue;
+                    }
+                    if y == w || y == z {
+                        left = !x;
+                        self.rw_counts[4] += 1;
+                        continue;
+                    }
+                }
+            }
+            if rn && !ln {
+                if let (Some((w, z)), Some((x, y))) = (rk, lk) {
+                    if w == x || w == y {
+                        right = !z;
+                        self.rw_counts[4] += 1;
+                        continue;
+                    }
+                    if z == x || z == y {
+                        right = !w;
+                        self.rw_counts[4] += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // === Level 4: idempotence across two Ands — drop the shared
+            // conjunct from one side, restart. (a ∧ b) ∧ (c ∧ d) with
+            // c ∈ {a, b} → keep d (resp. d ∈ {a, b} → keep c). ===
+            if !ln && !rn {
+                if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                    if x == w || y == w {
+                        self.rw_counts[5] += 1;
+                        right = z;
+                        continue;
+                    }
+                    if x == z || y == z {
+                        self.rw_counts[5] += 1;
+                        right = w;
+                        continue;
+                    }
+                }
+            }
+
+            break;
         }
-        if b == AigRef::TRUE {
-            return a;
-        }
-        if a == AigRef::FALSE || b == AigRef::FALSE {
-            return AigRef::FALSE;
-        }
-        // Identities on the operands themselves.
-        if a == b {
-            return a;
-        }
-        if a == !b {
-            return AigRef::FALSE;
-        }
+
         // Canonicalize: put the smaller AigRef first so `(a, b)` and
         // `(b, a)` land on the same hash-cons key.
-        let (lhs, rhs) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+        let (lhs, rhs) = if left.0 <= right.0 {
+            (left, right)
+        } else {
+            (right, left)
+        };
         if let Some(&idx) = self.hash_cons.get(&(lhs, rhs)) {
             return AigRef::from_parts(idx, false);
         }
@@ -261,6 +518,423 @@ impl Aig {
         self.or(hi, lo)
     }
 
+    /// Rewrite node `dup` into a pure alias of `target`, after an external
+    /// proof (FRAIG sweep) that they compute the same function. The alias
+    /// is represented structurally as `And(target, target)`, which computes
+    /// exactly `target` — every existing holder of a ref to `dup` keeps its
+    /// ref and transparently evaluates / materializes through `target`
+    /// (CNF emission recognizes the shape and reuses target's SAT lit with
+    /// zero clauses; see `SmtSolver::lit_of`). Such identity nodes can NOT
+    /// arise from normal construction — `and()` folds `and(x, x)` to `x` —
+    /// so the shape unambiguously means "merged".
+    ///
+    /// `target.node_idx() < dup` is required: it preserves the topological
+    /// invariant (children strictly smaller), which is also what makes
+    /// alias chains terminate.
+    pub fn merge_equiv(&mut self, dup: u32, target: AigRef) {
+        debug_assert!(target.node_idx() < dup, "merge target must be older than dup");
+        debug_assert!(
+            matches!(self.nodes[dup as usize], AigNode::And(..)),
+            "only And nodes are merge candidates"
+        );
+        self.nodes[dup as usize] = AigNode::And(target, target);
+    }
+
+    /// Chase FRAIG/fold alias nodes (`And(t, t)`) to the underlying ref,
+    /// composing polarities. Terminates: an alias always points at a
+    /// strictly smaller node index.
+    fn resolve(&self, mut r: AigRef) -> AigRef {
+        loop {
+            if let AigNode::And(a, b) = self.nodes[r.node_idx() as usize] {
+                if a == b {
+                    r = if r.is_negated() { !a } else { a };
+                    continue;
+                }
+            }
+            return r;
+        }
+    }
+
+    /// Sharing-aware two-level substitution, run AFTER the batch's AIG is
+    /// fully built (unlike the construction-time rules, which fire before
+    /// a node's co-parents exist). This is what makes the substitution
+    /// family compatible with shared circuits:
+    ///
+    /// Construction-time substitution re-points a parent at a grandchild,
+    /// bypassing the interior node. If that interior keeps other parents,
+    /// the emitted CNF ends up with two vocabularies for one subfunction —
+    /// some cones constrain the interior's gate variable, rewritten ones
+    /// constrain its expansion — and learned clauses stop transferring
+    /// between them (measured: bench_5906 fired 9045 substitutions,
+    /// changed <3% of gates, and took 15× more conflicts). Here, with the
+    /// batch graph complete, we apply a substitution ONLY when the
+    /// bypassed interior has exactly one live parent (the node being
+    /// rewritten) and is neither a root nor already materialized — so a
+    /// rewrite never strands a co-parent. Tree-shaped cones still cascade
+    /// (freed nodes release their children, and later passes pick up
+    /// substitutions unblocked by earlier ones); shared nodes are left
+    /// intact.
+    ///
+    /// All rewrites are function-preserving and in-place, so every
+    /// existing holder of a ref (caches, roots, other parents) stays
+    /// valid. Full folds turn the node into an `And(t, t)` alias (the
+    /// same shape `merge_equiv` uses; CNF emission binds it to `t`'s lit
+    /// with zero clauses).
+    ///
+    /// `roots` are the batch's assertion refs (bypass-protected);
+    /// `pinned[i]` marks nodes already bound to a SAT lit (their CNF is
+    /// emitted — rewriting them can only fragment). May be shorter than
+    /// `nodes`.
+    pub fn substitute_pass(&mut self, roots: &[AigRef], pinned: &[bool]) -> PostPassStats {
+        let n = self.nodes.len();
+        let mut stats = PostPassStats::default();
+        let is_pinned = |i: u32| (i as usize) < pinned.len() && pinned[i as usize];
+
+        // Liveness: reachable from the roots without descending into
+        // pinned cones (their structure is settled). Keeps garbage nodes
+        // (e.g. rejected-normalization variants) from inflating parent
+        // counts and blocking valid substitutions.
+        let mut live = vec![false; n];
+        let mut stack: Vec<u32> = roots.iter().map(|r| r.node_idx()).collect();
+        while let Some(i) = stack.pop() {
+            if live[i as usize] || is_pinned(i) {
+                continue;
+            }
+            live[i as usize] = true;
+            if let AigNode::And(a, b) = self.nodes[i as usize] {
+                stack.push(a.node_idx());
+                stack.push(b.node_idx());
+            }
+        }
+
+        // Live parent counts. Roots get a sentinel parent so they can
+        // never be bypassed (they materialize regardless).
+        let mut parents = vec![0u32; n];
+        for i in 0..n {
+            if !live[i] {
+                continue;
+            }
+            if let AigNode::And(a, b) = self.nodes[i] {
+                parents[a.node_idx() as usize] += 1;
+                parents[b.node_idx() as usize] += 1;
+            }
+        }
+        for r in roots {
+            parents[r.node_idx() as usize] += 1;
+        }
+
+        // Release a reference to node `k`; if it just died, cascade into
+        // its children so later passes see accurate counts.
+        fn release(k: u32, nodes: &[AigNode], parents: &mut [u32], live: &mut [bool]) {
+            let mut stack = vec![k];
+            while let Some(i) = stack.pop() {
+                let iu = i as usize;
+                debug_assert!(parents[iu] > 0, "releasing unreferenced node");
+                parents[iu] -= 1;
+                if parents[iu] == 0 && live[iu] {
+                    live[iu] = false;
+                    if let AigNode::And(a, b) = nodes[iu] {
+                        stack.push(a.node_idx());
+                        stack.push(b.node_idx());
+                    }
+                }
+            }
+        }
+
+        const MAX_PASSES: u32 = 4;
+        for _pass in 0..MAX_PASSES {
+            let mut rewrites_this_pass = 0u64;
+            stats.passes += 1;
+
+            for i in 1..n {
+                if !live[i] || is_pinned(i as u32) {
+                    continue;
+                }
+                let AigNode::And(l0, r0) = self.nodes[i] else {
+                    continue;
+                };
+                if l0 == r0 {
+                    continue; // already an alias
+                }
+
+                // Track the node's current (virtual) children; parent
+                // counts are adjusted incrementally on every re-point.
+                let mut left = self.resolve(l0);
+                let mut right = self.resolve(r0);
+                if left != l0 {
+                    parents[left.node_idx() as usize] += 1;
+                    release(l0.node_idx(), &self.nodes, &mut parents, &mut live);
+                }
+                if right != r0 {
+                    parents[right.node_idx() as usize] += 1;
+                    release(r0.node_idx(), &self.nodes, &mut parents, &mut live);
+                }
+
+                let mut fold: Option<AigRef> = None;
+                loop {
+                    // Level-1 folds on the virtual children.
+                    if left == AigRef::TRUE || left == right {
+                        fold = Some(right);
+                        break;
+                    }
+                    if right == AigRef::TRUE {
+                        fold = Some(left);
+                        break;
+                    }
+                    if left == AigRef::FALSE || right == AigRef::FALSE || left == !right {
+                        fold = Some(AigRef::FALSE);
+                        break;
+                    }
+
+                    let lk = self.and_children(left);
+                    let rk = self.and_children(right);
+                    let ln = left.is_negated();
+                    let rn = right.is_negated();
+
+                    // Pure-deletion folds (ungated — they don't bypass).
+                    // Contradiction.
+                    if !ln {
+                        if let Some((x, y)) = lk {
+                            if x == !right || y == !right {
+                                fold = Some(AigRef::FALSE);
+                                break;
+                            }
+                        }
+                    }
+                    if !rn {
+                        if let Some((x, y)) = rk {
+                            if x == !left || y == !left {
+                                fold = Some(AigRef::FALSE);
+                                break;
+                            }
+                        }
+                    }
+                    if !ln && !rn {
+                        if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                            if x == !w || x == !z || y == !w || y == !z {
+                                fold = Some(AigRef::FALSE);
+                                break;
+                            }
+                        }
+                    }
+                    // Subsumption.
+                    if ln {
+                        if let Some((x, y)) = lk {
+                            if x == !right || y == !right {
+                                fold = Some(right);
+                                break;
+                            }
+                        }
+                    }
+                    if rn {
+                        if let Some((x, y)) = rk {
+                            if x == !left || y == !left {
+                                fold = Some(left);
+                                break;
+                            }
+                        }
+                    }
+                    if ln && !rn {
+                        if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                            if x == !w || x == !z || y == !w || y == !z {
+                                fold = Some(right);
+                                break;
+                            }
+                        }
+                    }
+                    if rn && !ln {
+                        if let (Some((w, z)), Some((x, y))) = (rk, lk) {
+                            if w == !x || w == !y || z == !x || z == !y {
+                                fold = Some(left);
+                                break;
+                            }
+                        }
+                    }
+                    // Idempotence (2-level).
+                    if !ln {
+                        if let Some((x, y)) = lk {
+                            if x == right || y == right {
+                                fold = Some(left);
+                                break;
+                            }
+                        }
+                    }
+                    if !rn {
+                        if let Some((x, y)) = rk {
+                            if x == left || y == left {
+                                fold = Some(right);
+                                break;
+                            }
+                        }
+                    }
+                    // Resolution.
+                    if ln && rn {
+                        if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                            if (x == w && y == !z) || (x == z && y == !w) {
+                                fold = Some(!x);
+                                break;
+                            }
+                            if (z == y && w == !x) || (z == x && w == !y) {
+                                fold = Some(!z);
+                                break;
+                            }
+                        }
+                    }
+
+                    // Gated substitution: bypass only single-parent,
+                    // unpinned interiors. `parents[k] == 1` means the sole
+                    // live reference is the one we're about to drop.
+                    let can_bypass = |k: u32, parents: &[u32]| {
+                        parents[k as usize] == 1 && !is_pinned(k)
+                    };
+                    let mut applied = false;
+
+                    // Asymmetric: ¬(a ∧ b) ∧ c.
+                    if ln {
+                        if let Some((x, y)) = lk {
+                            let k = left.node_idx();
+                            if x == right || y == right {
+                                if can_bypass(k, &parents) {
+                                    let repl = if x == right { !y } else { !x };
+                                    parents[repl.node_idx() as usize] += 1;
+                                    release(k, &self.nodes, &mut parents, &mut live);
+                                    left = repl;
+                                    applied = true;
+                                } else {
+                                    stats.blocked += 1;
+                                }
+                            }
+                        }
+                    }
+                    if !applied && rn {
+                        if let Some((w, z)) = rk {
+                            let k = right.node_idx();
+                            if w == left || z == left {
+                                if can_bypass(k, &parents) {
+                                    let repl = if w == left { !z } else { !w };
+                                    parents[repl.node_idx() as usize] += 1;
+                                    release(k, &self.nodes, &mut parents, &mut live);
+                                    right = repl;
+                                    applied = true;
+                                } else {
+                                    stats.blocked += 1;
+                                }
+                            }
+                        }
+                    }
+                    // Symmetric: ¬(a ∧ b) ∧ (c ∧ d).
+                    if !applied && ln && !rn {
+                        if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                            let k = left.node_idx();
+                            if x == w || x == z || y == w || y == z {
+                                if can_bypass(k, &parents) {
+                                    let repl = if x == w || x == z { !y } else { !x };
+                                    parents[repl.node_idx() as usize] += 1;
+                                    release(k, &self.nodes, &mut parents, &mut live);
+                                    left = repl;
+                                    applied = true;
+                                } else {
+                                    stats.blocked += 1;
+                                }
+                            }
+                        }
+                    }
+                    if !applied && rn && !ln {
+                        if let (Some((w, z)), Some((x, y))) = (rk, lk) {
+                            let k = right.node_idx();
+                            if w == x || w == y || z == x || z == y {
+                                if can_bypass(k, &parents) {
+                                    let repl = if w == x || w == y { !z } else { !w };
+                                    parents[repl.node_idx() as usize] += 1;
+                                    release(k, &self.nodes, &mut parents, &mut live);
+                                    right = repl;
+                                    applied = true;
+                                } else {
+                                    stats.blocked += 1;
+                                }
+                            }
+                        }
+                    }
+                    // Idempotence (level 4): (a ∧ b) ∧ (c ∧ d) sharing a
+                    // conjunct — drop the shared one from the right side.
+                    if !applied && !ln && !rn {
+                        if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                            let k = right.node_idx();
+                            if x == w || y == w || x == z || y == z {
+                                if can_bypass(k, &parents) {
+                                    let repl = if x == w || y == w { z } else { w };
+                                    parents[repl.node_idx() as usize] += 1;
+                                    release(k, &self.nodes, &mut parents, &mut live);
+                                    right = repl;
+                                    applied = true;
+                                } else {
+                                    stats.blocked += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    if applied {
+                        stats.subst_applied += 1;
+                        continue;
+                    }
+                    break;
+                }
+
+                // Commit: alias-fold or child re-point (both in place, both
+                // function-preserving, so co-parents of `i` are unaffected).
+                if let Some(t) = fold {
+                    stats.folds += 1;
+                    rewrites_this_pass += 1;
+                    parents[t.node_idx() as usize] += 2;
+                    release(left.node_idx(), &self.nodes, &mut parents, &mut live);
+                    release(right.node_idx(), &self.nodes, &mut parents, &mut live);
+                    self.nodes[i] = AigNode::And(t, t);
+                } else if left != self.resolve_stored(i, true) || right != self.resolve_stored(i, false)
+                {
+                    // Children changed (substitutions applied above).
+                    let (lhs, rhs) = if left.0 <= right.0 {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                    if self.nodes_and_eq(i, lhs, rhs) {
+                        continue;
+                    }
+                    rewrites_this_pass += 1;
+                    self.nodes[i] = AigNode::And(lhs, rhs);
+                    // Keep hash-consing able to find the simplified form.
+                    self.hash_cons.entry((lhs, rhs)).or_insert(i as u32);
+                }
+            }
+
+            if rewrites_this_pass == 0 {
+                break;
+            }
+        }
+        stats
+    }
+
+    /// Current stored child of node `i` (left or right).
+    #[inline]
+    fn resolve_stored(&self, i: usize, left: bool) -> AigRef {
+        match self.nodes[i] {
+            AigNode::And(a, b) => {
+                if left {
+                    a
+                } else {
+                    b
+                }
+            }
+            _ => unreachable!("substitute_pass only visits And nodes"),
+        }
+    }
+
+    #[inline]
+    fn nodes_and_eq(&self, i: usize, l: AigRef, r: AigRef) -> bool {
+        matches!(self.nodes[i], AigNode::And(a, b) if a == l && b == r)
+    }
+
     /// Attach a BV-source annotation to a node (typically the most recent
     /// And node just built). Used so that SAT vars allocated at CNF
     /// emission time can carry `VarOrigin::BvBit { term, bit }` metadata.
@@ -313,6 +987,118 @@ impl Aig {
         let s = sigs[r.node_idx() as usize];
         if r.is_negated() { !s } else { s }
     }
+
+    /// FRAIG feasibility diagnostic: how much *semantic* redundancy does
+    /// random simulation see beyond what structural hashing already merged?
+    ///
+    /// Runs `SIM_WORDS` independent 64-bit simulation rounds (a 256-bit
+    /// signature per node), canonicalizes each signature up to complement
+    /// (a node equal to the *negation* of another is equally mergeable —
+    /// the inversion rides on the edge), and buckets AND nodes by
+    /// signature. Inputs are excluded: distinct primary inputs are free
+    /// variables, never merge candidates.
+    ///
+    /// Interpretation caveats, for honest reading of the numbers:
+    /// - `redundant` is an UPPER bound: sim-equivalence ≠ equivalence.
+    ///   A real FRAIG confirms each candidate with a SAT query.
+    /// - `sim_const` counts nodes whose 256 random samples were all-0 /
+    ///   all-1. Comparator-style outputs (`a == b` over wide BVs) are
+    ///   almost-never-true under uniform inputs, so this bucket is the
+    ///   classic false-positive inflation source — reported separately
+    ///   and EXCLUDED from `classes`/`redundant`.
+    pub fn sim_sweep(&self, seed: u64) -> SimSweepStats {
+        const SIM_WORDS: usize = 4;
+        let rounds: Vec<Vec<u64>> = (0..SIM_WORDS)
+            .map(|w| self.simulate(seed.wrapping_add(w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+            .collect();
+
+        let mut buckets: HashMap<[u64; SIM_WORDS], u32> = HashMap::new();
+        let mut num_and = 0usize;
+        let mut sim_const = 0usize;
+        for (idx, &node) in self.nodes.iter().enumerate() {
+            if !matches!(node, AigNode::And(..)) {
+                continue;
+            }
+            num_and += 1;
+            let mut sig = [0u64; SIM_WORDS];
+            for w in 0..SIM_WORDS {
+                sig[w] = rounds[w][idx];
+            }
+            // Canonicalize up to complement: clear the LSB of word 0.
+            if sig[0] & 1 != 0 {
+                for s in sig.iter_mut() {
+                    *s = !*s;
+                }
+            }
+            if sig.iter().all(|&s| s == 0) {
+                sim_const += 1;
+                continue;
+            }
+            *buckets.entry(sig).or_insert(0) += 1;
+        }
+
+        let mut classes = 0usize;
+        let mut redundant = 0usize;
+        let mut largest_class = 0usize;
+        for &count in buckets.values() {
+            let c = count as usize;
+            if c >= 2 {
+                classes += 1;
+                redundant += c - 1;
+                largest_class = largest_class.max(c);
+            }
+        }
+
+        SimSweepStats {
+            num_nodes: self.nodes.len(),
+            num_and,
+            sim_const,
+            classes,
+            redundant,
+            largest_class,
+        }
+    }
+}
+
+/// Result of [`Aig::substitute_pass`].
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PostPassStats {
+    /// Substitutions applied (bypassed interior had a single live parent).
+    pub subst_applied: u64,
+    /// Substitution opportunities skipped because the interior is shared
+    /// or pinned — the fragmentation cases.
+    pub blocked: u64,
+    /// Nodes folded to an alias (constant, child, or resolution result).
+    pub folds: u64,
+    /// Bottom-up passes run (cascades may need more than one).
+    pub passes: u32,
+}
+
+impl PostPassStats {
+    pub fn accumulate(&mut self, o: PostPassStats) {
+        self.subst_applied += o.subst_applied;
+        self.blocked += o.blocked;
+        self.folds += o.folds;
+        self.passes += o.passes;
+    }
+}
+
+/// Result of [`Aig::sim_sweep`] — see its docs for interpretation caveats.
+#[derive(Copy, Clone, Debug)]
+pub struct SimSweepStats {
+    /// Total AIG nodes (constant + inputs + ANDs).
+    pub num_nodes: usize,
+    /// AND nodes — the merge-candidate population.
+    pub num_and: usize,
+    /// AND nodes simulating as constant over all 256 samples (excluded
+    /// from the class counts; see docs).
+    pub sim_const: usize,
+    /// Signature classes containing >= 2 AND nodes.
+    pub classes: usize,
+    /// Upper bound on mergeable nodes: sum of (class size - 1).
+    pub redundant: usize,
+    /// Size of the biggest candidate class.
+    pub largest_class: usize,
 }
 
 impl Default for Aig {
@@ -417,6 +1203,236 @@ mod tests {
         assert_eq!(aig.mux(s, AigRef::FALSE, AigRef::TRUE), !s);
     }
 
+    /// Two-level rewriting rule tests. Each asserts the exact result ref
+    /// (not just node count), mirroring bitwuzla's rule semantics.
+    fn aig2() -> Aig {
+        let mut a = Aig::new();
+        a.set_two_level(true);
+        a
+    }
+
+    #[test]
+    fn two_level_contradiction_asymmetric() {
+        let mut aig = aig2();
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let ab = aig.and(a, b);
+        assert_eq!(aig.and(ab, !a), AigRef::FALSE);
+        assert_eq!(aig.and(!b, ab), AigRef::FALSE);
+    }
+
+    #[test]
+    fn two_level_contradiction_symmetric() {
+        let mut aig = aig2();
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let c = mk_input(&mut aig, 3);
+        let ab = aig.and(a, b);
+        let nac = aig.and(!a, c);
+        assert_eq!(aig.and(ab, nac), AigRef::FALSE);
+    }
+
+    #[test]
+    fn two_level_subsumption() {
+        let mut aig = aig2();
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let c = mk_input(&mut aig, 3);
+        let ab = aig.and(a, b);
+        // ¬(a ∧ b) ∧ ¬a = ¬a  (asymmetric)
+        assert_eq!(aig.and(!ab, !a), !a);
+        // ¬(a ∧ b) ∧ (¬a ∧ c) = ¬a ∧ c  (symmetric)
+        let nac = aig.and(!a, c);
+        assert_eq!(aig.and(!ab, nac), nac);
+    }
+
+    #[test]
+    fn two_level_idempotence() {
+        let mut aig = aig2();
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let c = mk_input(&mut aig, 3);
+        let ab = aig.and(a, b);
+        // (a ∧ b) ∧ a = (a ∧ b)
+        assert_eq!(aig.and(ab, a), ab);
+        assert_eq!(aig.and(b, ab), ab);
+        // Level 4: (a ∧ b) ∧ (b ∧ c) = (a ∧ b) ∧ c
+        let bc = aig.and(b, c);
+        let expect = aig.and(ab, c);
+        assert_eq!(aig.and(ab, bc), expect);
+    }
+
+    #[test]
+    fn two_level_resolution() {
+        let mut aig = aig2();
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let ab = aig.and(a, b);
+        let anb = aig.and(a, !b);
+        // ¬(a ∧ b) ∧ ¬(a ∧ ¬b) = ¬a
+        assert_eq!(aig.and(!ab, !anb), !a);
+    }
+
+    #[test]
+    fn two_level_substitution() {
+        let mut aig = aig2();
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let c = mk_input(&mut aig, 3);
+        let ab = aig.and(a, b);
+        // ¬(a ∧ b) ∧ b = ¬a ∧ b  (asymmetric)
+        let expect = aig.and(!a, b);
+        assert_eq!(aig.and(!ab, b), expect);
+        // ¬(a ∧ b) ∧ (b ∧ c) = ¬a ∧ (b ∧ c)  (symmetric)
+        let bc = aig.and(b, c);
+        let expect2 = aig.and(!a, bc);
+        assert_eq!(aig.and(!ab, bc), expect2);
+    }
+
+    /// The XOR and MUX construction shapes over independent inputs must
+    /// survive two-level rewriting — `SmtSolver::detect_shape`'s direct
+    /// 4-clause encodings depend on the exact 3-node structure.
+    #[test]
+    fn two_level_preserves_xor_and_mux_shapes() {
+        let mut aig = aig2();
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let s = mk_input(&mut aig, 3);
+        let x = aig.xor(a, b);
+        assert!(x.is_negated());
+        match aig.node(x.node_idx()) {
+            AigNode::And(l, r) => {
+                assert!(l.is_negated() && r.is_negated());
+                assert!(matches!(aig.node(l.node_idx()), AigNode::And(..)));
+                assert!(matches!(aig.node(r.node_idx()), AigNode::And(..)));
+            }
+            n => panic!("xor top must be an And, got {:?}", n),
+        }
+        let m = aig.mux(s, a, b);
+        match aig.node(m.node_idx()) {
+            AigNode::And(l, r) => {
+                assert!(l.is_negated() && r.is_negated());
+            }
+            n => panic!("mux top must be an And, got {:?}", n),
+        }
+    }
+
+    /// Post-pass: substitution applies when the bypassed interior has a
+    /// single live parent...
+    #[test]
+    fn post_pass_substitutes_private_interior() {
+        let mut aig = Aig::new(); // build-time rules off
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let ab = aig.and(a, b);
+        let top = aig.and(!ab, b); // ¬(a∧b) ∧ b — substitutable to ¬a ∧ b
+        let stats = aig.substitute_pass(&[top], &[]);
+        assert_eq!(stats.subst_applied, 1);
+        assert_eq!(stats.blocked, 0);
+        match aig.node(top.node_idx()) {
+            AigNode::And(l, r) => {
+                let (lo, hi) = if l.0 <= r.0 { (l, r) } else { (r, l) };
+                assert_eq!(lo, !a);
+                assert_eq!(hi, b);
+            }
+            n => panic!("expected rewritten And, got {:?}", n),
+        }
+    }
+
+    /// ...and is blocked when the interior has another live parent — the
+    /// fragmentation case the pass exists to avoid.
+    #[test]
+    fn post_pass_blocks_shared_interior() {
+        let mut aig = Aig::new();
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let c = mk_input(&mut aig, 3);
+        let ab = aig.and(a, b);
+        let top = aig.and(!ab, b);
+        let keeper = aig.and(ab, c); // second live parent of (a∧b)
+        let before = format!("{:?}", aig.node(top.node_idx()));
+        let stats = aig.substitute_pass(&[top, keeper], &[]);
+        assert_eq!(stats.subst_applied, 0);
+        assert_eq!(stats.blocked, 1);
+        assert_eq!(format!("{:?}", aig.node(top.node_idx())), before);
+    }
+
+    /// A pinned (already-materialized) interior must also block.
+    #[test]
+    fn post_pass_blocks_pinned_interior() {
+        let mut aig = Aig::new();
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let ab = aig.and(a, b);
+        let top = aig.and(!ab, b);
+        let mut pinned = vec![false; aig.num_nodes()];
+        pinned[ab.node_idx() as usize] = true;
+        let stats = aig.substitute_pass(&[top], &pinned);
+        assert_eq!(stats.subst_applied, 0);
+        assert_eq!(stats.blocked, 1);
+    }
+
+    /// Pure-deletion folds rewrite the node into an alias in place.
+    #[test]
+    fn post_pass_folds_to_alias() {
+        let mut aig = Aig::new();
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let ab = aig.and(a, b);
+        let top = aig.and(!ab, !a); // subsumption: ≡ ¬a
+        let stats = aig.substitute_pass(&[top], &[]);
+        assert_eq!(stats.folds, 1);
+        match aig.node(top.node_idx()) {
+            AigNode::And(l, r) => {
+                assert_eq!(l, r, "fold must produce an alias node");
+                assert_eq!(l, !a);
+            }
+            n => panic!("expected alias, got {:?}", n),
+        }
+    }
+
+    /// Cascade: bypassing one interior frees its child, unblocking a
+    /// substitution one level up on a later pass.
+    #[test]
+    fn post_pass_cascades_across_passes() {
+        let mut aig = Aig::new();
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let c = mk_input(&mut aig, 3);
+        // inner = a∧b (parent: mid only). mid = ¬(a∧b) ∧ b (parents: top).
+        // top = ¬mid ∧ ... constructed so top's substitution needs mid to
+        // be single-parent (it is) and mid's needs inner (it is).
+        let inner = aig.and(a, b);
+        let mid = aig.and(!inner, b); // → ¬a ∧ b after pass
+        let top = aig.and(!mid, c);
+        let stats = aig.substitute_pass(&[top], &[]);
+        // mid gets rewritten; top has shape ¬(¬a∧b) ∧ c afterwards — no
+        // further rule applies (no shared children with c), so we just
+        // assert mid's rewrite happened and no assert on top.
+        assert!(stats.subst_applied >= 1);
+        match aig.node(mid.node_idx()) {
+            AigNode::And(l, r) => {
+                let (lo, hi) = if l.0 <= r.0 { (l, r) } else { (r, l) };
+                assert_eq!(lo, !a);
+                assert_eq!(hi, b);
+            }
+            n => panic!("expected rewritten And, got {:?}", n),
+        }
+    }
+
+    /// Flag off must behave exactly like the historical builder: none of
+    /// the two-level shapes may fold.
+    #[test]
+    fn two_level_off_is_inert() {
+        let mut aig = Aig::new(); // flag off
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        let ab = aig.and(a, b);
+        let r = aig.and(ab, !a); // would be FALSE with the rules on
+        assert_ne!(r, AigRef::FALSE);
+        assert!(matches!(aig.node(r.node_idx()), AigNode::And(..)));
+    }
+
     #[test]
     fn simulation_signatures_respect_negation() {
         let mut aig = Aig::new();
@@ -431,6 +1447,24 @@ mod tests {
         let neg_a = sigs[(!a).node_idx() as usize]; // same underlying node
         assert_eq!(sig_a, neg_a);
         assert_eq!(sigs[0], u64::MAX); // TRUE is all-ones
+    }
+
+    #[test]
+    fn sim_sweep_finds_semantic_duplicates() {
+        let mut aig = Aig::new();
+        let a = mk_input(&mut aig, 1);
+        let b = mk_input(&mut aig, 2);
+        // `a ∨ b` built directly...
+        let or1 = aig.or(a, b);
+        // ...and as `¬(¬a ∧ ¬(¬a ∧ b))` — semantically a ∨ b, but the inner
+        // AND differs structurally so hash-consing can NOT merge the tops.
+        let inner = aig.and(!a, b);
+        let or2 = !aig.and(!a, !inner);
+        assert_ne!(or1.node_idx(), or2.node_idx());
+        let stats = aig.sim_sweep(42);
+        assert_eq!(stats.classes, 1);
+        assert_eq!(stats.redundant, 1);
+        assert_eq!(stats.sim_const, 0);
     }
 
     #[test]

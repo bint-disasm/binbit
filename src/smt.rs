@@ -29,6 +29,7 @@
 //! Comparisons: eq/ne, ult/ule/ugt/uge (unsigned), slt/sle/sgt/sge (signed).
 
 use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 
 use crate::aig::{Aig, AigNode, AigRef};
 use crate::bv::{BoolOp, BoolTerm, BvContext, BvOp, BvTerm, mask};
@@ -113,6 +114,10 @@ pub struct SmtSolverStats {
     pub pp_eliminated: u64,
     /// Clauses removed by (self-)subsumption during CNF preprocessing.
     pub pp_subsumed: u64,
+    /// VE-eliminated AIG nodes later re-materialized (fresh var + clauses,
+    /// typically by an assumption probe) — each is wasted elimination work
+    /// plus CNF bloat. High values ⇒ run that phase with `set_bve(false)`.
+    pub pp_remat: u64,
     /// Literals removed by strengthening during CNF preprocessing.
     pub pp_strengthened: u64,
 }
@@ -183,6 +188,47 @@ pub struct SmtSolver {
     /// their AIG nodes (a later consumer then re-materializes the node
     /// under a fresh variable with fresh defining clauses).
     lit_node: Vec<u32>,
+
+    /// FRAIG-merged alias nodes bound to another node's SAT lit: var idx →
+    /// the alias node indices sharing it. `lit_node` is one-to-one and
+    /// stays pointing at the node that emitted the defining clauses; this
+    /// side map lets `commit_batch` invalidate every alias binding when
+    /// bounded VE eliminates the shared variable (else an alias would keep
+    /// serving a lit whose defining clauses are gone — unsound).
+    aig_lit_aliases: HashMap<u32, Vec<u32>>,
+
+    /// FRAIG sweep (off by default — changes search trajectory): prove
+    /// sim-equivalence candidates in the batch AIG with bounded SAT
+    /// queries and merge them before CNF emission. See `crate::fraig`.
+    fraig_enabled: bool,
+    /// Nodes below this index were candidates in a previous sweep.
+    fraig_swept_upto: u32,
+    fraig_stats: crate::fraig::FraigStats,
+    fraig_time: std::time::Duration,
+
+    /// Sharing-aware post-build substitution pass (`--aig2-post`): the
+    /// two-level substitution family applied only where it cannot strand
+    /// a co-parent. See `Aig::substitute_pass`.
+    aig2_post: bool,
+    aig2_post_stats: crate::aig::PostPassStats,
+
+    /// AIG nodes whose SAT binding was dropped by bounded VE. If a later
+    /// consumer (typically an assumption probe under bint's
+    /// solve_under_assumptions usage) re-materializes one, the SAT core
+    /// ends up holding BOTH the elimination resolvents and the fresh gate
+    /// clauses — VE work wasted plus CNF bloat. `pp_remat` counts these
+    /// re-materializations; a high count on a workload means VE is
+    /// dissolving cones the assumptions keep probing and should be
+    /// disabled for that phase (`set_bve(false)`).
+    elim_nodes: HashSet<u32>,
+    pp_remat: u64,
+
+    /// Gate-mix counters: how CNF emission encoded each materialized gate.
+    /// Diagnostic for encoding-shape changes (e.g. AIG rewriting breaking
+    /// the XOR/MUX pattern paths and demoting them to generic ANDs).
+    stats_and_gates: u64,
+    stats_xor_gates: u64,
+    stats_mux_gates: u64,
 
     /// When `Some`, clause emission is buffered here instead of going to
     /// the SAT core — active during `flush_pending` so the whole batch can
@@ -334,6 +380,18 @@ impl SmtSolver {
             aig: Aig::new(),
             aig_lit: Vec::new(),
             lit_node: Vec::new(),
+            aig_lit_aliases: HashMap::default(),
+            fraig_enabled: false,
+            fraig_swept_upto: 0,
+            fraig_stats: crate::fraig::FraigStats::default(),
+            fraig_time: std::time::Duration::ZERO,
+            stats_and_gates: 0,
+            stats_xor_gates: 0,
+            stats_mux_gates: 0,
+            aig2_post: false,
+            aig2_post_stats: crate::aig::PostPassStats::default(),
+            elim_nodes: HashSet::default(),
+            pp_remat: 0,
             cnf_buffer: None,
             bv_var_subst: HashMap::default(),
             subst_bool_memo: HashMap::default(),
@@ -405,6 +463,58 @@ impl SmtSolver {
     /// impact of the heuristic on a given workload.
     pub fn set_ite_branching_hints(&mut self, on: bool) {
         self.ite_branching_hints = on;
+    }
+
+    /// Enable/disable Brummayer-Biere two-level AIG rewriting in the
+    /// bitblaster's `and()` (see `Aig::set_two_level`). Off by default —
+    /// changes circuit structure and search trajectory.
+    pub fn set_aig_two_level(&mut self, on: bool) {
+        self.aig.set_two_level(on);
+        // Safe-subset escape hatch for mechanism experiments: skip the
+        // node-bypassing substitution/idem-4 families.
+        if std::env::var_os("BINBIT_AIG2_NOSUBST").is_some() {
+            self.aig.set_two_level_subst(false);
+        }
+    }
+
+    /// Sharing-aware two-level rewriting: construction-time safe subset
+    /// (pure deletions) + a post-build substitution pass gated on parent
+    /// counts, so a substitution never bypasses a shared interior node.
+    /// The compatible successor to plain `set_aig_two_level`.
+    pub fn set_aig_two_level_post(&mut self, on: bool) {
+        self.aig.set_two_level(on);
+        self.aig.set_two_level_subst(false);
+        self.aig2_post = on;
+    }
+
+    pub fn aig2_post_report(&self) -> crate::aig::PostPassStats {
+        self.aig2_post_stats
+    }
+
+    /// Enable/disable the flush-time FRAIG sweep (see `crate::fraig`).
+    /// Off by default: merging changes CNF shape and therefore search
+    /// trajectory — benchmark per-corpus before adopting.
+    pub fn set_fraig(&mut self, on: bool) {
+        self.fraig_enabled = on;
+    }
+
+    /// Cumulative FRAIG sweep statistics and wall-clock time spent.
+    pub fn fraig_report(&self) -> (crate::fraig::FraigStats, std::time::Duration) {
+        (self.fraig_stats, self.fraig_time)
+    }
+
+    /// Two-level rewrite rule firings by family (see `Aig::rw_counts`).
+    pub fn aig_rw_counts(&self) -> [u64; 6] {
+        self.aig.rw_counts
+    }
+
+    /// Gate-mix report: (plain AND, XOR-pattern, MUX-pattern) gates emitted.
+    pub fn gate_mix(&self) -> (u64, u64, u64) {
+        (
+            self.stats_and_gates,
+            self.stats_xor_gates,
+            self.stats_mux_gates,
+        )
     }
 
     // ---------- Delegating term builders ----------
@@ -1969,6 +2079,49 @@ impl SmtSolver {
                 }
             }
 
+            // Sharing-aware substitution pass (gated): bitblast the batch
+            // purely (memoized — the assert loop below re-hits the caches),
+            // then rewrite with full parent-count knowledge so substitution
+            // never bypasses a shared interior. Must run before
+            // materialization so emission sees the rewritten structure.
+            if self.aig2_post {
+                let mut roots: Vec<crate::aig::AigRef> = Vec::new();
+                for (_, terms) in &batch {
+                    for &t in terms {
+                        roots.push(self.bitblast_bool(t));
+                    }
+                }
+                let pinned: Vec<bool> = self.aig_lit.iter().map(|l| l.is_some()).collect();
+                let stats = self.aig.substitute_pass(&roots, &pinned);
+                self.aig2_post_stats.accumulate(stats);
+            }
+
+            // FRAIG sweep (gated): bitblast the whole batch into the AIG
+            // purely first (bitblasting emits no CNF; these calls are
+            // memoized, so the assert loop below re-hits the caches), then
+            // prove-and-merge equivalence candidates so materialization
+            // reuses one SAT lit per proven class. Unconditional
+            // equivalences — sound across scopes and later assertions.
+            if self.fraig_enabled {
+                let t0 = std::time::Instant::now();
+                for (_, terms) in &batch {
+                    for &t in terms {
+                        let _ = self.bitblast_bool(t);
+                    }
+                }
+                let start = self.fraig_swept_upto;
+                let stats = crate::fraig::sweep(
+                    &mut self.aig,
+                    start,
+                    fraig_budget("BINBIT_FRAIG_MAXQ", 20_000),
+                    fraig_budget("BINBIT_FRAIG_CONFL", 100),
+                    0x5EED_CAFE_F00D_D00D ^ start as u64,
+                );
+                self.fraig_swept_upto = self.aig.num_nodes() as u32;
+                self.fraig_stats.accumulate(stats);
+                self.fraig_time += t0.elapsed();
+            }
+
             self.cnf_buffer = Some(Vec::new());
             for (depth, terms) in batch {
                 let act_lit = if depth == 0 {
@@ -2140,6 +2293,15 @@ impl SmtSolver {
             if node != u32::MAX {
                 self.aig_lit[node as usize] = None;
                 self.lit_node[ov] = u32::MAX;
+                self.elim_nodes.insert(node);
+            }
+            // FRAIG alias nodes bound to this variable's lit must be
+            // invalidated too — their defining clauses are the ones just
+            // eliminated. They re-materialize through their merge target.
+            if let Some(aliases) = self.aig_lit_aliases.remove(&(ov as u32)) {
+                for n in aliases {
+                    self.aig_lit[n as usize] = None;
+                }
             }
             // The variable has no clauses left — exclude it from branching
             // so model completion doesn't pay a decision for it.
@@ -2167,6 +2329,12 @@ impl SmtSolver {
     /// Post-flush SAT statistics — useful for profiling. Only meaningful
     /// after `solve*` has flushed the pending queue; before that, the
     /// numbers reflect only clauses emitted by prior solves.
+    /// Run the FRAIG feasibility diagnostic over the accumulated AIG —
+    /// see [`Aig::sim_sweep`] for what the numbers mean.
+    pub fn fraig_diagnostic(&self) -> crate::aig::SimSweepStats {
+        self.aig.sim_sweep(0x5EED_CAFE_F00D_D00D)
+    }
+
     pub fn sat_stats(&self) -> SmtSolverStats {
         // Count BV/Bool vars that got merged into another root by alias_*.
         let bv_aliased = self
@@ -2199,6 +2367,7 @@ impl SmtSolver {
             pp_substituted: self.pp_substituted,
             pp_eliminated: self.pp_eliminated,
             pp_subsumed: self.pp_subsumed,
+            pp_remat: self.pp_remat,
             pp_strengthened: self.pp_strengthened,
         }
     }
@@ -2868,6 +3037,21 @@ impl SmtSolver {
                         self.set_node_lit(top, lit);
                         worklist.pop();
                     }
+                    AigNode::And(a, b) if a == b => {
+                        // FRAIG alias node (`Aig::merge_equiv`): the node is
+                        // a proven copy of `a` — bind it to a's lit, emit
+                        // nothing. Normal construction can't produce
+                        // And(x, x) (the builder folds it), so this shape
+                        // is unambiguous.
+                        match self.node_lit(a.node_idx()) {
+                            Some(base) => {
+                                let l = if a.is_negated() { !base } else { base };
+                                self.alias_node_lit(top, l);
+                                worklist.pop();
+                            }
+                            None => worklist.push(a.node_idx()),
+                        }
+                    }
                     AigNode::And(a, b) => {
                         // Plain-And shortcut: if both children already have
                         // lits, the 3-clause encoding is the cheapest form —
@@ -2960,6 +3144,26 @@ impl SmtSolver {
         }
         self.aig_lit[idx as usize] = Some(l);
         self.lit_node[l.var_idx()] = idx;
+        // VE dissolved this node once and now something re-materialized it
+        // — the elimination was wasted work (see `elim_nodes`).
+        if !self.elim_nodes.is_empty() && self.elim_nodes.remove(&idx) {
+            self.pp_remat += 1;
+        }
+    }
+
+    /// Bind a FRAIG alias node to another node's (possibly negated) lit
+    /// WITHOUT claiming `lit_node` — that stays pointing at the node whose
+    /// materialization emitted the variable's defining clauses. The side
+    /// map lets variable elimination invalidate every alias binding too.
+    fn alias_node_lit(&mut self, idx: u32, l: Lit) {
+        if self.aig_lit.len() <= idx as usize {
+            self.aig_lit.resize(idx as usize + 1, None);
+        }
+        self.aig_lit[idx as usize] = Some(l);
+        self.aig_lit_aliases
+            .entry(l.var_idx() as u32)
+            .or_default()
+            .push(idx);
     }
 
     /// Signed lookup: the node behind `r` must already have a lit.
@@ -3010,6 +3214,7 @@ impl SmtSolver {
 
     /// Emit `o ↔ (al ∧ bl)` for node `idx` (3 clauses, 1 var).
     fn emit_and_gate(&mut self, idx: u32, al: Lit, bl: Lit) {
+        self.stats_and_gates += 1;
         let origin = VarOrigin::GateOut {
             gate: GateKind::And,
             term: self.aig.src_term(idx),
@@ -3025,6 +3230,7 @@ impl SmtSolver {
     /// Emit `o ↔ (xl ⊕ yl)` for node `idx` (4 clauses, 1 var). The node
     /// itself IS the xor of the operands (see `detect_shape`).
     fn emit_xor_gate(&mut self, idx: u32, xl: Lit, yl: Lit) {
+        self.stats_xor_gates += 1;
         let origin = VarOrigin::GateOut {
             gate: GateKind::Xor,
             term: self.aig.src_term(idx),
@@ -3042,6 +3248,7 @@ impl SmtSolver {
     /// The fresh var `o` encodes the mux VALUE; the node's stored lit is
     /// therefore `¬o`. (4 clauses, 1 var.)
     fn emit_mux_gate(&mut self, idx: u32, sl: Lit, tl: Lit, el: Lit) {
+        self.stats_mux_gates += 1;
         let origin = VarOrigin::GateOut {
             gate: GateKind::Ite,
             term: self.aig.src_term(idx),
@@ -3952,6 +4159,17 @@ impl Default for SmtSolver {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// FRAIG sweep budget with an env override — lets budget experiments run
+/// without a recompile (`BINBIT_FRAIG_MAXQ`, `BINBIT_FRAIG_CONFL`). Cold
+/// path: read once per flush.
+fn fraig_budget(env: &str, default: u64) -> u64 {
+    std::env::var(env)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+        .max(1)
 }
 
 /// Flip the sign bit (MSB) of a bitblasted BV — used for signed comparisons.
