@@ -67,6 +67,199 @@ impl Watcher {
         debug_assert!(!self.is_binary());
         self.cref
     }
+
+    /// Filler for reserved-but-unused arena slots.
+    const EMPTY: Watcher = Watcher {
+        cref: ClauseRef(WATCH_BINARY_FLAG),
+        blocker: Lit(0),
+    };
+}
+
+/// Flat arena holding every literal's watch list in one shared buffer.
+/// Replaces `Vec<Vec<Watcher>>`: literal `l`'s watchers live at
+/// `data[offs[l] .. offs[l] + lens[l]]` with `caps[l]` slots reserved.
+///
+/// Why: with millions of literals, per-list heap allocations scatter
+/// watcher data across the address space (one malloc chunk per literal),
+/// and propagate visits one list per trail literal — allocator overhead
+/// and TLB pressure show up on memory-bound instances. One buffer keeps
+/// the data dense; the u32 header arrays pack 16 literals per cache line
+/// versus 24-byte `Vec` headers.
+///
+/// Growth: a full list relocates to the end of the buffer with doubled
+/// capacity, abandoning its old region. `wasted` tracks abandoned slots;
+/// `maybe_defrag` (called from reduce_db, never during propagate) rebuilds
+/// the buffer dense in literal order. Per-list watcher ORDER is preserved
+/// by every operation — that is what keeps propagation order, and thus
+/// the search trajectory, bit-identical to the nested-Vec layout.
+struct WatchArena {
+    data: Vec<Watcher>,
+    offs: Vec<u32>,
+    lens: Vec<u32>,
+    caps: Vec<u32>,
+    wasted: usize,
+}
+
+impl WatchArena {
+    fn new() -> Self {
+        WatchArena {
+            data: Vec::new(),
+            offs: Vec::new(),
+            lens: Vec::new(),
+            caps: Vec::new(),
+            wasted: 0,
+        }
+    }
+
+    fn reserve(&mut self, num_lits: usize) {
+        self.offs.reserve(num_lits);
+        self.lens.reserve(num_lits);
+        self.caps.reserve(num_lits);
+        // Matches the initial 4-slot region every literal starts with.
+        self.data.reserve(num_lits * 4);
+    }
+
+    #[inline]
+    fn num_lits(&self) -> usize {
+        self.offs.len()
+    }
+
+    /// Register the next literal (two calls per variable), with the same
+    /// initial 4-slot capacity the nested-Vec layout used.
+    fn add_literal(&mut self) {
+        let off = self.data.len();
+        debug_assert!(off + 4 < u32::MAX as usize, "watch arena offset overflow");
+        self.data.resize(off + 4, Watcher::EMPTY);
+        self.offs.push(off as u32);
+        self.lens.push(0);
+        self.caps.push(4);
+    }
+
+    // The hot-path accessors mirror the old code's `get_unchecked` slice
+    // discipline: every literal index is < 2 * num_vars == offs.len() by
+    // construction, and cursors stay within the list's reserved region.
+
+    #[inline]
+    fn off(&self, lit: usize) -> usize {
+        debug_assert!(lit < self.offs.len());
+        // SAFETY: see above — lit is a valid literal index.
+        unsafe { *self.offs.get_unchecked(lit) as usize }
+    }
+
+    #[inline]
+    fn len(&self, lit: usize) -> usize {
+        debug_assert!(lit < self.lens.len());
+        // SAFETY: see above.
+        unsafe { *self.lens.get_unchecked(lit) as usize }
+    }
+
+    #[inline]
+    fn set_len(&mut self, lit: usize, n: usize) {
+        debug_assert!(lit < self.lens.len());
+        debug_assert!(n <= self.caps[lit] as usize);
+        // SAFETY: see above.
+        unsafe {
+            *self.lens.get_unchecked_mut(lit) = n as u32;
+        }
+    }
+
+    /// Base pointer of the shared buffer. Invalidated by any `push` (the
+    /// buffer may reallocate) — callers must re-fetch after pushing.
+    #[inline]
+    fn data_ptr(&mut self) -> *mut Watcher {
+        self.data.as_mut_ptr()
+    }
+
+    #[inline]
+    fn push(&mut self, lit: usize, w: Watcher) {
+        debug_assert!(lit < self.lens.len());
+        let n = self.lens[lit];
+        if n == self.caps[lit] {
+            self.grow(lit);
+        }
+        let idx = self.offs[lit] as usize + n as usize;
+        // SAFETY: the region [offs, offs + caps) is always fully resident
+        // in `data` (resize in add_literal / grow), and n < caps here.
+        unsafe {
+            *self.data.get_unchecked_mut(idx) = w;
+            *self.lens.get_unchecked_mut(lit) = n + 1;
+        }
+    }
+
+    /// Relocate `lit`'s list to the end of the buffer with doubled
+    /// capacity. Order-preserving; the old region becomes waste.
+    #[inline(never)]
+    fn grow(&mut self, lit: usize) {
+        let old_off = self.offs[lit] as usize;
+        let old_cap = self.caps[lit] as usize;
+        let n = self.lens[lit] as usize;
+        let new_cap = old_cap * 2;
+        let new_off = self.data.len();
+        debug_assert!(new_off + new_cap < u32::MAX as usize, "watch arena offset overflow");
+        self.data.resize(new_off + new_cap, Watcher::EMPTY);
+        // SAFETY: source and destination regions are disjoint (the new
+        // region was just appended past the old buffer contents).
+        unsafe {
+            let p = self.data.as_mut_ptr();
+            std::ptr::copy_nonoverlapping(p.add(old_off), p.add(new_off), n);
+        }
+        self.offs[lit] = new_off as u32;
+        self.caps[lit] = new_cap as u32;
+        self.wasted += old_cap;
+    }
+
+    /// This literal's live watchers as a slice.
+    #[inline]
+    fn list(&self, lit: usize) -> &[Watcher] {
+        let off = self.offs[lit] as usize;
+        let n = self.lens[lit] as usize;
+        &self.data[off..off + n]
+    }
+
+    #[inline]
+    fn list_mut(&mut self, lit: usize) -> &mut [Watcher] {
+        let off = self.offs[lit] as usize;
+        let n = self.lens[lit] as usize;
+        &mut self.data[off..off + n]
+    }
+
+    /// Order-preserving in-place filter of one literal's list.
+    fn retain<F: FnMut(&Watcher) -> bool>(&mut self, lit: usize, mut f: F) {
+        let off = self.offs[lit] as usize;
+        let n = self.lens[lit] as usize;
+        let mut w = 0usize;
+        for r in 0..n {
+            let x = self.data[off + r];
+            if f(&x) {
+                self.data[off + w] = x;
+                w += 1;
+            }
+        }
+        self.lens[lit] = w as u32;
+    }
+
+    /// Rebuild the buffer dense (literal order, per-list order preserved)
+    /// once a quarter of it is abandoned regions. Never called during
+    /// propagate — offsets are stable across a whole propagate() call.
+    fn maybe_defrag(&mut self) {
+        if self.wasted * 4 <= self.data.len() {
+            return;
+        }
+        let mut new_data: Vec<Watcher> = Vec::with_capacity(self.data.len() - self.wasted);
+        for lit in 0..self.offs.len() {
+            let off = self.offs[lit] as usize;
+            let n = self.lens[lit] as usize;
+            // Modest slack so lists don't relocate again immediately.
+            let cap = (n + (n >> 1)).max(4);
+            let new_off = new_data.len();
+            new_data.extend_from_slice(&self.data[off..off + n]);
+            new_data.resize(new_off + cap, Watcher::EMPTY);
+            self.offs[lit] = new_off as u32;
+            self.caps[lit] = cap as u32;
+        }
+        self.data = new_data;
+        self.wasted = 0;
+    }
 }
 
 /// Glucose-style adaptive restart policy. Replaces fixed Luby scheduling with
@@ -344,9 +537,10 @@ pub struct Solver {
     qhead: usize,
     trail_lim: Vec<usize>,
     // Unified watch lists: one list per literal, holding both binary and
-    // long-clause watchers (see `Watcher` for the layout). Replaces the
-    // older split `watches` / `bin_watches` pair.
-    watches: Vec<Vec<Watcher>>,
+    // long-clause watchers (see `Watcher` for the layout), all packed in
+    // one flat arena (see `WatchArena`). Replaces the older split
+    // `watches` / `bin_watches` pair and the nested `Vec<Vec<Watcher>>`.
+    watches: WatchArena,
 
     // === Warm — touched during analyze() and branch picking. ===
     activity: Vec<f64>,
@@ -440,7 +634,7 @@ impl Solver {
             trail: Vec::new(),
             qhead: 0,
             trail_lim: Vec::new(),
-            watches: Vec::new(),
+            watches: WatchArena::new(),
             activity: Vec::new(),
             polarity: Vec::new(),
             decision: Vec::new(),
@@ -528,11 +722,11 @@ impl Solver {
         self.decision.push(true);
         self.seen.push(false);
         self.lbd_stamp.push(0);
-        // One unified watch list per literal — two per variable. Prime each
-        // with a small capacity; most literals accumulate several watchers
-        // quickly, and reallocating from 0 → 1 → 2 → 4 adds up.
-        self.watches.push(Vec::with_capacity(4));
-        self.watches.push(Vec::with_capacity(4));
+        // One unified watch list per literal — two per variable. Each
+        // starts with a small reserved region in the arena; most literals
+        // accumulate several watchers quickly.
+        self.watches.add_literal();
+        self.watches.add_literal();
         self.order_heap.new_var();
         self.order_heap.insert(v.0, &self.activity);
         v
@@ -635,8 +829,8 @@ impl Solver {
             2 => {
                 // Binary: skip the arena, store inline as binary watchers
                 // in the same unified list used for long clauses.
-                self.watches[lits[0].idx()].push(Watcher::binary(lits[1]));
-                self.watches[lits[1].idx()].push(Watcher::binary(lits[0]));
+                self.watches.push(lits[0].idx(), Watcher::binary(lits[1]));
+                self.watches.push(lits[1].idx(), Watcher::binary(lits[0]));
                 true
             }
             _ => {
@@ -644,8 +838,8 @@ impl Solver {
                 let w1 = lits[1];
                 let cref = self.clauses.alloc(&lits, false);
                 self.num_clauses_total += 1;
-                self.watches[w0.idx()].push(Watcher::long(cref, w1));
-                self.watches[w1.idx()].push(Watcher::long(cref, w0));
+                self.watches.push(w0.idx(), Watcher::long(cref, w1));
+                self.watches.push(w1.idx(), Watcher::long(cref, w0));
                 true
             }
         }
@@ -729,12 +923,6 @@ impl Solver {
         let lit_value: &mut [LBool] = lit_value.as_mut_slice();
         let level: &mut [i32] = level.as_mut_slice();
         let reason: &mut [Reason] = reason.as_mut_slice();
-        // The OUTER watch table is likewise fixed-size during propagate:
-        // migrations push onto the INNER lists and the restore reassigns an
-        // inner list, but the outer `Vec<Vec<Watcher>>` never grows here.
-        // Slicing it removes the deref on every `get_unchecked_mut`.
-        let watches: &mut [Vec<Watcher>] = watches.as_mut_slice();
-
         'queue: while *qhead < trail.len() {
             // SAFETY: the loop guard just established `*qhead < trail.len()`.
             let p = unsafe { *trail.get_unchecked(*qhead) };
@@ -744,31 +932,28 @@ impl Solver {
             let false_lit = !p;
             let wl_idx = false_lit.idx();
 
-            // Detach this slot so long-clause migrations can push to other
-            // slots of `watches` without aliasing it. Binaries never
-            // migrate — they always get copied through to the write cursor.
+            // This literal's arena region. Two invariants make cursor-based
+            // in-place compaction sound without detaching the list:
             //
-            // SAFETY: every literal on the trail is a valid Lit, so its
-            // index is < 2 * num_vars == watches.len().
-            let mut ws = std::mem::take(unsafe { watches.get_unchecked_mut(wl_idx) });
+            // 1. No push ever targets `wl_idx` during this visit — a
+            //    migrated watch goes to a literal whose value is currently
+            //    non-False, and `false_lit` is False — so `off`, `n`, and
+            //    the entries under our cursors are only touched by us.
+            // 2. Pushes to OTHER lists may grow (and thus reallocate) the
+            //    shared buffer, so the raw base pointer is re-fetched after
+            //    every migration; `off` itself is stable (only a push to
+            //    `wl_idx` could relocate this region).
+            let off = watches.off(wl_idx);
+            let n = watches.len(wl_idx);
+            // SAFETY: [off, off + n) is this list's live region.
+            let mut base: *mut Watcher = unsafe { watches.data_ptr().add(off) };
+            let mut read = 0usize;
+            let mut write = 0usize;
 
-            // Two-cursor compaction: `read` walks forward consuming entries,
-            // `write` lags behind recording the survivors. Final length is
-            // `write.offset_from(start)`.
-            let start_ptr = ws.as_mut_ptr();
-            let mut read = start_ptr;
-            let mut write = start_ptr;
-            // SAFETY: ws.len() is the valid extent of the buffer; `add` stays
-            // within (or one past) the allocation as required by the API.
-            let end = unsafe { start_ptr.add(ws.len()) };
-
-            'watches: while read < end {
-                // SAFETY: `read < end` and `end == start + len`, so `read`
-                // points to an initialized Watcher within the buffer.
-                let w = unsafe { *read };
-                // SAFETY: after this advance, `read <= end`. Subsequent
-                // reads are guarded by the `read < end` loop condition.
-                read = unsafe { read.add(1) };
+            'watches: while read < n {
+                // SAFETY: read < n, within the live region.
+                let w = unsafe { *base.add(read) };
+                read += 1;
 
                 // Software prefetch of the *next* watcher's clause body
                 // AND of its blocker's `lit_value` slot. Both are off the
@@ -778,8 +963,8 @@ impl Solver {
                 // (2 × num_vars bytes) so its lookups regularly miss L1/L2
                 // on big formulas — pulling the next slot in early is
                 // measurable on long watch lists.
-                if read < end {
-                    let nw = unsafe { *read };
+                if read < n {
+                    let nw = unsafe { *base.add(read) };
                     if !nw.is_binary() {
                         clauses.prefetch(nw.long_cref());
                     }
@@ -795,9 +980,9 @@ impl Solver {
                     // Binary path: blocker == q. Binaries never migrate, so
                     // unconditionally copy through to the write cursor.
                     let q = w.blocker;
-                    // SAFETY: `write <= read - 1 < end`.
-                    unsafe { *write = w };
-                    write = unsafe { write.add(1) };
+                    // SAFETY: `write <= read - 1 < n`.
+                    unsafe { *base.add(write) = w };
+                    write += 1;
 
                     match bv {
                         LBool::True => {} // satisfied
@@ -815,18 +1000,13 @@ impl Solver {
                         LBool::False => {
                             // Both !p and q false — binary conflict. Copy
                             // remaining watchers and exit the queue loop.
-                            while read < end {
-                                unsafe {
-                                    *write = *read;
-                                    read = read.add(1);
-                                    write = write.add(1);
-                                }
+                            while read < n {
+                                // SAFETY: write < read < n, within the region.
+                                unsafe { *base.add(write) = *base.add(read) };
+                                read += 1;
+                                write += 1;
                             }
-                            // SAFETY: write is between start_ptr and end, all
-                            // entries in [start, write) are initialized.
-                            let new_len = unsafe { write.offset_from(start_ptr) } as usize;
-                            unsafe { ws.set_len(new_len) };
-                            unsafe { *watches.get_unchecked_mut(wl_idx) = ws };
+                            watches.set_len(wl_idx, write);
                             conflict = Some(PropConflict::Binary(false_lit, q));
                             break 'queue;
                         }
@@ -837,8 +1017,8 @@ impl Solver {
                 // Long-clause path. If the blocker is true, the clause is
                 // satisfied — keep the watch verbatim.
                 if bv == LBool::True {
-                    unsafe { *write = w };
-                    write = unsafe { write.add(1) };
+                    unsafe { *base.add(write) = w };
+                    write += 1;
                     continue 'watches;
                 }
 
@@ -886,8 +1066,8 @@ impl Solver {
 
                 if first_val == LBool::True {
                     // Refresh blocker hint and keep watch.
-                    unsafe { *write = Watcher::long(cref, first) };
-                    write = unsafe { write.add(1) };
+                    unsafe { *base.add(write) = Watcher::long(cref, first) };
+                    write += 1;
                     continue 'watches;
                 }
 
@@ -896,31 +1076,28 @@ impl Solver {
                     // swap with k so lk takes the watch and false_lit
                     // moves into the body.
                     clauses.swap_lits(cref, 1, k);
-                    // SAFETY: lk is a valid Lit, lk.idx() < watches.len().
-                    unsafe {
-                        watches
-                            .get_unchecked_mut(lk.idx())
-                            .push(Watcher::long(cref, first));
-                    }
+                    watches.push(lk.idx(), Watcher::long(cref, first));
+                    // The push may have grown + reallocated the arena
+                    // buffer; `off` is stable (invariant 1), the base
+                    // pointer is not.
+                    // SAFETY: off + n is still within this list's region.
+                    base = unsafe { watches.data_ptr().add(off) };
                     continue 'watches;
                 }
 
                 // No replacement watch — keep this one with refreshed blocker.
-                unsafe { *write = Watcher::long(cref, first) };
-                write = unsafe { write.add(1) };
+                unsafe { *base.add(write) = Watcher::long(cref, first) };
+                write += 1;
 
                 if first_val == LBool::False {
                     // Long-clause conflict. Copy remainder and exit.
-                    while read < end {
-                        unsafe {
-                            *write = *read;
-                            read = read.add(1);
-                            write = write.add(1);
-                        }
+                    while read < n {
+                        // SAFETY: write < read < n, within the region.
+                        unsafe { *base.add(write) = *base.add(read) };
+                        read += 1;
+                        write += 1;
                     }
-                    let new_len = unsafe { write.offset_from(start_ptr) } as usize;
-                    unsafe { ws.set_len(new_len) };
-                    unsafe { *watches.get_unchecked_mut(wl_idx) = ws };
+                    watches.set_len(wl_idx, write);
                     conflict = Some(PropConflict::Clause(cref));
                     break 'queue;
                 } else {
@@ -940,9 +1117,7 @@ impl Solver {
                 }
             }
 
-            let new_len = unsafe { write.offset_from(start_ptr) } as usize;
-            unsafe { ws.set_len(new_len) };
-            unsafe { *watches.get_unchecked_mut(wl_idx) = ws };
+            watches.set_len(wl_idx, write);
         }
 
         *stats_propagations += (*qhead - qhead_start) as u64;
@@ -1440,9 +1615,13 @@ impl Solver {
         // Binary watchers don't refer to the arena at all (their cref is a
         // sentinel), so they're always preserved.
         let clauses = &self.clauses;
-        for wl in &mut self.watches {
-            wl.retain(|w| w.is_binary() || !clauses.deleted(w.long_cref()));
+        for lit in 0..self.watches.num_lits() {
+            self.watches
+                .retain(lit, |w| w.is_binary() || !clauses.deleted(w.long_cref()));
         }
+        // Compact the watch arena if list relocations have abandoned enough
+        // of it. Safe here (never during propagate); order-preserving.
+        self.watches.maybe_defrag();
 
         // Compact the arena once a fifth of it is dead words. Deletion only
         // marks; without this the arena grows monotonically and live clauses
@@ -1494,8 +1673,8 @@ impl Solver {
         // everything already moved just gets its forwarding pointer back.
         // Watcher order within each list is preserved — that's what keeps
         // the propagation trajectory identical.
-        for wl in self.watches.iter_mut() {
-            for w in wl.iter_mut() {
+        for lit in 0..self.watches.num_lits() {
+            for w in self.watches.list_mut(lit) {
                 if !w.is_binary() {
                     *w = Watcher::long(self.clauses.reloc(w.long_cref(), &mut to), w.blocker);
                 }
@@ -1564,9 +1743,9 @@ impl Solver {
         // literal's slot); dedupe by counting it only when the slot's literal
         // sorts below its partner.
         let bin_w = 0.25_f64; // 2^-2
-        for i in 0..self.watches.len() {
+        for i in 0..self.watches.num_lits() {
             let lit_a = Lit(i as u32);
-            for w in &self.watches[i] {
+            for w in self.watches.list(i) {
                 if !w.is_binary() {
                     continue;
                 }
@@ -1729,8 +1908,8 @@ impl Solver {
                     2 => {
                         let a = learned[0];
                         let b = learned[1];
-                        self.watches[a.idx()].push(Watcher::binary(b));
-                        self.watches[b.idx()].push(Watcher::binary(a));
+                        self.watches.push(a.idx(), Watcher::binary(b));
+                        self.watches.push(b.idx(), Watcher::binary(a));
                         self.enqueue(a, Reason::Binary(b));
                     }
                     _ => {
@@ -1740,8 +1919,8 @@ impl Solver {
                         self.num_clauses_total += 1;
                         self.clauses.set_lbd(cref, lbd);
                         self.learnts.push(cref);
-                        self.watches[w0.idx()].push(Watcher::long(cref, w1));
-                        self.watches[w1.idx()].push(Watcher::long(cref, w0));
+                        self.watches.push(w0.idx(), Watcher::long(cref, w1));
+                        self.watches.push(w1.idx(), Watcher::long(cref, w0));
                         self.bump_clause_activity(cref);
                         self.enqueue(w0, Reason::Clause(cref));
                     }
