@@ -10,7 +10,10 @@ pub struct ClauseRef(pub u32);
 ///
 /// ```text
 /// word 0        : flags  (bit 0 = learned, bit 1 = deleted, bit 2 = relocated)
-/// word 1        : LBD (or forwarding ClauseRef while bit 2 is set mid-GC)
+/// word 1        : low 16 bits: LBD (clamped); high 16 bits: saved
+///                 replacement-watch search position (see `search_pos`).
+///                 The whole word doubles as the forwarding ClauseRef
+///                 while flag bit 2 is set mid-GC.
 /// word 2        : activity (f32 bits)
 /// word 3        : length (number of literals)
 /// word 4..4+len : literals (each Lit stored as its .0)
@@ -147,12 +150,42 @@ impl ClauseArena {
 
     #[inline]
     pub fn lbd(&self, c: ClauseRef) -> u32 {
-        self.data[c.0 as usize + 1]
+        self.data[c.0 as usize + 1] & 0xFFFF
     }
 
     #[inline]
     pub fn set_lbd(&mut self, c: ClauseRef, lbd: u32) {
-        self.data[c.0 as usize + 1] = lbd;
+        let w = &mut self.data[c.0 as usize + 1];
+        *w = (*w & 0xFFFF_0000) | lbd.min(0xFFFF);
+    }
+
+    /// Saved replacement-watch search position (CaDiCaL-style): where the
+    /// last scan for a non-false literal left off. Long clauses (wide
+    /// `distinct`/equality encodings reach 1000+ literals) otherwise
+    /// re-walk their known-false prefix on every propagate visit — on
+    /// pow2-style instances that made propagation 14× slower per
+    /// propagation than normal. Packed into the LBD word's high half:
+    /// zero header growth (a header word costs ~1% on nobranch).
+    ///
+    /// The next four accessors are propagate-hot; same raw-pointer
+    /// discipline and safety argument as `len`/`get_lit` above.
+    #[inline]
+    pub fn search_pos(&self, c: ClauseRef) -> usize {
+        let idx = c.0 as usize + 1;
+        debug_assert!(idx < self.data.len(), "search_pos read out of bounds");
+        // SAFETY: header word in bounds for any live clause.
+        (unsafe { *self.data.as_ptr().add(idx) } >> 16) as usize
+    }
+
+    #[inline]
+    pub fn set_search_pos(&mut self, c: ClauseRef, pos: usize) {
+        let idx = c.0 as usize + 1;
+        debug_assert!(idx < self.data.len(), "search_pos write out of bounds");
+        // SAFETY: header word in bounds for any live clause.
+        unsafe {
+            let p = self.data.as_mut_ptr().add(idx);
+            *p = (*p & 0xFFFF) | ((pos.min(0xFFFF) as u32) << 16);
+        }
     }
 
     #[inline]

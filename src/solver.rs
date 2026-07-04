@@ -22,6 +22,16 @@ enum Reason {
     Binary(Lit),
 }
 
+/// Per-variable assignment metadata. Level and reason are written together
+/// at every assignment (enqueue / propagate / cancel_until) and read
+/// together throughout conflict analysis — one struct keeps the pair on
+/// the same cache line instead of split across two parallel arrays.
+#[derive(Copy, Clone)]
+struct VarInfo {
+    level: i32,
+    reason: Reason,
+}
+
 /// A unified watcher entry. Used for both binary and long clauses, kept in a
 /// single per-literal list. The high bit of `cref` is the "binary" flag:
 ///
@@ -519,7 +529,7 @@ impl OrderHeap {
 pub struct Solver {
     // === Hot section — touched on every propagate() iteration. ===
     // Field order here is deliberately packed for cache locality: the inner
-    // propagation loop reads clauses, lit_value, assigns, level, reason,
+    // propagation loop reads clauses, lit_value, assigns, vardata,
     // trail, qhead, and watches together.
     clauses: ClauseArena,
     // Per-literal assignment table — `lit_value[lit.0]` returns the truth
@@ -530,8 +540,7 @@ pub struct Solver {
     // value is exactly `lit_value[2v]` (the positive literal's value).
     lit_value: Vec<LBool>,
     // Per-variable state (indexed by Var.0).
-    level: Vec<i32>,
-    reason: Vec<Reason>,
+    vardata: Vec<VarInfo>,
     // Trail: assignments in propagation order.
     trail: Vec<Lit>,
     qhead: usize,
@@ -615,6 +624,10 @@ pub struct Solver {
     pub stats_min_removed: u64,
     pub stats_gcs: u64,
 
+    // Sticky: an original clause with >= SEARCH_POS_MIN_LEN literals was
+    // added. Arms saved-position replacement scans in propagate.
+    has_wide_original: bool,
+
     // Sticky "this formula is already UNSAT" flag. Set whenever `add_clause`
     // detects trivial unsatisfiability (empty clause, or a unit whose value
     // is already forced to the opposite polarity). Once set, every future
@@ -625,12 +638,35 @@ pub struct Solver {
 }
 
 impl Solver {
+    // Clauses at least this long use saved-position replacement scans in
+    // propagate (see the scan loop). Short clauses — the overwhelming bulk
+    // on gate-encoded formulas — scan from position 2 exactly as they
+    // always did, keeping their propagation trajectory untouched: an
+    // ungated version of position saving regressed the symbex corpus 36%
+    // through pure watch-choice perturbation while saving nothing (a
+    // 3-lit clause has one body literal to scan). Long clauses are where
+    // the pathology lives: 1000+-lit distinct/equality encodings re-walk
+    // their false prefix on every visit (pow2 instance: 14× slower per
+    // propagation, 13.9s → 2.6s with saved positions).
+    //
+    // 128 deliberately clears the widest clauses real workloads produce —
+    // 64-bit distinct/equality encodings are ~65 literals (nobranch tops
+    // out at width 64). The gate is the sticky `has_wide_original` flag,
+    // not per-clause kind: on wide-input instances the rescan pathology
+    // lives in BOTH the wide inputs and the wide learned clauses analysis
+    // mints from them (originals-only left pow2 at 13s; with learned
+    // included it solves in ~2.6s), while on ordinary instances the only
+    // ≥128-lit clauses are learned ones and engaging them just re-rolled
+    // the trajectory lottery (+25% corpus at every threshold tried).
+    // Instances that never add a wide original clause run the exact
+    // pre-feature code path — trajectory-identical by construction.
+    const SEARCH_POS_MIN_LEN: usize = 128;
+
     pub fn new() -> Self {
         Solver {
             clauses: ClauseArena::new(),
             lit_value: Vec::new(),
-            level: Vec::new(),
-            reason: Vec::new(),
+            vardata: Vec::new(),
             trail: Vec::new(),
             qhead: 0,
             trail_lim: Vec::new(),
@@ -663,6 +699,7 @@ impl Solver {
             stats_reductions: 0,
             stats_min_removed: 0,
             stats_gcs: 0,
+            has_wide_original: false,
             dead: false,
         }
     }
@@ -682,8 +719,7 @@ impl Solver {
     /// would otherwise happen as variables and clauses stream in.
     pub fn reserve(&mut self, num_vars: usize, num_clauses: usize) {
         // Per-variable arrays.
-        self.level.reserve(num_vars);
-        self.reason.reserve(num_vars);
+        self.vardata.reserve(num_vars);
         self.activity.reserve(num_vars);
         self.polarity.reserve(num_vars);
         self.decision.reserve(num_vars);
@@ -715,8 +751,10 @@ impl Solver {
         // Per-literal value table — two entries per variable, both Undef.
         self.lit_value.push(LBool::Undef);
         self.lit_value.push(LBool::Undef);
-        self.level.push(-1);
-        self.reason.push(Reason::Decision);
+        self.vardata.push(VarInfo {
+            level: -1,
+            reason: Reason::Decision,
+        });
         self.activity.push(0.0);
         self.polarity.push(false);
         self.decision.push(true);
@@ -764,7 +802,7 @@ impl Solver {
         if v == LBool::Undef {
             return LBool::Undef;
         }
-        if self.level[l.var_idx()] == 0 {
+        if self.vardata[l.var_idx()].level == 0 {
             v
         } else {
             LBool::Undef
@@ -836,6 +874,9 @@ impl Solver {
             _ => {
                 let w0 = lits[0];
                 let w1 = lits[1];
+                if lits.len() >= Self::SEARCH_POS_MIN_LEN {
+                    self.has_wide_original = true;
+                }
                 let cref = self.clauses.alloc(&lits, false);
                 self.num_clauses_total += 1;
                 self.watches.push(w0.idx(), Watcher::long(cref, w1));
@@ -855,8 +896,8 @@ impl Solver {
                 let vi = lit.var_idx();
                 self.lit_value[lit.0 as usize] = LBool::True;
                 self.lit_value[(lit.0 ^ 1) as usize] = LBool::False;
-                self.level[vi] = self.decision_level();
-                self.reason[vi] = reason;
+                self.vardata[vi].level = self.decision_level();
+                self.vardata[vi].reason = reason;
                 self.trail.push(lit);
                 true
             }
@@ -882,7 +923,7 @@ impl Solver {
     ///   checks on the inner `ws[i]` / `ws[j]` accesses.
     /// - **`get_unchecked` on indexed accesses** whose bounds are program
     ///   invariants (every `Lit.0 < 2 * num_vars == lit_value.len()`,
-    ///   every variable index is < `level.len() / reason.len()`, etc.).
+    ///   every variable index is < `vardata.len()`, etc.).
     /// - **Software prefetch** of the next watcher's clause header.
     ///
     /// Returns `Some` on conflict, tagging binary vs long-clause.
@@ -894,15 +935,19 @@ impl Solver {
         let Solver {
             clauses,
             lit_value,
-            level,
-            reason,
+            vardata,
             trail,
             trail_lim,
             watches,
             qhead,
             stats_propagations,
+            has_wide_original,
             ..
         } = self;
+
+        // Saved-position scans arm only on wide-input instances (see
+        // SEARCH_POS_MIN_LEN); invariant across one propagate() call.
+        let use_search_pos = *has_wide_original;
 
         // Decision level is invariant across one propagate() call.
         let dl = trail_lim.len() as i32;
@@ -921,8 +966,7 @@ impl Solver {
         // grows them) is never called mid-solve, and `cancel_until` only
         // truncates `trail` / `trail_lim`, not the per-variable tables.
         let lit_value: &mut [LBool] = lit_value.as_mut_slice();
-        let level: &mut [i32] = level.as_mut_slice();
-        let reason: &mut [Reason] = reason.as_mut_slice();
+        let vardata: &mut [VarInfo] = vardata.as_mut_slice();
         'queue: while *qhead < trail.len() {
             // SAFETY: the loop guard just established `*qhead < trail.len()`.
             let p = unsafe { *trail.get_unchecked(*qhead) };
@@ -988,12 +1032,14 @@ impl Solver {
                         LBool::True => {} // satisfied
                         LBool::Undef => {
                             let vq = q.var_idx();
-                            // SAFETY: q.0 < lit_value.len() and vq < level.len() / reason.len().
+                            // SAFETY: q.0 < lit_value.len() and vq < vardata.len().
                             unsafe {
                                 *lit_value.get_unchecked_mut(q.0 as usize) = LBool::True;
                                 *lit_value.get_unchecked_mut((q.0 ^ 1) as usize) = LBool::False;
-                                *level.get_unchecked_mut(vq) = dl;
-                                *reason.get_unchecked_mut(vq) = Reason::Binary(false_lit);
+                                *vardata.get_unchecked_mut(vq) = VarInfo {
+                                    level: dl,
+                                    reason: Reason::Binary(false_lit),
+                                };
                             }
                             trail.push(q);
                         }
@@ -1046,11 +1092,23 @@ impl Solver {
                         // Skip the inner scan — clause is satisfied by `first`.
                         (first, first_val, None)
                     } else {
+                        // Long clauses resume the replacement scan where
+                        // the previous visit left off (CaDiCaL-style saved
+                        // position), wrapping around through the body;
+                        // short clauses start at 2 as always (see
+                        // SEARCH_POS_MIN_LEN). Positions 0/1 are the
+                        // watches; a stale or overflowed save clamps back
+                        // into [2, n).
                         let mut found: Option<(usize, Lit)> = None;
                         let n = lits.len();
-                        let mut k = 2usize;
-                        while k < n {
-                            // SAFETY: k < n == lits.len().
+                        let start = if use_search_pos && n >= Self::SEARCH_POS_MIN_LEN {
+                            clauses.search_pos(cref).clamp(2, n - 1)
+                        } else {
+                            2
+                        };
+                        let mut k = start;
+                        loop {
+                            // SAFETY: 2 <= k < n == lits.len().
                             let lk = unsafe { *lits.get_unchecked(k) };
                             // SAFETY: lk.0 < lit_value.len().
                             let lkv = unsafe { *lit_value.get_unchecked(lk.0 as usize) };
@@ -1059,6 +1117,12 @@ impl Solver {
                                 break;
                             }
                             k += 1;
+                            if k == n {
+                                k = 2;
+                            }
+                            if k == start {
+                                break;
+                            }
                         }
                         (first, first_val, found)
                     }
@@ -1074,8 +1138,12 @@ impl Solver {
                 if let Some((k, lk)) = found {
                     // Migrate: lits[1] holds false_lit (post-eager-swap);
                     // swap with k so lk takes the watch and false_lit
-                    // moves into the body.
+                    // moves into the body. Long clauses remember where the
+                    // scan ended so the next visit resumes there.
                     clauses.swap_lits(cref, 1, k);
+                    if use_search_pos && clauses.len(cref) >= Self::SEARCH_POS_MIN_LEN {
+                        clauses.set_search_pos(cref, k);
+                    }
                     watches.push(lk.idx(), Watcher::long(cref, first));
                     // The push may have grown + reallocated the arena
                     // buffer; `off` is stable (invariant 1), the base
@@ -1110,8 +1178,10 @@ impl Solver {
                         *lit_value.get_unchecked_mut(first.0 as usize) = LBool::True;
                         *lit_value.get_unchecked_mut((first.0 ^ 1) as usize) =
                             LBool::False;
-                        *level.get_unchecked_mut(vi) = dl;
-                        *reason.get_unchecked_mut(vi) = Reason::Clause(cref);
+                        *vardata.get_unchecked_mut(vi) = VarInfo {
+                            level: dl,
+                            reason: Reason::Clause(cref),
+                        };
                     }
                     trail.push(first);
                 }
@@ -1201,7 +1271,7 @@ impl Solver {
                 break;
             }
 
-            current = match self.reason[pvi] {
+            current = match self.vardata[pvi].reason {
                 Reason::Clause(cr) => {
                     // Prefetch the next reason clause. Unlike propagate —
                     // which prefetches the next watcher's clause — analyze
@@ -1230,7 +1300,7 @@ impl Solver {
         // Used by lit_redundant as a cheap level-locality reject filter.
         let mut abstract_levels: u64 = 0;
         for i in 1..learned.len() {
-            abstract_levels |= 1u64 << (self.level[learned[i].var_idx()] & 63);
+            abstract_levels |= 1u64 << (self.vardata[learned[i].var_idx()].level & 63);
         }
 
         let pre_min_len = learned.len();
@@ -1240,7 +1310,7 @@ impl Solver {
             let vi = l.var_idx();
             // A decision literal has no reason graph to walk, and is never
             // implied by the other clause literals — keep it.
-            let keep = matches!(self.reason[vi], Reason::Decision)
+            let keep = matches!(self.vardata[vi].reason, Reason::Decision)
                 || !self.lit_redundant(l, abstract_levels);
             if keep {
                 learned[write] = l;
@@ -1265,9 +1335,9 @@ impl Solver {
             0
         } else {
             let mut max_i = 1;
-            let mut max_l = self.level[learned[1].var_idx()];
+            let mut max_l = self.vardata[learned[1].var_idx()].level;
             for i in 2..learned.len() {
-                let lv = self.level[learned[i].var_idx()];
+                let lv = self.vardata[learned[i].var_idx()].level;
                 if lv > max_l {
                     max_l = lv;
                     max_i = i;
@@ -1290,11 +1360,11 @@ impl Solver {
         learned: &mut Vec<Lit>,
     ) {
         let vq = q.var_idx();
-        if !self.seen[vq] && self.level[vq] > 0 {
+        if !self.seen[vq] && self.vardata[vq].level > 0 {
             self.bump_var_activity(q.var());
             self.seen[vq] = true;
             self.analyze_toclear.push(q);
-            if self.level[vq] >= current_level {
+            if self.vardata[vq].level >= current_level {
                 *path_c += 1;
             } else {
                 learned.push(q);
@@ -1321,7 +1391,7 @@ impl Solver {
             // Extract p's reason into one of two shapes: Clause (many lits,
             // indices 1..n are the "other" lits) or Binary (single partner).
             let (cref_opt, binary_other): (Option<ClauseRef>, Option<Lit>) =
-                match self.reason[p.var_idx()] {
+                match self.vardata[p.var_idx()].reason {
                     // SAFETY: the caller filters decision literals, and we
                     // only push literals onto analyze_stack when we've
                     // verified their reason is not a Decision. Reaching this
@@ -1348,7 +1418,7 @@ impl Solver {
                     None => self.clauses.get_lit(cref_opt.unwrap(), i + 1),
                 };
                 let vq = q.var_idx();
-                if self.seen[vq] || self.level[vq] <= 0 {
+                if self.seen[vq] || self.vardata[vq].level <= 0 {
                     // Already in learned / visited, or at level 0 (implied).
                     continue;
                 }
@@ -1356,8 +1426,8 @@ impl Solver {
                 // AND its level must match one of the levels present in the
                 // learned clause's 64-bit abstraction — a cheap reject filter
                 // that avoids walking into subgraphs whose levels are absent.
-                let can_recurse = !matches!(self.reason[vq], Reason::Decision)
-                    && (abstract_levels & (1u64 << (self.level[vq] & 63))) != 0;
+                let can_recurse = !matches!(self.vardata[vq].reason, Reason::Decision)
+                    && (abstract_levels & (1u64 << (self.vardata[vq].level & 63))) != 0;
                 if can_recurse {
                     self.seen[vq] = true;
                     self.analyze_stack.push(q);
@@ -1408,7 +1478,7 @@ impl Solver {
             if !self.seen[vx] {
                 continue;
             }
-            match self.reason[vx] {
+            match self.vardata[vx].reason {
                 Reason::Decision => {
                     // Decisions at this stage of solve are assumptions (no
                     // VSIDS decisions happen inside the assumption prefix).
@@ -1419,13 +1489,13 @@ impl Solver {
                     let clen = self.clauses.len(cr);
                     for j in 1..clen {
                         let lj = self.clauses.get_lit(cr, j);
-                        if self.level[lj.var_idx()] > 0 {
+                        if self.vardata[lj.var_idx()].level > 0 {
                             self.seen[lj.var_idx()] = true;
                         }
                     }
                 }
                 Reason::Binary(other) => {
-                    if self.level[other.var_idx()] > 0 {
+                    if self.vardata[other.var_idx()].level > 0 {
                         self.seen[other.var_idx()] = true;
                     }
                 }
@@ -1441,7 +1511,7 @@ impl Solver {
         let stamp = self.lbd_counter;
         let mut count = 0u32;
         for &l in lits {
-            let lvl = self.level[l.var_idx()];
+            let lvl = self.vardata[l.var_idx()].level;
             if lvl < 0 {
                 continue;
             }
@@ -1472,8 +1542,8 @@ impl Solver {
             let pos = (lit.0 & !1) as usize;
             self.lit_value[pos] = LBool::Undef;
             self.lit_value[pos | 1] = LBool::Undef;
-            self.level[vi] = -1;
-            self.reason[vi] = Reason::Decision;
+            self.vardata[vi].level = -1;
+            self.vardata[vi].reason = Reason::Decision;
             if self.decision[vi] {
                 self.order_heap.insert(lit.var().0, &self.activity);
             }
@@ -1572,7 +1642,7 @@ impl Solver {
         if self.value_of(first) != LBool::True {
             return false;
         }
-        matches!(self.reason[first.var_idx()], Reason::Clause(r) if r == cref)
+        matches!(self.vardata[first.var_idx()].reason, Reason::Clause(r) if r == cref)
     }
 
     /// Drop low-quality learned clauses. Keep clauses with LBD <= 2 (glue),
@@ -1682,8 +1752,8 @@ impl Solver {
         }
         for i in 0..self.trail.len() {
             let vi = self.trail[i].var_idx();
-            if let Reason::Clause(cr) = self.reason[vi] {
-                self.reason[vi] = Reason::Clause(self.clauses.reloc(cr, &mut to));
+            if let Reason::Clause(cr) = self.vardata[vi].reason {
+                self.vardata[vi].reason = Reason::Clause(self.clauses.reloc(cr, &mut to));
             }
         }
 
