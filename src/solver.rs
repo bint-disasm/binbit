@@ -2060,6 +2060,52 @@ impl Solver {
         }
     }
 
+    /// Propagation-only probe: enqueue each assumption at its own decision
+    /// level, running unit propagation after each, then hand `read` the
+    /// solver so it can inspect which literals are forced (`value_of`).
+    /// The trail is unwound to level 0 before returning — no search runs,
+    /// nothing is learned, no decisions beyond the assumptions are made.
+    ///
+    /// Returns `None` when propagation alone refutes formula + assumptions
+    /// — a real UNSAT proof, the same guarantee as an Unsat solve result.
+    /// `Some` does NOT imply satisfiability (propagation is incomplete);
+    /// it only means every literal `read` saw as assigned is genuinely
+    /// implied by the formula and the assumptions.
+    pub fn probe_under_assumptions<R>(
+        &mut self,
+        assumptions: &[Lit],
+        read: impl FnOnce(&Self) -> R,
+    ) -> Option<R> {
+        if self.dead {
+            return None;
+        }
+        self.cancel_until(0);
+        if self.propagate().is_some() {
+            // Root-level conflict: unconditionally UNSAT.
+            return None;
+        }
+        for &a in assumptions {
+            match self.value_of(a) {
+                LBool::True => continue,
+                LBool::False => {
+                    self.cancel_until(0);
+                    return None;
+                }
+                LBool::Undef => {
+                    self.trail_lim.push(self.trail.len());
+                    self.enqueue(a, Reason::Decision);
+                    if self.propagate().is_some() {
+                        self.cancel_until(0);
+                        return None;
+                    }
+                }
+            }
+        }
+        let r = read(self);
+        self.cancel_until(0);
+        Some(r)
+    }
+
     /// The UNSAT core from the most recent [`solve_under_assumptions`] call
     /// that returned [`SolveResult::Unsat`] because of an assumption clash.
     /// Empty if the last solve was SAT, or was UNSAT at level 0 (the

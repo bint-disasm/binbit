@@ -932,6 +932,63 @@ impl SmtSolver {
         }
     }
 
+    /// Known bits of `x` under assumption terms, derived from bitblasting
+    /// plus a single unit-propagation pass — no search, no conflicts, no
+    /// learning. The assumption semantics match [`solve_under_assumptions`]
+    /// exactly (same literal construction, including scope activation and
+    /// named-assertion controls).
+    ///
+    /// Returns `(known_ones, known_zeros)` in the same shape as
+    /// [`BvContext::bv_known_bits`], whose construction-time masks are
+    /// folded in. Sound but conservative: a reported bit is 1 (resp. 0) in
+    /// EVERY model of assertions + assumptions; an unreported bit may
+    /// still be semantically forced — propagation just couldn't see it.
+    /// A conservative unsigned range falls out as
+    /// `[ones, ones | !(ones | zeros) & mask]`.
+    ///
+    /// Returns `None` when unit propagation alone refutes the formula
+    /// under the assumptions — a real UNSAT proof (same guarantee as an
+    /// Unsat result from `solve_under_assumptions`).
+    ///
+    /// Costs one bitblast of `x`'s cone (cached, and its CNF stays in the
+    /// SAT core — later solves reuse it) plus one propagation pass. Like
+    /// any state-changing call, it invalidates the model of a previous
+    /// solve. Panics if `x` is wider than 128 bits.
+    pub fn bv_known_bits_under_assumptions(
+        &mut self,
+        x: BvTerm,
+        assumptions: &[BoolTerm],
+    ) -> Option<(u128, u128)> {
+        let w = self.ctx.width_of(x);
+        assert!(w <= 128, "bv_known_bits_under_assumptions: width > 128");
+        self.last_result = None;
+        self.flush_pending();
+        let refs = self.bitblast_bv(x);
+        let bits: Vec<Lit> = refs.iter().map(|&r| self.lit_of(r)).collect();
+        let extras = self.build_assumption_lits(assumptions);
+        let asmps = self.built_assumptions(&extras);
+        let (o, z) = self.sat.probe_under_assumptions(&asmps, |s| {
+            let (mut o, mut z) = (0u128, 0u128);
+            for (i, &l) in bits.iter().enumerate() {
+                match s.value_of(l) {
+                    LBool::True => o |= 1 << i,
+                    LBool::False => z |= 1 << i,
+                    LBool::Undef => {}
+                }
+            }
+            (o, z)
+        })?;
+        let (co, cz) = self.ctx.bv_known_bits(x);
+        let (ones, zeros) = (o | co, z | cz);
+        if ones & zeros != 0 {
+            // Construction-time and propagated facts contradict on a bit:
+            // the formula is UNSAT under these assumptions even though
+            // propagation alone didn't close the refutation.
+            return None;
+        }
+        Some((ones, zeros))
+    }
+
     // ---------- Optimization: solve_min / solve_max ----------
     //
     // "Bit-hunt" search: walk the target term's bitblasted SAT lits from
@@ -960,6 +1017,34 @@ impl SmtSolver {
     pub fn solve_max_u(&mut self, x: BvTerm) -> Option<u128> {
         assert!(self.ctx.width_of(x) <= 128, "solve_max_u: width > 128");
         self.solve_max_u_limbs(x).map(|l| limbs_to_u128(&l))
+    }
+
+    /// [`solve_min_u`] with assumption terms held through the whole hunt —
+    /// the exact minimum of `x` over models satisfying assertions AND
+    /// assumptions (same semantics as [`solve_under_assumptions`]).
+    /// Returns `None` if unsat under the assumptions.
+    pub fn solve_min_u_under_assumptions(
+        &mut self,
+        x: BvTerm,
+        assumptions: &[BoolTerm],
+    ) -> Option<u128> {
+        assert!(self.ctx.width_of(x) <= 128, "solve_min_u: width > 128");
+        let (bits, extras) = self.opt_prologue_with(x, assumptions)?;
+        let limbs = self.bit_hunt_with(&bits, &extras, |_| false);
+        Some(limbs_to_u128(&limbs))
+    }
+
+    /// [`solve_max_u`] with assumption terms — see
+    /// [`solve_min_u_under_assumptions`].
+    pub fn solve_max_u_under_assumptions(
+        &mut self,
+        x: BvTerm,
+        assumptions: &[BoolTerm],
+    ) -> Option<u128> {
+        assert!(self.ctx.width_of(x) <= 128, "solve_max_u: width > 128");
+        let (bits, extras) = self.opt_prologue_with(x, assumptions)?;
+        let limbs = self.bit_hunt_with(&bits, &extras, |_| true);
+        Some(limbs_to_u128(&limbs))
     }
 
     /// Minimum signed (two's complement) value of `x` satisfying all
@@ -1018,6 +1103,17 @@ impl SmtSolver {
     /// unsat (and updates `last_result` accordingly); returns the LSB-first
     /// SAT lits of `x` when sat, with `last_result = Sat`.
     fn opt_prologue(&mut self, x: BvTerm) -> Option<Vec<Lit>> {
+        self.opt_prologue_with(x, &[]).map(|(bits, _)| bits)
+    }
+
+    /// [`opt_prologue`] with assumption terms: also bitblasts the
+    /// assumptions and returns their lits so callers can keep them
+    /// installed for every solve of the hunt.
+    fn opt_prologue_with(
+        &mut self,
+        x: BvTerm,
+        assumptions: &[BoolTerm],
+    ) -> Option<(Vec<Lit>, Vec<Lit>)> {
         self.flush_pending();
         // Materialize BEFORE the initial solve so the feasibility check
         // sees any clauses the target term's cone adds — otherwise a sat
@@ -1025,11 +1121,12 @@ impl SmtSolver {
         // gates.
         let refs = self.bitblast_bv(x);
         let bits: Vec<Lit> = refs.iter().map(|&r| self.lit_of(r)).collect();
-        let asmps = self.built_assumptions(&[]);
+        let extras = self.build_assumption_lits(assumptions);
+        let asmps = self.built_assumptions(&extras);
         match self.sat.solve_under_assumptions(&asmps) {
             SolveResult::Sat => {
                 self.last_result = Some(SmtResult::Sat);
-                Some(bits)
+                Some((bits, extras))
             }
             SolveResult::Unsat => {
                 self.last_result = Some(SmtResult::Unsat);
@@ -1044,10 +1141,22 @@ impl SmtSolver {
     /// Caller guarantees the formula is sat before invocation (via
     /// [`opt_prologue`]).
     fn bit_hunt(&mut self, bits: &[Lit], want_one: impl Fn(usize) -> bool) -> Vec<u64> {
+        self.bit_hunt_with(bits, &[], want_one)
+    }
+
+    /// [`bit_hunt`] with a fixed assumption-lit prefix held through every
+    /// solve of the hunt (the under-assumptions min/max entry points).
+    fn bit_hunt_with(
+        &mut self,
+        bits: &[Lit],
+        extras: &[Lit],
+        want_one: impl Fn(usize) -> bool,
+    ) -> Vec<u64> {
         let w = bits.len();
         let nlimbs = (w + 63) / 64;
         let mut limbs = vec![0u64; nlimbs];
-        let mut fixed: Vec<Lit> = Vec::with_capacity(w);
+        let mut fixed: Vec<Lit> = Vec::with_capacity(extras.len() + w);
+        fixed.extend_from_slice(extras);
         for i in (0..w).rev() {
             let b = bits[i];
             let prefer_one = want_one(i);
