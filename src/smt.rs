@@ -1103,6 +1103,110 @@ impl SmtSolver {
         self.solve_many_u_under_assumptions(x, limit, &[])
     }
 
+    /// Batch feasibility: for each `candidates[i]`, decide whether
+    /// assertions ∧ `assumptions` ∧ `candidates[i]` is satisfiable — the
+    /// result is exactly what `solve_under_assumptions(assumptions ++
+    /// [candidates[i]])` would return for each, but usually much cheaper.
+    ///
+    /// The win is model reuse: after any SAT solve, every still-undecided
+    /// candidate is first EVALUATED against the current model (a
+    /// structural AIG walk, no SAT work); candidates the model satisfies
+    /// are SAT for free. Only model-falsified candidates get a real solve,
+    /// and each new model re-screens the remaining ones. For symbex
+    /// branch/target fan-outs, typically a large fraction of candidates
+    /// resolve without touching the SAT core.
+    ///
+    /// Invalidates any previous model; `last_result` is cleared.
+    pub fn solve_each_under_assumptions(
+        &mut self,
+        candidates: &[BoolTerm],
+        assumptions: &[BoolTerm],
+    ) -> Vec<SmtResult> {
+        self.last_result = None;
+        self.flush_pending();
+        // Bitblast every candidate up front — AIG only, no CNF emission —
+        // so model screening can evaluate them structurally.
+        let cand_refs: Vec<AigRef> =
+            candidates.iter().map(|&t| self.bitblast_bool(t)).collect();
+        let extras = self.build_assumption_lits(assumptions);
+        let base_asmps = self.built_assumptions(&extras);
+
+        let mut results: Vec<Option<SmtResult>> = vec![None; candidates.len()];
+        // Baseline solve: no candidate. Unsat here decides everything.
+        let mut model_valid = match self.sat.solve_under_assumptions(&base_asmps) {
+            SolveResult::Sat => true,
+            SolveResult::Unsat => {
+                return vec![SmtResult::Unsat; candidates.len()];
+            }
+        };
+        loop {
+            if model_valid {
+                // One structural walk screens every undecided candidate
+                // (shared memo across their cones).
+                let pending: Vec<usize> =
+                    (0..results.len()).filter(|&i| results[i].is_none()).collect();
+                let refs: Vec<AigRef> = pending.iter().map(|&i| cand_refs[i]).collect();
+                for (&i, sat) in pending.iter().zip(self.eval_refs(&refs)) {
+                    if sat {
+                        results[i] = Some(SmtResult::Sat);
+                    }
+                }
+            }
+            let Some(next) = results.iter().position(|r| r.is_none()) else {
+                break;
+            };
+            // Materializing the candidate lit may emit CNF, which rewinds
+            // the trail — done only now, after screening used the model.
+            let lit = self.lit_of(cand_refs[next]);
+            let mut asmps = base_asmps.clone();
+            asmps.push(lit);
+            match self.sat.solve_under_assumptions(&asmps) {
+                SolveResult::Sat => {
+                    results[next] = Some(SmtResult::Sat);
+                    model_valid = true;
+                }
+                SolveResult::Unsat => {
+                    results[next] = Some(SmtResult::Unsat);
+                    model_valid = false;
+                }
+            }
+        }
+        results.into_iter().map(|r| r.unwrap()).collect()
+    }
+
+    /// Exact unsigned `[min, max]` of `x` under assumptions — one shared
+    /// prologue (flush + bitblast + feasibility solve), then two bit-hunts
+    /// on the hot solver. `None` iff unsat under the assumptions.
+    pub fn solve_range_u_under_assumptions(
+        &mut self,
+        x: BvTerm,
+        assumptions: &[BoolTerm],
+    ) -> Option<(u128, u128)> {
+        assert!(self.ctx.width_of(x) <= 128, "solve_range_u: width > 128");
+        let (bits, extras) = self.opt_prologue_with(x, assumptions)?;
+        let min = limbs_to_u128(&self.bit_hunt_with(&bits, &extras, |_| false));
+        let max = limbs_to_u128(&self.bit_hunt_with(&bits, &extras, |_| true));
+        Some((min, max))
+    }
+
+    /// After [`solve_under_assumptions`] (or a per-candidate Unsat from
+    /// [`solve_each_under_assumptions`]) returns Unsat, the indices into
+    /// `assumptions` whose lits appear in the SAT-level unsat core — the
+    /// subset of assumptions that jointly caused the conflict. Pass the
+    /// SAME slice that was passed to the failing solve; bitblast caching
+    /// makes the lit lookup free. Meaningless after a Sat result.
+    pub fn failed_assumptions(&mut self, assumptions: &[BoolTerm]) -> Vec<usize> {
+        let extras = self.build_assumption_lits(assumptions);
+        let core: std::collections::HashSet<Lit> =
+            self.sat.unsat_core().iter().copied().collect();
+        extras
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| core.contains(l))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// [`solve_max_u`] with assumption terms — see
     /// [`solve_min_u_under_assumptions`].
     pub fn solve_max_u_under_assumptions(
