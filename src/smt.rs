@@ -1034,6 +1034,75 @@ impl SmtSolver {
         Some(limbs_to_u128(&limbs))
     }
 
+    /// Enumerate up to `limit` distinct values of `x` under the current
+    /// assertions plus `assumptions`. Exact: the returned flag is `true`
+    /// iff the returned values are ALL values `x` can take (the
+    /// enumeration exhausted the space); `false` means the limit cut it
+    /// short. Values arrive in model-discovery order, not sorted.
+    ///
+    /// Each found value is excluded with a single SAT clause over `x`'s
+    /// already-materialized bit literals — no `x != c` comparator circuit,
+    /// no term-graph growth, no push/pop churn — and every blocking clause
+    /// is guarded by one per-call activation literal that is retired on
+    /// return, so the enumeration leaves no semantic residue and learned
+    /// clauses remain valid for later solves. Panics if `x` is wider than
+    /// 128 bits.
+    pub fn solve_many_u_under_assumptions(
+        &mut self,
+        x: BvTerm,
+        limit: usize,
+        assumptions: &[BoolTerm],
+    ) -> (Vec<u128>, bool) {
+        assert!(self.ctx.width_of(x) <= 128, "solve_many_u: width > 128");
+        self.last_result = None;
+        self.flush_pending();
+        let refs = self.bitblast_bv(x);
+        let bits: Vec<Lit> = refs.iter().map(|&r| self.lit_of(r)).collect();
+        let mut extras = self.build_assumption_lits(assumptions);
+        let act = self.new_sat_lit_tagged(VarOrigin::Activation);
+        extras.push(act);
+        let asmps = self.built_assumptions(&extras);
+        let mut values: Vec<u128> = Vec::new();
+        let exhausted = loop {
+            if values.len() >= limit {
+                break false;
+            }
+            match self.sat.solve_under_assumptions(&asmps) {
+                SolveResult::Unsat => break true,
+                SolveResult::Sat => {
+                    // Read the value and build the blocking clause BEFORE
+                    // add_clause — it rewinds the trail (and the model).
+                    let mut v = 0u128;
+                    let mut clause = Vec::with_capacity(bits.len() + 1);
+                    clause.push(!act);
+                    for (i, &l) in bits.iter().enumerate() {
+                        match self.sat.value_of(l) {
+                            LBool::True => {
+                                v |= 1u128 << i;
+                                clause.push(!l);
+                            }
+                            LBool::False => clause.push(l),
+                            // Materialized bit vars are decision vars; a
+                            // SAT result assigns all of them.
+                            LBool::Undef => unreachable!("unassigned bit in SAT model"),
+                        }
+                    }
+                    values.push(v);
+                    self.sat.add_clause(clause);
+                }
+            }
+        };
+        // Retire the session: the blocking clauses become permanently
+        // vacuous and can never constrain a future solve.
+        self.sat.add_clause(vec![!act]);
+        (values, exhausted)
+    }
+
+    /// [`solve_many_u_under_assumptions`] with no assumptions.
+    pub fn solve_many_u(&mut self, x: BvTerm, limit: usize) -> (Vec<u128>, bool) {
+        self.solve_many_u_under_assumptions(x, limit, &[])
+    }
+
     /// [`solve_max_u`] with assumption terms — see
     /// [`solve_min_u_under_assumptions`].
     pub fn solve_max_u_under_assumptions(
