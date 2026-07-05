@@ -1116,29 +1116,54 @@ impl SmtSolver {
     /// branch/target fan-outs, typically a large fraction of candidates
     /// resolve without touching the SAT core.
     ///
-    /// Invalidates any previous model; `last_result` is cleared.
+    /// Warm start: if the solver still holds an intact model from the
+    /// caller's previous solve (the typical symbex shape — the path
+    /// condition was just solved to reach this state) and that model also
+    /// satisfies `assumptions`, screening starts from it directly: the
+    /// baseline solve is skipped, and candidates the standing model
+    /// satisfies cost zero SAT work and zero CNF. A branch fan-out
+    /// `solve_each_under_assumptions(&[cond, not_cond], pc)` right after
+    /// solving `pc` does at most one real solve instead of two.
+    ///
+    /// `last_result` is cleared. The previous model is invalidated unless
+    /// the warm path decided every candidate without any SAT call, in
+    /// which case it survives and can warm the next batch too.
     pub fn solve_each_under_assumptions(
         &mut self,
         candidates: &[BoolTerm],
         assumptions: &[BoolTerm],
     ) -> Vec<SmtResult> {
         self.last_result = None;
+        // Pending work can change semantics without emitting CNF
+        // (top-level substitutions), which `has_model` alone can't see —
+        // warm start additionally requires flush to be a true no-op.
+        let had_pending = self.pending.iter().any(|q| !q.is_empty());
         self.flush_pending();
         // Bitblast every candidate up front — AIG only, no CNF emission —
         // so model screening can evaluate them structurally.
         let cand_refs: Vec<AigRef> =
             candidates.iter().map(|&t| self.bitblast_bool(t)).collect();
-        let extras = self.build_assumption_lits(assumptions);
-        let base_asmps = self.built_assumptions(&extras);
+
+        // Warm start: the trail may still hold an intact model. It screens
+        // candidates iff it also satisfies the base assumptions — standing
+        // controls checked by direct trail reads, the caller's assumption
+        // terms by structural evaluation (their lits stay unmaterialized
+        // here: `lit_of` could emit CNF and destroy the very model being
+        // read).
+        let mut model_valid = !had_pending && self.sat.has_model() && {
+            let asm_refs: Vec<AigRef> =
+                assumptions.iter().map(|&t| self.bitblast_bool(t)).collect();
+            self.built_assumptions(&[])
+                .iter()
+                .all(|&l| self.sat.value_of(l) == LBool::True)
+                && self.eval_refs(&asm_refs).into_iter().all(|v| v)
+        };
+        let warm = model_valid;
 
         let mut results: Vec<Option<SmtResult>> = vec![None; candidates.len()];
-        // Baseline solve: no candidate. Unsat here decides everything.
-        let mut model_valid = match self.sat.solve_under_assumptions(&base_asmps) {
-            SolveResult::Sat => true,
-            SolveResult::Unsat => {
-                return vec![SmtResult::Unsat; candidates.len()];
-            }
-        };
+        // Built lazily, at the first candidate needing a real solve — a
+        // warm run that screens everything never touches the SAT core.
+        let mut base_asmps: Option<Vec<Lit>> = None;
         loop {
             if model_valid {
                 // One structural walk screens every undecided candidate
@@ -1155,10 +1180,31 @@ impl SmtSolver {
             let Some(next) = results.iter().position(|r| r.is_none()) else {
                 break;
             };
+            if base_asmps.is_none() {
+                let extras = self.build_assumption_lits(assumptions);
+                let asmps = self.built_assumptions(&extras);
+                if !warm {
+                    // Cold start: baseline solve with no candidate. Unsat
+                    // here decides everything at once; Sat provides the
+                    // first screening model. A warm run skips this — the
+                    // standing model already witnessed the base as sat.
+                    match self.sat.solve_under_assumptions(&asmps) {
+                        SolveResult::Sat => {
+                            base_asmps = Some(asmps);
+                            model_valid = true;
+                            continue;
+                        }
+                        SolveResult::Unsat => {
+                            return vec![SmtResult::Unsat; candidates.len()];
+                        }
+                    }
+                }
+                base_asmps = Some(asmps);
+            }
             // Materializing the candidate lit may emit CNF, which rewinds
             // the trail — done only now, after screening used the model.
             let lit = self.lit_of(cand_refs[next]);
-            let mut asmps = base_asmps.clone();
+            let mut asmps = base_asmps.as_ref().unwrap().clone();
             asmps.push(lit);
             match self.sat.solve_under_assumptions(&asmps) {
                 SolveResult::Sat => {

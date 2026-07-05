@@ -635,6 +635,15 @@ pub struct Solver {
     // we'd silently ignore clauses that filter down to "empty" and report
     // spurious SAT.
     dead: bool,
+    // True while the trail holds an intact model of the clause set from the
+    // most recent SAT solve. `add_clause` and `probe_under_assumptions`
+    // clear it (they rewind the trail); every solve clears it on entry and
+    // sets it again only on a Sat return. Variables created after the solve
+    // stay unassigned — that keeps the flag true, matching the "complete
+    // unassigned with false" model convention callers already use to read
+    // values. Lets callers reuse the standing model to screen candidates
+    // without a redundant re-solve.
+    has_model: bool,
 }
 
 impl Solver {
@@ -701,6 +710,7 @@ impl Solver {
             stats_gcs: 0,
             has_wide_original: false,
             dead: false,
+            has_model: false,
         }
     }
 
@@ -820,6 +830,7 @@ impl Solver {
     /// that happens, the unsat condition is recorded persistently so that
     /// later `solve*` calls also return UNSAT.
     pub fn add_clause(&mut self, lits: Vec<Lit>) -> bool {
+        self.has_model = false;
         if self.dead {
             return false;
         }
@@ -1935,6 +1946,7 @@ impl Solver {
     where
         F: Fn(&Self, u64) -> bool,
     {
+        self.has_model = false;
         if self.dead {
             return Some(SolveResult::Unsat);
         }
@@ -2049,7 +2061,10 @@ impl Solver {
 
                 let chosen = next.or_else(|| self.pick_branch_lit());
                 match chosen {
-                    None => return Some(SolveResult::Sat),
+                    None => {
+                        self.has_model = true;
+                        return Some(SolveResult::Sat);
+                    }
                     Some(lit) => {
                         self.stats_decisions += 1;
                         self.trail_lim.push(self.trail.len());
@@ -2076,6 +2091,7 @@ impl Solver {
         assumptions: &[Lit],
         read: impl FnOnce(&Self) -> R,
     ) -> Option<R> {
+        self.has_model = false;
         if self.dead {
             return None;
         }
@@ -2104,6 +2120,14 @@ impl Solver {
         let r = read(self);
         self.cancel_until(0);
         Some(r)
+    }
+
+    /// True while the trail still holds the intact model found by the most
+    /// recent Sat solve — nothing has rewound or constrained it since.
+    /// While true, `value_of` reads are a genuine model of the clause set
+    /// (variables created after the solve read Undef; complete with false).
+    pub fn has_model(&self) -> bool {
+        self.has_model
     }
 
     /// The UNSAT core from the most recent [`solve_under_assumptions`] call
