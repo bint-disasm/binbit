@@ -3417,8 +3417,14 @@ impl SmtSolver {
         if t == sel {
             return self.mk_or(sel, e);
         }
-        if e == !sel {
+        if t == !sel {
+            return self.mk_and(!sel, e);
+        }
+        if e == sel {
             return self.mk_and(sel, t);
+        }
+        if e == !sel {
+            return self.mk_or(!sel, t);
         }
         let out = self.aig.mux(sel, t, e);
         if let Some(term) = self.current_bv_ctx {

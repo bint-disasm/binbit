@@ -506,12 +506,20 @@ impl Aig {
         if t == AigRef::FALSE && e == AigRef::TRUE {
             return !sel;
         }
-        // `mux(s, s, e) = s ∨ e`, `mux(s, t, !s) = s ∧ t`, etc.
+        // Branch-equals-selector folds, from `mux(s,t,e) = (s∧t) ∨ (¬s∧e)`:
+        // `mux(s, s, e) = s ∨ e`, `mux(s, ¬s, e) = ¬s ∧ e`,
+        // `mux(s, t, s) = s ∧ t`, `mux(s, t, ¬s) = ¬s ∨ t`.
         if t == sel {
             return self.or(sel, e);
         }
-        if e == !sel {
+        if t == !sel {
+            return self.and(!sel, e);
+        }
+        if e == sel {
             return self.and(sel, t);
+        }
+        if e == !sel {
+            return self.or(!sel, t);
         }
         let hi = self.and(sel, t);
         let lo = self.and(!sel, e);

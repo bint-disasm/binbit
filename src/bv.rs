@@ -1342,8 +1342,10 @@ impl BvContext {
             "bv_select: selectors and values must be parallel slices"
         );
         let w = self.width_of(default);
+        let mut default = default;
         let mut filtered: Vec<(BoolTerm, BvTerm)> =
             Vec::with_capacity(selectors.len());
+        let mut seen: HashMap<BoolTerm, ()> = HashMap::default();
         for (&s, &v) in selectors.iter().zip(values.iter()) {
             assert_eq!(
                 self.width_of(v),
@@ -1352,24 +1354,70 @@ impl BvContext {
             );
             match self.const_bool(s) {
                 Some(true) => {
-                    // First const-true selector wins — everything later is
-                    // shadowed by first-match semantics.
-                    return v;
+                    // A const-true selector shadows everything AFTER it,
+                    // but earlier pairs still take first-match priority —
+                    // so it becomes the default for them, not the result.
+                    default = v;
+                    break;
                 }
                 Some(false) => continue, // drop unreachable branch
                 None => {}
             }
-            if v == default {
-                // Branch value equals the default: whether `s` is true or
-                // false, the observed output is the same. Drop it.
+            if seen.insert(s, ()).is_some() {
+                // A later pair with a selector already in the list is dead:
+                // if it's true, first-match already stopped at the earlier
+                // occurrence. Dropping it is required for the value==default
+                // drop below to stay sound under the mutual-exclusivity
+                // contract (s excludes other selectors, never itself).
                 continue;
             }
             filtered.push((s, v));
         }
+        // Drop pairs whose value equals the (final) default. Sound for the
+        // trailing pairs unconditionally; for interior pairs it relies on
+        // the documented caller contract that selectors are mutually
+        // exclusive (fall-through past a dropped pair must not hit a later
+        // true selector).
+        filtered.retain(|&(_, v)| v != default);
         if filtered.is_empty() {
             return default;
         }
-        if filtered.iter().all(|&(_, v)| v == filtered[0].1) && filtered[0].1 == default {
+        // Nested same-selector collapse (the n-ary analogue of the
+        // `ite(c, ite(c, x, _), e)` rules in `bv_ite`). Both rules are
+        // sound under pure first-match semantics — no mutual exclusivity
+        // required — and only fire when the inner table's selector slice
+        // is *identical* to this one's post-filter slice.
+        let outer_sels: Vec<BoolTerm> = filtered.iter().map(|p| p.0).collect();
+        let same_sel_table = |ctx: &Self, t: BvTerm| -> Option<u32> {
+            let BvOp::Select(idx) = ctx.bv_op(t) else { return None };
+            (ctx.select_tables[idx as usize].selectors[..] == outer_sels[..]).then_some(idx)
+        };
+        // Default position: the default is only reached when every selector
+        // is false, so a same-selector inner select also falls through —
+        // all its values are dead. Chase to the innermost default.
+        let mut default = default;
+        while let Some(idx) = same_sel_table(self, default) {
+            default = self.select_tables[idx as usize].default;
+        }
+        // Value position: first-match at slot `i` means selectors 0..i are
+        // false and selector i is true, so a same-selector inner select
+        // also picks slot `i`.
+        for (i, pair) in filtered.iter_mut().enumerate() {
+            while let Some(idx) = same_sel_table(self, pair.1) {
+                pair.1 = self.select_tables[idx as usize].values[i];
+            }
+        }
+        // The rewrites can newly equate values with the (possibly chased)
+        // default. Drop only the trailing run of such pairs — a suffix
+        // drop is sound under pure first-match with no exclusivity
+        // assumption (fall-through from the end always reaches `default`).
+        while let Some(&(_, v)) = filtered.last() {
+            if v != default {
+                break;
+            }
+            filtered.pop();
+        }
+        if filtered.is_empty() {
             return default;
         }
         let idx = self.select_tables.len() as u32;
