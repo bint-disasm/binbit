@@ -366,6 +366,17 @@ pub struct SmtSolver {
     banked_gen: u64,
     banked_valid: bool,
 
+    // Structural-evaluation memo (`eval_refs_from`), node-indexed:
+    // `eval_stamp[i] == eval_epoch` marks `eval_value[i]` as computed for
+    // the current walk. Persistent buffers with an epoch bump per walk
+    // replace a per-call hash map — model screening is on the batch fast
+    // path where a solve is often near-pure propagation, so the check
+    // must not pay allocation or hashing per node.
+    eval_stamp: Vec<u32>,
+    eval_value: Vec<bool>,
+    eval_epoch: u32,
+    eval_stack: Vec<u32>,
+
     // --- Metadata layer -----------------------------------------------------
     // Parallel to the SAT variable table: `var_origin[i]` records what SAT
     // variable `i` is for — a BV input bit, a gate output, an activation
@@ -435,6 +446,10 @@ impl SmtSolver {
             banked_model: Vec::new(),
             banked_gen: 0,
             banked_valid: false,
+            eval_stamp: Vec::new(),
+            eval_value: Vec::new(),
+            eval_epoch: 0,
+            eval_stack: Vec::new(),
             subst_enabled: true,
             gauss_enabled: true,
             bve_enabled: true,
@@ -893,6 +908,41 @@ impl SmtSolver {
         self.banked_gen = self.sat.model_gen();
     }
 
+    /// True iff the banked model is valid and satisfies the standing
+    /// controls (scope activations, named-assertion controls) and every
+    /// assumption term — i.e. it genuinely witnesses "assertions ∧
+    /// assumptions" as Sat, so Sat answers can be read off it for free.
+    /// Costs O(#assumptions) direct reads when the terms were
+    /// materialized by an earlier solve; structural walks happen only for
+    /// cones the model predates, and the scan exits at the first
+    /// falsified assumption. No CNF is emitted (`lit_of` is never
+    /// called): a negative answer leaves the solver byte-identical.
+    fn banked_model_holds(&mut self, assumptions: &[BoolTerm]) -> bool {
+        if !self.banked_valid {
+            return false;
+        }
+        let controls_ok = self
+            .activation_stack
+            .iter()
+            .copied()
+            .chain(self.named_controls.iter().map(|(_, l)| *l))
+            .all(|l| self.model_value_of(l, ModelSource::Banked) == LBool::True);
+        if !controls_ok {
+            return false;
+        }
+        for &t in assumptions {
+            let r = self.bitblast_bool(t);
+            let holds = match self.model_ref_fast(r, ModelSource::Banked) {
+                Some(v) => v,
+                None => self.eval_refs_from(&[r], ModelSource::Banked)[0],
+            };
+            if !holds {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn solve(&mut self) -> SmtResult {
         self.flush_pending();
         let asmps = self.built_assumptions(&[]);
@@ -1210,29 +1260,8 @@ impl SmtSolver {
             candidates.iter().map(|&t| self.bitblast_bool(t)).collect();
 
         // Warm gate: the banked model screens candidates iff it also
-        // satisfies the base — standing controls by direct reads, the
-        // caller's assumption terms via their materialized lits (O(1)
-        // each) with structural evaluation only for cones the model
-        // predates, exiting at the first falsified assumption. Lits stay
-        // unmaterialized here: `lit_of` would emit CNF, and the whole
-        // point is to touch nothing until a real solve is unavoidable.
-        let mut warm = self.banked_valid
-            && self
-                .built_assumptions(&[])
-                .iter()
-                .all(|&l| self.model_value_of(l, ModelSource::Banked) == LBool::True);
-        if warm {
-            for &t in assumptions {
-                let r = self.bitblast_bool(t);
-                let holds = self
-                    .model_ref_fast(r, ModelSource::Banked)
-                    .unwrap_or_else(|| self.eval_refs_from(&[r], ModelSource::Banked)[0]);
-                if !holds {
-                    warm = false;
-                    break;
-                }
-            }
-        }
+        // satisfies the base.
+        let warm = self.banked_model_holds(assumptions);
 
         let mut results: Vec<Option<SmtResult>> = vec![None; candidates.len()];
         // Which model screens undecided candidates: the banked one until
@@ -1304,6 +1333,64 @@ impl SmtSolver {
         // core, so this is a no-op and the banked model just survives.
         self.bank_model();
         results.into_iter().map(|r| r.unwrap()).collect()
+    }
+
+    /// Branch feasibility for a complementary pair: exactly
+    /// `solve_each_under_assumptions(&[cond, ¬cond], assumptions)`,
+    /// returned as `(result_cond, result_not_cond)`, with the pair
+    /// structure exploited outright — any model of the base satisfies
+    /// exactly one side, so a single structural evaluation hands that
+    /// side Sat for free and the one real solve goes to the other side.
+    /// There is never a reason to screen the second side against a model
+    /// that satisfied the first.
+    ///
+    /// Solve count: warm (a banked model witnesses the base) — exactly 1;
+    /// cold — a baseline solve plus 1, or just the baseline when it comes
+    /// back Unsat (both sides Unsat). This is the floor for deciding both
+    /// sides of a genuine branch: two answers need two witnesses, one of
+    /// which the standing model supplies when warm.
+    pub fn solve_pair_under_assumptions(
+        &mut self,
+        cond: BoolTerm,
+        assumptions: &[BoolTerm],
+    ) -> (SmtResult, SmtResult) {
+        self.last_result = None;
+        self.flush_pending();
+        let r = self.bitblast_bool(cond);
+
+        // Which model witnesses the base, and does it satisfy `cond`?
+        let (cond_sat, mut asmps) = if self.banked_model_holds(assumptions) {
+            (self.eval_refs_from(&[r], ModelSource::Banked)[0], None)
+        } else {
+            let extras = self.build_assumption_lits(assumptions);
+            let asmps = self.built_assumptions(&extras);
+            match self.sat.solve_under_assumptions(&asmps) {
+                SolveResult::Unsat => return (SmtResult::Unsat, SmtResult::Unsat),
+                SolveResult::Sat => {}
+            }
+            (self.eval_refs_from(&[r], ModelSource::Trail)[0], Some(asmps))
+        };
+
+        // The model-falsified side gets the one real solve. Only now may
+        // CNF be emitted (assumption lits on the warm path, the candidate
+        // lit always) — screening is done reading models.
+        let mut asmps = asmps.take().unwrap_or_else(|| {
+            let extras = self.build_assumption_lits(assumptions);
+            self.built_assumptions(&extras)
+        });
+        let lit = self.lit_of(r);
+        asmps.push(if cond_sat { !lit } else { lit });
+        let other = match self.sat.solve_under_assumptions(&asmps) {
+            SolveResult::Sat => SmtResult::Sat,
+            SolveResult::Unsat => SmtResult::Unsat,
+        };
+        // Bank the fresh model (if Sat) for the next warm start.
+        self.bank_model();
+        if cond_sat {
+            (SmtResult::Sat, other)
+        } else {
+            (other, SmtResult::Sat)
+        }
     }
 
     /// Exact unsigned `[min, max]` of `x` under assumptions — one shared
@@ -2929,7 +3016,7 @@ impl SmtSolver {
 
     /// Evaluate AIG refs under the current SAT model *without* forcing any
     /// CNF emission. See [`eval_refs_from`].
-    fn eval_refs(&self, refs: &[AigRef]) -> Vec<bool> {
+    fn eval_refs(&mut self, refs: &[AigRef]) -> Vec<bool> {
         self.eval_refs_from(refs, ModelSource::Trail)
     }
 
@@ -2981,57 +3068,103 @@ impl SmtSolver {
     /// computed structurally from the inputs. Unassigned inputs (vars
     /// created after the model) default to false, matching a "model
     /// completion with 0" convention.
-    fn eval_refs_from(&self, refs: &[AigRef], src: ModelSource) -> Vec<bool> {
-        let mut memo: HashMap<u32, bool> = HashMap::default();
+    ///
+    /// Hot path for model screening: the memo is the persistent
+    /// epoch-stamped `eval_stamp`/`eval_value` pair (no allocation, no
+    /// hashing), and an And with one false child never visits the other
+    /// child's cone. Within one call refs share the memo, so evaluating
+    /// `cond` makes `¬cond` free.
+    fn eval_refs_from(&mut self, refs: &[AigRef], src: ModelSource) -> Vec<bool> {
+        // Buffers move to locals so the walk can mutate them while
+        // reading `self` (AIG, models) — restored before returning.
+        let mut stamp = std::mem::take(&mut self.eval_stamp);
+        let mut value = std::mem::take(&mut self.eval_value);
+        let mut stack = std::mem::take(&mut self.eval_stack);
+        self.eval_epoch = self.eval_epoch.wrapping_add(1);
+        if self.eval_epoch == 0 {
+            // Epoch wrapped: stale stamps could collide. Hard reset.
+            stamp.clear();
+            self.eval_epoch = 1;
+        }
+        let epoch = self.eval_epoch;
+        if stamp.len() < self.aig.num_nodes() {
+            stamp.resize(self.aig.num_nodes(), 0);
+            value.resize(self.aig.num_nodes(), false);
+        }
+
         let mut out = Vec::with_capacity(refs.len());
-        let mut stack: Vec<u32> = Vec::new();
         for &r in refs {
-            let idx = r.node_idx();
-            if !memo.contains_key(&idx) {
-                stack.push(idx);
+            let root = r.node_idx() as usize;
+            if stamp[root] != epoch {
+                stack.push(r.node_idx());
                 while let Some(&top) = stack.last() {
-                    if memo.contains_key(&top) {
+                    let ti = top as usize;
+                    if stamp[ti] == epoch {
                         stack.pop();
                         continue;
                     }
                     // Materialized + assigned: read the model directly.
-                    if let Some(Some(l)) = self.aig_lit.get(top as usize) {
+                    if let Some(Some(l)) = self.aig_lit.get(ti) {
                         let v = self.model_value_of(*l, src);
                         if v != LBool::Undef {
-                            memo.insert(top, v == LBool::True);
+                            stamp[ti] = epoch;
+                            value[ti] = v == LBool::True;
                             stack.pop();
                             continue;
                         }
                     }
                     match self.aig.node(top) {
                         AigNode::ConstTrue => {
-                            memo.insert(top, true);
+                            stamp[ti] = epoch;
+                            value[ti] = true;
                             stack.pop();
                         }
                         AigNode::Input(l) => {
-                            memo.insert(top, self.model_value_of(l, src) == LBool::True);
+                            stamp[ti] = epoch;
+                            value[ti] = self.model_value_of(l, src) == LBool::True;
                             stack.pop();
                         }
                         AigNode::And(a, b) => {
-                            let ai = a.node_idx();
-                            let bi = b.node_idx();
-                            match (memo.get(&ai).copied(), memo.get(&bi).copied()) {
-                                (Some(av), Some(bv)) => {
-                                    let av = av ^ a.is_negated();
-                                    let bv = bv ^ b.is_negated();
-                                    memo.insert(top, av && bv);
+                            let ai = a.node_idx() as usize;
+                            let bi = b.node_idx() as usize;
+                            let av = (stamp[ai] == epoch)
+                                .then(|| value[ai] ^ a.is_negated());
+                            // Short-circuit: one false child decides the
+                            // node without visiting the other's cone.
+                            if av == Some(false) {
+                                stamp[ti] = epoch;
+                                value[ti] = false;
+                                stack.pop();
+                                continue;
+                            }
+                            let bv = (stamp[bi] == epoch)
+                                .then(|| value[bi] ^ b.is_negated());
+                            if bv == Some(false) {
+                                stamp[ti] = epoch;
+                                value[ti] = false;
+                                stack.pop();
+                                continue;
+                            }
+                            match (av, bv) {
+                                // Neither child is false: both true.
+                                (Some(_), Some(_)) => {
+                                    stamp[ti] = epoch;
+                                    value[ti] = true;
                                     stack.pop();
                                 }
-                                (None, _) => stack.push(ai),
-                                (_, None) => stack.push(bi),
+                                (None, _) => stack.push(a.node_idx()),
+                                (_, None) => stack.push(b.node_idx()),
                             }
                         }
                     }
                 }
             }
-            let base = memo[&idx];
-            out.push(base ^ r.is_negated());
+            out.push(value[root] ^ r.is_negated());
         }
+        stack.clear();
+        self.eval_stamp = stamp;
+        self.eval_value = value;
+        self.eval_stack = stack;
         out
     }
 

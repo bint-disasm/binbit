@@ -448,6 +448,78 @@ fn bench_branch_fanout_warm_vs_individual() {
     );
 }
 
+/// Timing in the fast-solve regime: constraints so easy every SAT check
+/// is near-pure propagation. Here the batch's fixed overhead (structural
+/// model screening) competes directly with just running both solves, so
+/// this pins the worst case for `solve_each` vs two independent solves.
+///   cargo test --release --test solve_each -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_branch_fanout_trivial() {
+    use std::time::Instant;
+
+    const ROUNDS: u32 = 4000;
+
+    fn setup() -> (SmtSolver, binbit::BvTerm, binbit::BvTerm) {
+        let mut s = SmtSolver::new();
+        let x = s.bv_var(16);
+        let y = s.bv_var(16);
+        let bound = s.bv_const(1000, 16);
+        let below = s.bv_ult(x, bound);
+        s.assert(below);
+        (s, x, y)
+    }
+
+    // Two independent solves per round, no reach solve.
+    let (mut s, x, y) = setup();
+    let t0 = Instant::now();
+    for r in 0..ROUNDS {
+        let rc = s.bv_const(r as u128 % 500, 16);
+        let pc = s.bv_eq(y, rc);
+        let k = s.bv_const((r as u128 % 999) + 1, 16);
+        let cond = s.bv_ult(x, k);
+        let not_cond = s.bool_not(cond);
+        let a = s.solve_under_assumptions(&[pc, cond]);
+        let b = s.solve_under_assumptions(&[pc, not_cond]);
+        assert!(a == SmtResult::Sat || b == SmtResult::Sat);
+    }
+    let individual = t0.elapsed();
+
+    // One batch per round, same queries.
+    let (mut s, x, y) = setup();
+    let t0 = Instant::now();
+    for r in 0..ROUNDS {
+        let rc = s.bv_const(r as u128 % 500, 16);
+        let pc = s.bv_eq(y, rc);
+        let k = s.bv_const((r as u128 % 999) + 1, 16);
+        let cond = s.bv_ult(x, k);
+        let not_cond = s.bool_not(cond);
+        let res = s.solve_each_under_assumptions(&[cond, not_cond], &[pc]);
+        assert!(res.contains(&SmtResult::Sat));
+    }
+    let batch = t0.elapsed();
+
+    // The pair-specialized entry point, same queries.
+    let (mut s, x, y) = setup();
+    let t0 = Instant::now();
+    for r in 0..ROUNDS {
+        let rc = s.bv_const(r as u128 % 500, 16);
+        let pc = s.bv_eq(y, rc);
+        let k = s.bv_const((r as u128 % 999) + 1, 16);
+        let cond = s.bv_ult(x, k);
+        let res = s.solve_pair_under_assumptions(cond, &[pc]);
+        assert!(res.0 == SmtResult::Sat || res.1 == SmtResult::Sat);
+    }
+    let pair = t0.elapsed();
+
+    println!(
+        "trivial fan-out, {ROUNDS} rounds: individual {individual:?}, \
+         batch {batch:?} ({:.2}x), pair {pair:?} ({:.2}x)",
+        individual.as_secs_f64() / batch.as_secs_f64(),
+        individual.as_secs_f64() / pair.as_secs_f64()
+    );
+}
+
 /// Timing on the real symbex shape: (almost) no assertions, ALL path
 /// constraints carried as assumptions, constraints accumulating between
 /// branch points. Two variants: with a reach-solve of the constraints
@@ -469,6 +541,10 @@ fn bench_symbex_assumption_shape() {
     // between the reach solve and the fan-out — it rewinds the SAT trail
     // and used to kill the warm start.
     fn run(reach_solve: bool, probe: bool) -> std::time::Duration {
+        run_impl(reach_solve, probe, false)
+    }
+
+    fn run_impl(reach_solve: bool, probe: bool, use_pair: bool) -> std::time::Duration {
         let mut s = SmtSolver::new();
         let mut x = s.bv_var(32);
         let mut constraints: Vec<BoolTerm> = Vec::new();
@@ -497,7 +573,12 @@ fn bench_symbex_assumption_shape() {
             }
             let cond = s.bv_ult(x2, k);
             let not_cond = s.bool_not(cond);
-            let res = s.solve_each_under_assumptions(&[cond, not_cond], &constraints);
+            let res = if use_pair {
+                let (a, b) = s.solve_pair_under_assumptions(cond, &constraints);
+                vec![a, b]
+            } else {
+                s.solve_each_under_assumptions(&[cond, not_cond], &constraints)
+            };
             assert!(res.contains(&SmtResult::Sat));
             // Take a feasible branch, symbex-style.
             constraints.push(if res[0] == SmtResult::Sat { cond } else { not_cond });
@@ -508,10 +589,93 @@ fn bench_symbex_assumption_shape() {
     let no_reach = run(false, false);
     let with_reach = run(true, false);
     let with_probe = run(true, true);
+    let pair_no_reach = run_impl(false, false, true);
     println!(
         "symbex shape, {ROUNDS} rounds: solve_each only {no_reach:?}, \
          reach-solve + solve_each {with_reach:?}, \
-         reach-solve + known-bits probe + solve_each {with_probe:?}"
+         reach-solve + known-bits probe + solve_each {with_probe:?}, \
+         solve_pair only {pair_no_reach:?}"
+    );
+}
+
+// ---------- solve_pair ----------
+
+#[test]
+fn pair_matches_individual_solves() {
+    // Random branch conditions under random assumption sets: the pair
+    // result must equal per-side solve_under_assumptions on a fresh
+    // solver, warm or cold, and leave no residue.
+    let mut rng = Rng::new(0xFA1);
+    for _trial in 0..50 {
+        let spec = TrialSpec {
+            bound: 200 + rng.uniform_u32(200) as u128,
+            cands: vec![(rng.uniform_u32(2) == 0, rng.uniform_u32(600) as u128)],
+            asmps: (0..rng.uniform_u32(3) as usize)
+                .map(|_| rng.uniform_u32(400) as u128)
+                .collect(),
+        };
+        let expected: Vec<SmtResult> = [false, true]
+            .iter()
+            .map(|&neg| {
+                let (mut fresh, cands, asmps) = build(&spec);
+                let side = if neg { fresh.bool_not(cands[0]) } else { cands[0] };
+                let mut a = asmps.clone();
+                a.push(side);
+                fresh.solve_under_assumptions(&a)
+            })
+            .collect();
+
+        let (mut s, cands, asmps) = build(&spec);
+        if rng.uniform_u32(2) == 0 {
+            // Warm the solver with a base solve first.
+            let _ = s.solve_under_assumptions(&asmps);
+        }
+        let (rc, rn) = s.solve_pair_under_assumptions(cands[0], &asmps);
+        assert_eq!(vec![rc, rn], expected, "pair diverged from individual solves");
+
+        // No residue.
+        let (rc2, rn2) = s.solve_pair_under_assumptions(cands[0], &asmps);
+        assert_eq!((rc2, rn2), (rc, rn), "pair left residue");
+    }
+}
+
+#[test]
+fn pair_unsat_base_is_one_result() {
+    let mut s = SmtSolver::new();
+    let x = s.bv_var(8);
+    let one = s.bv_const(1, 8);
+    let two = s.bv_const(2, 8);
+    let a1 = s.bv_eq(x, one);
+    let a2 = s.bv_eq(x, two);
+    let c = s.bv_ult(x, two);
+    let res = s.solve_pair_under_assumptions(c, &[a1, a2]);
+    assert_eq!(res, (SmtResult::Unsat, SmtResult::Unsat));
+    // Not poisoned.
+    assert_eq!(s.solve_under_assumptions(&[a1]), SmtResult::Sat);
+}
+
+#[test]
+fn pair_forced_sides_are_exact() {
+    let mut s = SmtSolver::new();
+    let x = s.bv_var(32);
+    let ten = s.bv_const(10, 32);
+    let below = s.bv_ult(x, ten);
+    s.assert(below);
+    let pc = below;
+    assert_eq!(s.solve_under_assumptions(&[pc]), SmtResult::Sat);
+
+    // cond covers all of pc's models: (Sat, Unsat).
+    let twenty = s.bv_const(20, 32);
+    let tauto = s.bv_ult(x, twenty);
+    assert_eq!(
+        s.solve_pair_under_assumptions(tauto, &[pc]),
+        (SmtResult::Sat, SmtResult::Unsat)
+    );
+    // cond infeasible under pc: (Unsat, Sat).
+    let infeasible = s.bv_eq(x, twenty);
+    assert_eq!(
+        s.solve_pair_under_assumptions(infeasible, &[pc]),
+        (SmtResult::Unsat, SmtResult::Sat)
     );
 }
 
