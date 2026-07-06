@@ -644,6 +644,10 @@ pub struct Solver {
     // values. Lets callers reuse the standing model to screen candidates
     // without a redundant re-solve.
     has_model: bool,
+    // Bumped every time `has_model` is set — distinguishes one standing
+    // model from the next, so a caller that copies the assignment out can
+    // tell whether its copy is already up to date.
+    model_gen: u64,
 }
 
 impl Solver {
@@ -711,6 +715,7 @@ impl Solver {
             has_wide_original: false,
             dead: false,
             has_model: false,
+            model_gen: 0,
         }
     }
 
@@ -2063,6 +2068,7 @@ impl Solver {
                 match chosen {
                     None => {
                         self.has_model = true;
+                        self.model_gen += 1;
                         return Some(SolveResult::Sat);
                     }
                     Some(lit) => {
@@ -2128,6 +2134,22 @@ impl Solver {
     /// (variables created after the solve read Undef; complete with false).
     pub fn has_model(&self) -> bool {
         self.has_model
+    }
+
+    /// Generation counter of the standing model: bumped on every Sat
+    /// return. Two reads returning the same value with [`has_model`] true
+    /// in between refer to the same assignment.
+    pub fn model_gen(&self) -> u64 {
+        self.model_gen
+    }
+
+    /// Copy the current assignment into `out` as a literal-indexed table
+    /// (`out[lit.idx()]`, same layout as the internal `lit_value`). Callers
+    /// snapshot the standing model this way before an operation that will
+    /// rewind the trail. Meaningful only while [`has_model`] is true.
+    pub fn copy_model_into(&self, out: &mut Vec<LBool>) {
+        out.clear();
+        out.extend_from_slice(&self.lit_value);
     }
 
     /// The UNSAT core from the most recent [`solve_under_assumptions`] call

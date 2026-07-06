@@ -170,6 +170,15 @@ enum NodeShape {
     NotMux { s: AigRef, t: AigRef, e: AigRef },
 }
 
+/// Which assignment [`SmtSolver::eval_refs_from`] and friends read: the
+/// live SAT trail (valid right after a Sat solve) or the banked copy kept
+/// across trail rewinds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelSource {
+    Trail,
+    Banked,
+}
+
 pub struct SmtSolver {
     pub ctx: BvContext,
     sat: Solver,
@@ -334,6 +343,29 @@ pub struct SmtSolver {
     // callers check first.
     last_result: Option<SmtResult>,
 
+    // Banked model: a copy of the SAT assignment from a past Sat solve
+    // (literal-indexed, same layout as the solver's own table), kept at
+    // this layer because the trail model is destroyed by far more than
+    // semantic change — known-bits probes, Tseitin emission for a new
+    // term, even a later Unsat solve all rewind the trail while every
+    // model of the OLD clause set is still a model of the new one. The
+    // copy is what `solve_each_under_assumptions` screens candidates
+    // against ("warm start"). Only genuinely semantic events invalidate
+    // it: flushing pending assertions (which can also act by pure
+    // substitution, hence poisoning the generation, see below). Scope
+    // pops and `solve_many_u` sessions keep it valid — their clauses are
+    // guarded by activation literals that occur only negatively, so the
+    // banked model extends to a true model by completing those guards
+    // with false.
+    banked_model: Vec<LBool>,
+    // Which `Solver::model_gen` the copy came from. Doubles as a poison
+    // marker: invalidation records the CURRENT generation with
+    // `banked_valid = false`, so a standing trail model whose semantics
+    // were changed without emitting a clause (top-level substitution)
+    // cannot be re-banked.
+    banked_gen: u64,
+    banked_valid: bool,
+
     // --- Metadata layer -----------------------------------------------------
     // Parallel to the SAT variable table: `var_origin[i]` records what SAT
     // variable `i` is for — a BV input bit, a gate output, an activation
@@ -400,6 +432,9 @@ impl SmtSolver {
             normalize_enabled: true,
             norm_bool_memo: HashMap::default(),
             norm_bv_memo: HashMap::default(),
+            banked_model: Vec::new(),
+            banked_gen: 0,
+            banked_valid: false,
             subst_enabled: true,
             gauss_enabled: true,
             bve_enabled: true,
@@ -818,6 +853,11 @@ impl SmtSolver {
     pub fn pop(&mut self) {
         self.last_result = None;
         if let Some(act) = self.activation_stack.pop() {
+            // Retraction only weakens the formula, so a standing model
+            // survives it semantically — bank it before the retire clause
+            // rewinds the trail. (`act` occurs only negatively, so the
+            // banked model completes to a true model with `act = false`.)
+            self.bank_model();
             // Any pending (un-flushed) assertions in this scope are simply
             // dropped — they never reached the SAT solver. Flushed assertions
             // are already guarded by `act` and become vacuous once `act=false`.
@@ -829,6 +869,28 @@ impl SmtSolver {
     /// Current number of open push scopes.
     pub fn scope_depth(&self) -> usize {
         self.activation_stack.len()
+    }
+
+    /// Copy the standing trail model (if any, not yet banked, and not
+    /// poisoned) into the banked model. Called before operations that
+    /// rewind the trail; the copy stays usable for warm screening until
+    /// assertion semantics change. One memcpy of the assignment table,
+    /// and only when a new model actually appeared since the last bank.
+    fn bank_model(&mut self) {
+        if self.sat.has_model() && self.banked_gen != self.sat.model_gen() {
+            self.banked_gen = self.sat.model_gen();
+            self.banked_valid = true;
+            self.sat.copy_model_into(&mut self.banked_model);
+        }
+    }
+
+    /// Semantic change: the banked model can no longer vouch for SAT
+    /// answers. Recording the current generation also blocks re-banking a
+    /// standing trail model that the change made stale without touching
+    /// the trail (a flush absorbed by pure substitution).
+    fn invalidate_banked_model(&mut self) {
+        self.banked_valid = false;
+        self.banked_gen = self.sat.model_gen();
     }
 
     pub fn solve(&mut self) -> SmtResult {
@@ -1116,51 +1178,67 @@ impl SmtSolver {
     /// branch/target fan-outs, typically a large fraction of candidates
     /// resolve without touching the SAT core.
     ///
-    /// Warm start: if the solver still holds an intact model from the
-    /// caller's previous solve (the typical symbex shape — the path
-    /// condition was just solved to reach this state) and that model also
-    /// satisfies `assumptions`, screening starts from it directly: the
-    /// baseline solve is skipped, and candidates the standing model
-    /// satisfies cost zero SAT work and zero CNF. A branch fan-out
-    /// `solve_each_under_assumptions(&[cond, not_cond], pc)` right after
-    /// solving `pc` does at most one real solve instead of two.
+    /// Warm start: if a model from some previous solve is still
+    /// semantically valid (the banked model — it survives trail rewinds
+    /// from known-bits probes, CNF emission, even Unsat solves, and dies
+    /// only when new assertions land) and it satisfies `assumptions`,
+    /// screening starts from it directly: the baseline solve is skipped,
+    /// and candidates the model satisfies cost zero SAT work and zero
+    /// CNF. A branch fan-out `solve_each_under_assumptions(&[cond,
+    /// not_cond], pc)` anywhere downstream of a solve of `pc` does at
+    /// most one real solve instead of two. Validating the model against
+    /// the assumptions is O(#assumptions) reads when they were
+    /// materialized by an earlier solve, and exits at the first
+    /// falsified one — a stale model costs no cone walks over old
+    /// constraints.
     ///
-    /// `last_result` is cleared. The previous model is invalidated unless
-    /// the warm path decided every candidate without any SAT call, in
-    /// which case it survives and can warm the next batch too.
+    /// `last_result` is cleared. The batch's final model (from its last
+    /// internal Sat solve, or the still-valid banked model if everything
+    /// screened) is banked and can warm the next batch.
     pub fn solve_each_under_assumptions(
         &mut self,
         candidates: &[BoolTerm],
         assumptions: &[BoolTerm],
     ) -> Vec<SmtResult> {
         self.last_result = None;
-        // Pending work can change semantics without emitting CNF
-        // (top-level substitutions), which `has_model` alone can't see —
-        // warm start additionally requires flush to be a true no-op.
-        let had_pending = self.pending.iter().any(|q| !q.is_empty());
+        // Banks a standing trail model; a flush with real work instead
+        // invalidates the banked model (new assertions change semantics).
         self.flush_pending();
         // Bitblast every candidate up front — AIG only, no CNF emission —
         // so model screening can evaluate them structurally.
         let cand_refs: Vec<AigRef> =
             candidates.iter().map(|&t| self.bitblast_bool(t)).collect();
 
-        // Warm start: the trail may still hold an intact model. It screens
-        // candidates iff it also satisfies the base assumptions — standing
-        // controls checked by direct trail reads, the caller's assumption
-        // terms by structural evaluation (their lits stay unmaterialized
-        // here: `lit_of` could emit CNF and destroy the very model being
-        // read).
-        let mut model_valid = !had_pending && self.sat.has_model() && {
-            let asm_refs: Vec<AigRef> =
-                assumptions.iter().map(|&t| self.bitblast_bool(t)).collect();
-            self.built_assumptions(&[])
+        // Warm gate: the banked model screens candidates iff it also
+        // satisfies the base — standing controls by direct reads, the
+        // caller's assumption terms via their materialized lits (O(1)
+        // each) with structural evaluation only for cones the model
+        // predates, exiting at the first falsified assumption. Lits stay
+        // unmaterialized here: `lit_of` would emit CNF, and the whole
+        // point is to touch nothing until a real solve is unavoidable.
+        let mut warm = self.banked_valid
+            && self
+                .built_assumptions(&[])
                 .iter()
-                .all(|&l| self.sat.value_of(l) == LBool::True)
-                && self.eval_refs(&asm_refs).into_iter().all(|v| v)
-        };
-        let warm = model_valid;
+                .all(|&l| self.model_value_of(l, ModelSource::Banked) == LBool::True);
+        if warm {
+            for &t in assumptions {
+                let r = self.bitblast_bool(t);
+                let holds = self
+                    .model_ref_fast(r, ModelSource::Banked)
+                    .unwrap_or_else(|| self.eval_refs_from(&[r], ModelSource::Banked)[0]);
+                if !holds {
+                    warm = false;
+                    break;
+                }
+            }
+        }
 
         let mut results: Vec<Option<SmtResult>> = vec![None; candidates.len()];
+        // Which model screens undecided candidates: the banked one until
+        // the first internal solve, the live trail afterwards.
+        let mut screen_src = ModelSource::Banked;
+        let mut model_valid = warm;
         // Built lazily, at the first candidate needing a real solve — a
         // warm run that screens everything never touches the SAT core.
         let mut base_asmps: Option<Vec<Lit>> = None;
@@ -1171,7 +1249,7 @@ impl SmtSolver {
                 let pending: Vec<usize> =
                     (0..results.len()).filter(|&i| results[i].is_none()).collect();
                 let refs: Vec<AigRef> = pending.iter().map(|&i| cand_refs[i]).collect();
-                for (&i, sat) in pending.iter().zip(self.eval_refs(&refs)) {
+                for (&i, sat) in pending.iter().zip(self.eval_refs_from(&refs, screen_src)) {
                     if sat {
                         results[i] = Some(SmtResult::Sat);
                     }
@@ -1192,6 +1270,7 @@ impl SmtSolver {
                         SolveResult::Sat => {
                             base_asmps = Some(asmps);
                             model_valid = true;
+                            screen_src = ModelSource::Trail;
                             continue;
                         }
                         SolveResult::Unsat => {
@@ -1202,7 +1281,8 @@ impl SmtSolver {
                 base_asmps = Some(asmps);
             }
             // Materializing the candidate lit may emit CNF, which rewinds
-            // the trail — done only now, after screening used the model.
+            // the trail — safe for the banked model, but done only now so
+            // a fully-screened batch emits nothing.
             let lit = self.lit_of(cand_refs[next]);
             let mut asmps = base_asmps.as_ref().unwrap().clone();
             asmps.push(lit);
@@ -1210,6 +1290,7 @@ impl SmtSolver {
                 SolveResult::Sat => {
                     results[next] = Some(SmtResult::Sat);
                     model_valid = true;
+                    screen_src = ModelSource::Trail;
                 }
                 SolveResult::Unsat => {
                     results[next] = Some(SmtResult::Unsat);
@@ -1217,6 +1298,11 @@ impl SmtSolver {
                 }
             }
         }
+        // Bank the batch's final model (if its last solve was Sat) so the
+        // next batch can start warm even after intervening probes or CNF
+        // emission. A fully-screened warm batch never touched the SAT
+        // core, so this is a no-op and the banked model just survives.
+        self.bank_model();
         results.into_iter().map(|r| r.unwrap()).collect()
     }
 
@@ -2280,7 +2366,21 @@ impl SmtSolver {
     /// core (guarded by activation literals for scopes ≥ 1).
     fn flush_pending(&mut self) {
         let has_work = self.pending.iter().any(|q| !q.is_empty());
-        if has_work {
+        if !has_work {
+            // Flush is the funnel every solve/probe/batch entry point runs
+            // through, right before the SAT core (possibly) rewinds the
+            // trail — the one reliable moment to bank a standing model.
+            self.bank_model();
+            self.resolve_pending_ites();
+            return;
+        }
+        {
+            // New assertions strengthen the formula: neither the banked
+            // model nor the standing trail model can vouch for it anymore.
+            // (This also poisons the current generation — a flush absorbed
+            // entirely by top-level substitution changes semantics without
+            // emitting a single clause, leaving the trail intact.)
+            self.invalidate_banked_model();
             // Variables at or above this index were allocated by (and are
             // only visible to) this batch — eligible for elimination if
             // they're gate outputs. Everything older may be referenced by
@@ -2828,13 +2928,60 @@ impl SmtSolver {
     }
 
     /// Evaluate AIG refs under the current SAT model *without* forcing any
-    /// CNF emission. Nodes with an assigned materialized lit read straight
+    /// CNF emission. See [`eval_refs_from`].
+    fn eval_refs(&self, refs: &[AigRef]) -> Vec<bool> {
+        self.eval_refs_from(refs, ModelSource::Trail)
+    }
+
+    /// A literal's value in the chosen model: the live SAT trail, or the
+    /// banked copy (where literals from variables created after banking
+    /// read Undef).
+    #[inline]
+    fn model_value_of(&self, l: Lit, src: ModelSource) -> LBool {
+        match src {
+            ModelSource::Trail => self.sat.value_of(l),
+            ModelSource::Banked => self
+                .banked_model
+                .get(l.idx())
+                .copied()
+                .unwrap_or(LBool::Undef),
+        }
+    }
+
+    /// Model value of `r` via its materialized SAT lit only — no
+    /// structural walk. `None` when the node is unmaterialized or its lit
+    /// is unassigned in the chosen model; callers fall back to
+    /// [`eval_refs_from`]. This is the O(1) fast path that keeps warm-gate
+    /// validation linear in the number of assumptions for the common case
+    /// where they were materialized by an earlier solve.
+    #[inline]
+    fn model_ref_fast(&self, r: AigRef, src: ModelSource) -> Option<bool> {
+        let idx = r.node_idx();
+        let base = match self.aig.node(idx) {
+            AigNode::ConstTrue => true,
+            AigNode::Input(l) => match self.model_value_of(l, src) {
+                LBool::Undef => return None,
+                v => v == LBool::True,
+            },
+            AigNode::And(..) => match self.node_lit(idx) {
+                Some(l) => match self.model_value_of(l, src) {
+                    LBool::Undef => return None,
+                    v => v == LBool::True,
+                },
+                None => return None,
+            },
+        };
+        Some(base ^ r.is_negated())
+    }
+
+    /// Evaluate AIG refs under the chosen model *without* forcing any CNF
+    /// emission. Nodes with an assigned materialized lit read straight
     /// from the model (and don't recurse — Tseitin consistency guarantees
     /// the stored value matches the recomputed one); everything else is
     /// computed structurally from the inputs. Unassigned inputs (vars
-    /// created after the last solve) default to false, matching a "model
+    /// created after the model) default to false, matching a "model
     /// completion with 0" convention.
-    fn eval_refs(&self, refs: &[AigRef]) -> Vec<bool> {
+    fn eval_refs_from(&self, refs: &[AigRef], src: ModelSource) -> Vec<bool> {
         let mut memo: HashMap<u32, bool> = HashMap::default();
         let mut out = Vec::with_capacity(refs.len());
         let mut stack: Vec<u32> = Vec::new();
@@ -2849,7 +2996,7 @@ impl SmtSolver {
                     }
                     // Materialized + assigned: read the model directly.
                     if let Some(Some(l)) = self.aig_lit.get(top as usize) {
-                        let v = self.sat.value_of(*l);
+                        let v = self.model_value_of(*l, src);
                         if v != LBool::Undef {
                             memo.insert(top, v == LBool::True);
                             stack.pop();
@@ -2862,7 +3009,7 @@ impl SmtSolver {
                             stack.pop();
                         }
                         AigNode::Input(l) => {
-                            memo.insert(top, self.sat.value_of(l) == LBool::True);
+                            memo.insert(top, self.model_value_of(l, src) == LBool::True);
                             stack.pop();
                         }
                         AigNode::And(a, b) => {

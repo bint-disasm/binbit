@@ -195,6 +195,134 @@ fn warm_start_branch_fanout_single_solve() {
 }
 
 #[test]
+fn warm_survives_known_bits_probe() {
+    // A known-bits probe (the symbex fast-range pipeline) rewinds the SAT
+    // trail but changes no semantics: the banked model must still screen
+    // a following batch with zero SAT work.
+    let mut s = SmtSolver::new();
+    let x = s.bv_var(32);
+    let y = s.bv_var(32);
+    let hundred = s.bv_const(100, 32);
+    let below = s.bv_ult(x, hundred);
+    s.assert(below);
+
+    let pc = s.bv_ult(y, hundred);
+    assert_eq!(s.solve_under_assumptions(&[pc]), SmtResult::Sat);
+    let xv = s.get_bv_value(x) as u128;
+    let yv = s.get_bv_value(y) as u128;
+
+    // Trail-destroying, semantics-preserving interlude.
+    assert!(s.bv_known_bits_under_assumptions(x, &[pc]).is_some());
+
+    let xc = s.bv_const(xv, 32);
+    let yc = s.bv_const(yv, 32);
+    let c1 = s.bv_eq(x, xc);
+    let c2 = s.bv_eq(y, yc);
+    let before = s.sat_stats();
+    let res = s.solve_each_under_assumptions(&[c1, c2], &[pc]);
+    let after = s.sat_stats();
+    assert_eq!(res, vec![SmtResult::Sat; 2]);
+    assert_eq!(after.decisions, before.decisions, "probe killed the warm start");
+    assert_eq!(after.sat_clauses, before.sat_clauses);
+    assert_eq!(after.sat_vars, before.sat_vars);
+}
+
+#[test]
+fn warm_survives_unsat_side_query() {
+    // An Unsat solve only adds implied (learned) clauses — every model of
+    // the old formula still models the new one, so the banked model must
+    // keep warming batches afterwards.
+    let mut s = SmtSolver::new();
+    let x = s.bv_var(32);
+    let y = s.bv_var(32);
+    let hundred = s.bv_const(100, 32);
+    let below = s.bv_ult(x, hundred);
+    s.assert(below);
+
+    let pc = s.bv_ult(y, hundred);
+    assert_eq!(s.solve_under_assumptions(&[pc]), SmtResult::Sat);
+    let xv = s.get_bv_value(x) as u128;
+    let yv = s.get_bv_value(y) as u128;
+
+    let not_below = s.bool_not(below);
+    assert_eq!(s.solve_under_assumptions(&[not_below]), SmtResult::Unsat);
+
+    let xc = s.bv_const(xv, 32);
+    let yc = s.bv_const(yv, 32);
+    let c1 = s.bv_eq(x, xc);
+    let c2 = s.bv_eq(y, yc);
+    let before = s.sat_stats();
+    let res = s.solve_each_under_assumptions(&[c1, c2], &[pc]);
+    let after = s.sat_stats();
+    assert_eq!(res, vec![SmtResult::Sat; 2]);
+    assert_eq!(after.decisions, before.decisions, "unsat query killed the warm start");
+    assert_eq!(after.sat_clauses, before.sat_clauses);
+}
+
+#[test]
+fn warm_survives_pop() {
+    // Popping a scope retracts assertions — weakening — so the model from
+    // a solve taken inside the scope stays valid outside it.
+    let mut s = SmtSolver::new();
+    let x = s.bv_var(32);
+    let y = s.bv_var(32);
+    let hundred = s.bv_const(100, 32);
+    let five = s.bv_const(5, 32);
+    let below = s.bv_ult(x, hundred);
+    s.assert(below);
+
+    s.push();
+    let above5 = s.bv_ult(five, x);
+    s.assert(above5);
+    let pc = s.bv_ult(y, hundred);
+    assert_eq!(s.solve_under_assumptions(&[pc]), SmtResult::Sat);
+    let xv = s.get_bv_value(x) as u128;
+    let yv = s.get_bv_value(y) as u128;
+    s.pop();
+
+    let xc = s.bv_const(xv, 32);
+    let yc = s.bv_const(yv, 32);
+    let c1 = s.bv_eq(x, xc);
+    let c2 = s.bv_eq(y, yc);
+    let before = s.sat_stats();
+    let res = s.solve_each_under_assumptions(&[c1, c2], &[pc]);
+    let after = s.sat_stats();
+    assert_eq!(res, vec![SmtResult::Sat; 2]);
+    assert_eq!(after.decisions, before.decisions, "pop killed the warm start");
+    assert_eq!(after.sat_clauses, before.sat_clauses);
+}
+
+#[test]
+fn warm_carries_across_batches_without_reach_solve() {
+    // The user-shaped loop: no reach solve at all. Batch 1 runs cold, but
+    // its final internal Sat solve leaves a model that must warm batch 2.
+    let mut s = SmtSolver::new();
+    let x = s.bv_var(32);
+    let hundred = s.bv_const(100, 32);
+    let below = s.bv_ult(x, hundred);
+    s.assert(below);
+
+    let fifty = s.bv_const(50, 32);
+    let cond = s.bv_ult(x, fifty);
+    let not_cond = s.bool_not(cond);
+    let res1 = s.solve_each_under_assumptions(&[cond, not_cond], &[]);
+    assert_eq!(res1, vec![SmtResult::Sat; 2]);
+
+    // Whatever the last internal solve's model said, a candidate built
+    // from it must screen for free in the next batch.
+    let xv = s.get_bv_value(x) as u128;
+    let xc = s.bv_const(xv, 32);
+    let c = s.bv_eq(x, xc);
+    let before = s.sat_stats();
+    let res2 = s.solve_each_under_assumptions(&[c], &[]);
+    let after = s.sat_stats();
+    assert_eq!(res2, vec![SmtResult::Sat]);
+    assert_eq!(after.decisions, before.decisions, "batch model didn't carry over");
+    assert_eq!(after.sat_clauses, before.sat_clauses);
+    assert_eq!(after.sat_vars, before.sat_vars);
+}
+
+#[test]
 fn warm_start_falls_back_when_model_violates_assumptions() {
     // The standing model (x = 3) falsifies the batch's assumptions, so
     // the warm path must NOT screen with it; results must be exact.
@@ -317,6 +445,73 @@ fn bench_branch_fanout_warm_vs_individual() {
         "branch fan-out, {ROUNDS} rounds: individual {individual:?}, \
          batch(warm) {batch:?} ({:.1}x)",
         individual.as_secs_f64() / batch.as_secs_f64()
+    );
+}
+
+/// Timing on the real symbex shape: (almost) no assertions, ALL path
+/// constraints carried as assumptions, constraints accumulating between
+/// branch points. Two variants: with a reach-solve of the constraints
+/// right before each fan-out (warm intended), and without (the standing
+/// model is stale — from the previous round's candidate solve).
+///   cargo test --release --test solve_each -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_symbex_assumption_shape() {
+    use std::time::Instant;
+
+    const ROUNDS: u32 = 200;
+
+    // One symbolic step per round: x_{r+1} = x_r * 3 + r (fresh var each
+    // round, linked by an assumption), then branch on x_{r+1} < 2^16.
+    // Mul by an odd constant is a bijection mod 2^32, so both branch
+    // sides stay feasible and every solve does real inversion work.
+    // `probe` inserts a known-bits probe (the fast-range pipeline)
+    // between the reach solve and the fan-out — it rewinds the SAT trail
+    // and used to kill the warm start.
+    fn run(reach_solve: bool, probe: bool) -> std::time::Duration {
+        let mut s = SmtSolver::new();
+        let mut x = s.bv_var(32);
+        let mut constraints: Vec<BoolTerm> = Vec::new();
+        let k = s.bv_const(1 << 16, 32);
+        let three = s.bv_const(3, 32);
+        let t0 = Instant::now();
+        for r in 0..ROUNDS {
+            let x2 = s.bv_var(32);
+            let m = s.bv_mul(x, three);
+            let rc = s.bv_const(r as u128, 32);
+            let sum = s.bv_add(m, rc);
+            let link = s.bv_eq(x2, sum);
+            constraints.push(link);
+            x = x2;
+
+            if reach_solve {
+                assert_eq!(
+                    s.solve_under_assumptions(&constraints),
+                    SmtResult::Sat
+                );
+            }
+            if probe {
+                assert!(s
+                    .bv_known_bits_under_assumptions(x2, &constraints)
+                    .is_some());
+            }
+            let cond = s.bv_ult(x2, k);
+            let not_cond = s.bool_not(cond);
+            let res = s.solve_each_under_assumptions(&[cond, not_cond], &constraints);
+            assert!(res.contains(&SmtResult::Sat));
+            // Take a feasible branch, symbex-style.
+            constraints.push(if res[0] == SmtResult::Sat { cond } else { not_cond });
+        }
+        t0.elapsed()
+    }
+
+    let no_reach = run(false, false);
+    let with_reach = run(true, false);
+    let with_probe = run(true, true);
+    println!(
+        "symbex shape, {ROUNDS} rounds: solve_each only {no_reach:?}, \
+         reach-solve + solve_each {with_reach:?}, \
+         reach-solve + known-bits probe + solve_each {with_probe:?}"
     );
 }
 
