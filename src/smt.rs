@@ -337,6 +337,14 @@ pub struct SmtSolver {
     // points at which names participated.
     named_controls: Vec<(String, Lit)>,
 
+    // Every AIG root a flushed (or named) assertion's clauses reference —
+    // the permanent pin set for `retire_dead_cones`: anything reachable
+    // from these must keep its SAT bindings, because their clauses are
+    // semantic, not definitional. Grows monotonically; roots of popped
+    // scopes stay pinned (conservative — their clauses are vacuous but
+    // still reference the cones).
+    asserted_roots: Vec<AigRef>,
+
     // Last solve result if the formula hasn't been modified since. Reading
     // model values before any `solve*` or after a state-changing command
     // (assert, push, pop) is meaningless per SMT-LIB — `has_model()` lets
@@ -466,6 +474,7 @@ impl SmtSolver {
             activation_stack: Vec::new(),
             pending: vec![Vec::new()],
             named_controls: Vec::new(),
+            asserted_roots: Vec::new(),
             last_result: None,
             var_origin: Vec::new(),
             current_bv_ctx: None,
@@ -842,6 +851,7 @@ impl SmtSolver {
     pub fn assert_named(&mut self, name: impl Into<String>, t: BoolTerm) {
         self.last_result = None;
         let phi_ref = self.bitblast_bool(t);
+        self.asserted_roots.push(phi_ref);
         let phi = self.lit_of(phi_ref);
         let control = self.new_sat_lit_tagged(VarOrigin::Activation);
         // Clause: `(¬control ∨ phi)` — with any push-scope activation
@@ -916,6 +926,84 @@ impl SmtSolver {
     fn invalidate_banked_model(&mut self) {
         self.banked_valid = false;
         self.banked_gen = self.sat.model_gen();
+    }
+
+    /// Retire every materialized cone unreachable from the asserted
+    /// formula and `live` — the assumption terms the caller may still
+    /// use. Retired cones lose their SAT bindings, their CNF is deleted
+    /// (along with every learned clause touching it — no longer implied
+    /// once the definitions go), and their variables leave the decision
+    /// set. This is the antidote to unbounded accretion in long
+    /// assumption-driven sessions: without it, every query pays
+    /// propagation, decision, and rewind costs proportional to all cones
+    /// ever materialized; after retirement, cost tracks the live set.
+    ///
+    /// Sound because an unreachable materialized cone is purely
+    /// definitional — its clauses only relate its own gate variables to
+    /// its inputs, so deleting them cannot change satisfiability of the
+    /// remaining formula. Retired cones re-materialize transparently
+    /// (fresh variables and CNF) if a later query reaches them again —
+    /// correctness is unaffected, the cost is re-emission.
+    ///
+    /// Call with the complete set of terms that may reappear in future
+    /// queries (a symbex would pass its live states' constraint terms).
+    /// Terms never bitblasted are fine to include (no cone, nothing to
+    /// do). The standing SAT trail is dropped; the banked model survives
+    /// (clause deletion only weakens the formula). `last_result` is
+    /// cleared. Returns `(retired_sat_vars, deleted_clauses)`.
+    pub fn retire_dead_cones(&mut self, live: &[BoolTerm]) -> (u64, u64) {
+        self.last_result = None;
+        self.flush_pending();
+
+        // Live closure over the AIG: the constant, every asserted root,
+        // and every live term's cached cone.
+        let mut live_nodes = vec![false; self.aig.num_nodes()];
+        let mut stack: Vec<u32> = vec![0];
+        for &r in &self.asserted_roots {
+            stack.push(r.node_idx());
+        }
+        for t in live {
+            if let Some(r) = self.bool_cache.get(t) {
+                stack.push(r.node_idx());
+            }
+        }
+        while let Some(n) = stack.pop() {
+            if live_nodes[n as usize] {
+                continue;
+            }
+            live_nodes[n as usize] = true;
+            if let AigNode::And(a, b) = self.aig.node(n) {
+                stack.push(a.node_idx());
+                stack.push(b.node_idx());
+            }
+        }
+
+        // Unbind every variable whose defining node is dead and mark it
+        // for the SAT-level purge.
+        let mut marked = vec![false; self.sat.num_vars()];
+        let mut retired = 0u64;
+        for v in 0..self.lit_node.len().min(marked.len()) {
+            let node = self.lit_node[v];
+            if node != u32::MAX && !live_nodes[node as usize] {
+                marked[v] = true;
+                retired += 1;
+                self.aig_lit[node as usize] = None;
+                self.lit_node[v] = u32::MAX;
+                self.elim_nodes.insert(node);
+                if let Some(aliases) = self.aig_lit_aliases.remove(&(v as u32)) {
+                    for n in aliases {
+                        self.aig_lit[n as usize] = None;
+                    }
+                }
+            }
+        }
+        // ITE-gate registry entries whose output variable is retired are
+        // stale — drop them so `ite_gate_for_output` can't resurrect one.
+        self.ite_out_to_gate
+            .retain(|l, _| !marked.get(l.var_idx()).copied().unwrap_or(false));
+
+        let deleted = self.sat.purge_vars(&marked);
+        (retired, deleted)
     }
 
     /// True iff the banked model is valid and satisfies the standing
@@ -1636,6 +1724,8 @@ impl SmtSolver {
                 // per-bit shuffles SAT var numbering, which perturbs VSIDS
                 // tie-breaking / watch selection enough to flip near-cliff
                 // instances.
+                self.asserted_roots.extend_from_slice(&ab);
+                self.asserted_roots.extend_from_slice(&bb);
                 let als: Vec<Lit> = ab.iter().map(|&r| self.lit_of(r)).collect();
                 let bls: Vec<Lit> = bb.iter().map(|&r| self.lit_of(r)).collect();
                 for i in 0..ab.len() {
@@ -1678,6 +1768,7 @@ impl SmtSolver {
                     }
                     for i in 0..ab.len() {
                         let x = self.mk_xor(ab[i], bb[i]);
+                        self.asserted_roots.push(x);
                         let xl = self.lit_of(x);
                         clause.push(xl);
                     }
@@ -1688,6 +1779,7 @@ impl SmtSolver {
         }
         // General path: bitblast to one AIG root, materialize, emit unit.
         let r = self.bitblast_bool(t);
+        self.asserted_roots.push(r);
         let lit = self.lit_of(r);
         match act_lit {
             None => {
@@ -3781,6 +3873,11 @@ impl SmtSolver {
         }
         self.aig_lit[idx as usize] = Some(l);
         self.lit_node[l.var_idx()] = idx;
+        // The variable is (re-)gaining defining clauses: make sure it is
+        // branchable again. A no-op for fresh vars; load-bearing when a
+        // cone retired by `retire_dead_cones` (which un-branches its vars)
+        // re-materializes over the same input literals.
+        self.sat.set_decision_var(l.var(), true);
         // VE dissolved this node once and now something re-materialized it
         // — the elimination was wasted work (see `elim_nodes`).
         if !self.elim_nodes.is_empty() && self.elim_nodes.remove(&idx) {

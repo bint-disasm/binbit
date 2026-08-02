@@ -851,11 +851,15 @@ impl Solver {
         self.trail_lim.len() as i32
     }
 
-    /// Add an input clause. Safe to call between solve invocations — it
-    /// automatically cancels any lingering decision stack first. Returns
-    /// false iff the formula is trivially unsatisfiable as a result. When
-    /// that happens, the unsat condition is recorded persistently so that
-    /// later `solve*` calls also return UNSAT.
+    /// Add an input clause. Safe to call between solve invocations, and —
+    /// unlike the classical incremental interface — it does NOT rewind a
+    /// standing search trail to level 0 in the common case: a clause with
+    /// two non-false literals attaches in place, and a clause that is unit
+    /// under the trail backtracks only to the deepest level it depends on.
+    /// This keeps the previous solve's assumption-prefix trail alive
+    /// across CNF emission, so the next solve can reuse it. Returns false
+    /// iff the formula is trivially unsatisfiable as a result (recorded
+    /// persistently so later `solve*` calls also return UNSAT).
     pub fn add_clause(&mut self, lits: Vec<Lit>) -> bool {
         self.has_model = false;
         if self.dead {
@@ -869,9 +873,11 @@ impl Solver {
     }
 
     fn add_clause_inner(&mut self, mut lits: Vec<Lit>) -> bool {
-        self.cancel_until(0);
-
-        // Sort + filter: drop false-at-level-0 lits, detect taut/satisfied.
+        // Sort + filter against ROOT facts only (`value_fixed`): drop
+        // false-at-level-0 lits, detect tautology / root-satisfied.
+        // Search-level assignments must not filter anything — the clause
+        // outlives them. With no trail standing this is exactly the
+        // historical post-cancel filtering.
         lits.sort_by_key(|l| l.0);
         let mut j = 0usize;
         let mut i = 0usize;
@@ -884,7 +890,7 @@ impl Solver {
                 i += 1;
                 continue;
             }
-            match self.value_of(li) {
+            match self.value_fixed(li) {
                 LBool::True => return true,
                 LBool::False => {
                     i += 1;
@@ -900,25 +906,108 @@ impl Solver {
         lits.truncate(j);
 
         match lits.len() {
-            0 => false,
-            1 => self.enqueue(lits[0], Reason::Decision), // unit forced at level 0
-            2 => {
-                // Binary: skip the arena, store inline as binary watchers
-                // in the same unified list used for long clauses.
-                self.watches.push(lits[0].idx(), Watcher::binary(lits[1]));
-                self.watches.push(lits[1].idx(), Watcher::binary(lits[0]));
-                true
+            0 => {
+                self.cancel_until(0);
+                false
+            }
+            1 => {
+                // Root unit: must be recorded at level 0.
+                self.cancel_until(0);
+                self.enqueue(lits[0], Reason::Decision)
             }
             _ => {
-                let w0 = lits[0];
-                let w1 = lits[1];
-                if lits.len() >= Self::SEARCH_POS_MIN_LEN {
-                    self.has_wide_original = true;
+                // Choose watch positions valid under the CURRENT trail.
+                // Soundness rests on falsified-clause detection alone: a
+                // clause is discovered when a WATCHED literal gets
+                // falsified, so the only forbidden watch state is both
+                // watches already false at attach (its falsification events
+                // are in the past — the clause could sit falsified and
+                // undetected under a full assignment).
+                //
+                //  - ≥2 non-false lits: watch the first two (sorted order —
+                //    with no trail standing every lit is non-false, so this
+                //    is the historical lits[0], lits[1] choice).
+                //  - exactly 1 non-false lit u: the clause is unit (or
+                //    satisfied only above its false lits). Backtrack to
+                //    ℓ = the deepest false lit's level — the implication's
+                //    natural level — watch u + a false lit AT ℓ, and
+                //    enqueue u there when it is Undef. No level inflation
+                //    (so no missed lower implications), no re-scan; and
+                //    because the watched false lit is the deepest one, any
+                //    later backtrack below ℓ frees BOTH watches before the
+                //    other false lits, keeping the watch state legal.
+                //  - 0 non-false: conflicting under the search trail (never
+                //    the case for fresh-gate definitional clauses) — full
+                //    rewind, after which every remaining lit is Undef.
+                let nonfalse_count = |s: &Self, ls: &[Lit]| {
+                    ls.iter()
+                        .filter(|&&l| s.value_of(l) != LBool::False)
+                        .count()
+                };
+                if nonfalse_count(self, &lits) == 0 {
+                    self.cancel_until(0);
                 }
-                let cref = self.clauses.alloc(&lits, false);
-                self.num_clauses_total += 1;
-                self.watches.push(w0.idx(), Watcher::long(cref, w1));
-                self.watches.push(w1.idx(), Watcher::long(cref, w0));
+                let nf = nonfalse_count(self, &lits);
+                debug_assert!(nf >= 1);
+                let unit_undef = if nf == 1 {
+                    let u_pos = lits
+                        .iter()
+                        .position(|&l| self.value_of(l) != LBool::False)
+                        .unwrap();
+                    let deepest = lits
+                        .iter()
+                        .filter(|&&l| self.value_of(l) == LBool::False)
+                        .map(|&l| self.vardata[l.var_idx()].level)
+                        .max()
+                        .unwrap();
+                    self.cancel_until(deepest);
+                    lits.swap(0, u_pos);
+                    let f_pos = (1..lits.len())
+                        .find(|&k| {
+                            self.value_of(lits[k]) == LBool::False
+                                && self.vardata[lits[k].var_idx()].level == deepest
+                        })
+                        .unwrap_or(1);
+                    lits.swap(1, f_pos);
+                    self.value_of(lits[0]) == LBool::Undef
+                } else {
+                    // ≥2 non-false: move the first two non-false lits into
+                    // the watch positions (no-op on a clean trail).
+                    let first = lits
+                        .iter()
+                        .position(|&l| self.value_of(l) != LBool::False)
+                        .unwrap();
+                    lits.swap(0, first);
+                    let second = (1..lits.len())
+                        .find(|&k| self.value_of(lits[k]) != LBool::False)
+                        .unwrap();
+                    lits.swap(1, second);
+                    false
+                };
+
+                if lits.len() == 2 {
+                    // Binary: skip the arena, store inline as binary
+                    // watchers in the same unified list used for long
+                    // clauses.
+                    self.watches.push(lits[0].idx(), Watcher::binary(lits[1]));
+                    self.watches.push(lits[1].idx(), Watcher::binary(lits[0]));
+                    if unit_undef {
+                        self.enqueue(lits[0], Reason::Binary(lits[1]));
+                    }
+                } else {
+                    let w0 = lits[0];
+                    let w1 = lits[1];
+                    if lits.len() >= Self::SEARCH_POS_MIN_LEN {
+                        self.has_wide_original = true;
+                    }
+                    let cref = self.clauses.alloc(&lits, false);
+                    self.num_clauses_total += 1;
+                    self.watches.push(w0.idx(), Watcher::long(cref, w1));
+                    self.watches.push(w1.idx(), Watcher::long(cref, w0));
+                    if unit_undef {
+                        self.enqueue(w0, Reason::Clause(cref));
+                    }
+                }
                 true
             }
         }
@@ -1588,7 +1677,12 @@ impl Solver {
         }
         self.trail.truncate(target);
         self.trail_lim.truncate(level as usize);
-        self.qhead = target;
+        // `min`, not assignment: incremental `add_clause` rewinds `qhead`
+        // below the trail tip to schedule re-discovery of implications its
+        // new clauses create under the standing trail — a later cancel
+        // must not skip that re-scan. (Re-scanning processed entries is
+        // sound; propagation is idempotent.)
+        self.qhead = self.qhead.min(target);
     }
 
     #[inline]
@@ -1796,6 +1890,91 @@ impl Solver {
         }
 
         self.clauses = to;
+    }
+
+    /// Delete every clause — original or learned — that references a
+    /// marked variable, purge their watchers, clear root-trail reasons
+    /// that pointed at deleted clauses, and remove the marked variables
+    /// from the decision set. Returns the number of clauses deleted.
+    ///
+    /// The caller guarantees the marked variables' clauses are
+    /// collectively definitional or vacuous — deleting them must not
+    /// change the formula's meaning on unmarked variables. That holds for
+    /// Tseitin cones unreachable from any asserted root or live
+    /// assumption term; learned clauses touching them must go too (they
+    /// are implied only with the definitions present), and this sweep
+    /// deletes them by the same var-touch criterion.
+    ///
+    /// The trail is rewound to level 0 and is not reusable afterwards.
+    /// Arena words are only marked here; the next `reduce_db` compaction
+    /// reclaims them.
+    pub fn purge_vars(&mut self, marked: &[bool]) -> u64 {
+        self.has_model = false;
+        self.trail_reusable = false;
+        self.cancel_until(0);
+
+        let is_marked = |l: Lit| marked.get(l.var_idx()).copied().unwrap_or(false);
+
+        // Pass 1: mark long clauses touching a marked var (each long
+        // clause is visited via its two watchers; marking is idempotent).
+        let mut deleted = 0u64;
+        for lit_idx in 0..self.watches.num_lits() {
+            for wi in 0..self.watches.len(lit_idx) {
+                let w = self.watches.list(lit_idx)[wi];
+                if w.is_binary() {
+                    continue;
+                }
+                let cref = w.long_cref();
+                if !self.clauses.deleted(cref)
+                    && self.clauses.lits(cref).iter().any(|&l| is_marked(l))
+                {
+                    self.clauses.mark_deleted(cref);
+                    deleted += 1;
+                }
+            }
+        }
+        self.learnts.retain(|&cr| !self.clauses.deleted(cr));
+
+        // Pass 2: drop watchers of deleted clauses, and binary watchers
+        // whose either endpoint is marked (each binary counts once, from
+        // the side whose list-lit sorts below its partner).
+        let clauses = &self.clauses;
+        for lit_idx in 0..self.watches.num_lits() {
+            let this = Lit(lit_idx as u32);
+            let this_marked = is_marked(this);
+            self.watches.retain(lit_idx, |w| {
+                if w.is_binary() {
+                    let drop = this_marked || is_marked(w.blocker);
+                    if drop && this.0 < w.blocker.0 {
+                        deleted += 1;
+                    }
+                    !drop
+                } else {
+                    !clauses.deleted(w.long_cref())
+                }
+            });
+        }
+        self.watches.maybe_defrag();
+
+        // Pass 3: root facts whose reason clause was deleted keep their
+        // assignment (they are facts) but drop the dangling reference.
+        for i in 0..self.trail.len() {
+            let vi = self.trail[i].var_idx();
+            if let Reason::Clause(cr) = self.vardata[vi].reason {
+                if self.clauses.deleted(cr) {
+                    self.vardata[vi].reason = Reason::Decision;
+                }
+            }
+        }
+
+        // Marked variables can never be forced again — take them out of
+        // branching so model completion doesn't pay decisions for them.
+        for v in 0..marked.len().min(self.num_vars()) {
+            if marked[v] {
+                self.set_decision_var(Var(v as u32), false);
+            }
+        }
+        deleted
     }
 
     fn pick_branch_lit(&mut self) -> Option<Lit> {
@@ -2021,9 +2200,19 @@ impl Solver {
         // expand the budget naturally as they accumulate clauses.
         self.max_learnts = (self.num_clauses_total as f64 / 3.0).max(1000.0);
 
-        // Propagate level-0 units once up front.
+        // Propagate to a fixpoint up front. With a reused trail this also
+        // absorbs clauses attached incrementally since the last solve —
+        // their discovery rewound `qhead` into the kept prefix. A conflict
+        // at level 0 is a real proof; above level 0 it only refutes the
+        // kept assumptions' prefix, so fall back to a full rebuild once.
         if self.propagate().is_some() {
-            return Some(SolveResult::Unsat);
+            if self.decision_level() == 0 {
+                return Some(SolveResult::Unsat);
+            }
+            self.cancel_until(0);
+            if self.propagate().is_some() {
+                return Some(SolveResult::Unsat);
+            }
         }
 
         loop {
@@ -2114,8 +2303,11 @@ impl Solver {
                                 self.conflict_core.clear();
                                 self.conflict_core.push(a);
                             }
-                            self.trail_reusable =
-                                self.stats_conflicts == start_conflicts;
+                            // The trail below the clash is a propagation
+                            // fixpoint of the full DB with one level per
+                            // installed assumption — reusable as-is, even
+                            // when conflicts were learned along the way.
+                            self.trail_reusable = true;
                             return Some(SolveResult::Unsat);
                         }
                         LBool::Undef => {
@@ -2130,8 +2322,12 @@ impl Solver {
                     None => {
                         self.has_model = true;
                         self.model_gen += 1;
-                        self.trail_reusable =
-                            self.stats_conflicts == start_conflicts;
+                        // A Sat trail is by definition a propagation
+                        // fixpoint of the full DB (learned clauses
+                        // included), and backjumps/restarts preserved the
+                        // level-per-assumption invariant — reusable even
+                        // after a conflicted search.
+                        self.trail_reusable = true;
                         return Some(SolveResult::Sat);
                     }
                     Some(lit) => {
@@ -2147,8 +2343,11 @@ impl Solver {
     /// Propagation-only probe: enqueue each assumption at its own decision
     /// level, running unit propagation after each, then hand `read` the
     /// solver so it can inspect which literals are forced (`value_of`).
-    /// The trail is unwound to level 0 before returning — no search runs,
-    /// nothing is learned, no decisions beyond the assumptions are made.
+    /// No search runs, nothing is learned, no decisions beyond the
+    /// assumptions are made. On return the trail is unwound to the
+    /// assumption-prefix levels it shared with the previous solve (level 0
+    /// when there is no standing reusable trail) — so a probe between two
+    /// solves no longer costs the next solve its trail reuse.
     ///
     /// Returns `None` when propagation alone refutes formula + assumptions
     /// — a real UNSAT proof, the same guarantee as an Unsat solve result.
@@ -2164,30 +2363,54 @@ impl Solver {
         if self.dead {
             return None;
         }
-        self.cancel_until(0);
+        // Keep the reusable assumption-prefix levels the standing trail
+        // shares with this probe's assumption list (never search levels —
+        // the probe must expose only formula+assumption implications, and
+        // an assumption level contains exactly those; propagation closures
+        // are confluent, so the kept levels hold the same implications a
+        // from-root replay would derive). Restoring to the same prefix on
+        // every exit leaves the trail as reusable as it was found.
+        let mut keep = 0usize;
+        if self.trail_reusable {
+            let shared = self
+                .assumptions
+                .len()
+                .min(assumptions.len())
+                .min(self.decision_level() as usize);
+            while keep < shared && self.assumptions[keep] == assumptions[keep] {
+                keep += 1;
+            }
+        }
+        let keep = keep as i32;
+        self.cancel_until(keep);
         if self.propagate().is_some() {
-            // Root-level conflict: unconditionally UNSAT.
+            // Conflict with only formula + the first `keep` probe
+            // assumptions installed (level 0 included): a genuine
+            // refutation of the probe's assumption set. The kept prefix
+            // itself just proved inconsistent, so it is not reusable.
+            self.cancel_until(0);
+            self.trail_reusable = false;
             return None;
         }
-        for &a in assumptions {
+        for &a in &assumptions[keep as usize..] {
             match self.value_of(a) {
                 LBool::True => continue,
                 LBool::False => {
-                    self.cancel_until(0);
+                    self.cancel_until(keep);
                     return None;
                 }
                 LBool::Undef => {
                     self.trail_lim.push(self.trail.len());
                     self.enqueue(a, Reason::Decision);
                     if self.propagate().is_some() {
-                        self.cancel_until(0);
+                        self.cancel_until(keep);
                         return None;
                     }
                 }
             }
         }
         let r = read(self);
-        self.cancel_until(0);
+        self.cancel_until(keep);
         Some(r)
     }
 
