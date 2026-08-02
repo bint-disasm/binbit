@@ -374,6 +374,26 @@ pub struct SmtSolver {
     banked_gen: u64,
     banked_valid: bool,
 
+    // Assumption-prefix caches. Symbex queries pass an append-only
+    // constraint list, so consecutive calls share a long prefix; a u32
+    // term compare replaces a hash lookup per term, turning per-query
+    // assumption processing from O(list) hashing into O(new suffix) real
+    // work. `asmp_*` caches the previous `build_assumption_lits` call
+    // (terms → materialized lits); `gate_*` caches the previous
+    // `banked_model_holds` walk (terms → AIG refs, no CNF). Both are
+    // cleared whenever a flush lands real work (rewrites/BVE can rebind
+    // term meanings and lits) and on cone retirement.
+    asmp_terms_cache: Vec<BoolTerm>,
+    asmp_lits_cache: Vec<Lit>,
+    gate_terms_cache: Vec<BoolTerm>,
+    gate_refs_cache: Vec<AigRef>,
+
+    // True once `retire_dead_cones` has run. Until then no variable was
+    // ever un-branched by retirement, so `set_node_lit` can skip its
+    // re-enable write — a per-gate-materialization cache-line store that
+    // measured 1.5-2% on front-end-bound sessions that never retire.
+    retirement_used: bool,
+
     // Structural-evaluation memo (`eval_refs_from`), node-indexed:
     // `eval_stamp[i] == eval_epoch` marks `eval_value[i]` as computed for
     // the current walk. Persistent buffers with an epoch bump per walk
@@ -454,6 +474,11 @@ impl SmtSolver {
             banked_model: Vec::new(),
             banked_gen: 0,
             banked_valid: false,
+            asmp_terms_cache: Vec::new(),
+            asmp_lits_cache: Vec::new(),
+            gate_terms_cache: Vec::new(),
+            gate_refs_cache: Vec::new(),
+            retirement_used: false,
             eval_stamp: Vec::new(),
             eval_value: Vec::new(),
             eval_epoch: 0,
@@ -953,6 +978,7 @@ impl SmtSolver {
     /// cleared. Returns `(retired_sat_vars, deleted_clauses)`.
     pub fn retire_dead_cones(&mut self, live: &[BoolTerm]) -> (u64, u64) {
         self.last_result = None;
+        self.retirement_used = true;
         self.flush_pending();
 
         // Live closure over the AIG: the constant, every asserted root,
@@ -1001,6 +1027,13 @@ impl SmtSolver {
         // stale — drop them so `ite_gate_for_output` can't resurrect one.
         self.ite_out_to_gate
             .retain(|l, _| !marked.get(l.var_idx()).copied().unwrap_or(false));
+        // Cached assumption lits may point at purged variables (their
+        // clauses are gone — assuming them would be vacuous): drop the
+        // prefix caches.
+        self.asmp_terms_cache.clear();
+        self.asmp_lits_cache.clear();
+        self.gate_terms_cache.clear();
+        self.gate_refs_cache.clear();
 
         let deleted = self.sat.purge_vars(&marked);
         (retired, deleted)
@@ -1028,8 +1061,28 @@ impl SmtSolver {
         if !controls_ok {
             return false;
         }
-        for &t in assumptions {
-            let r = self.bitblast_bool(t);
+        // Prefix-cached term→ref mapping from the previous walk: shared
+        // entries skip the bitblast-cache hash lookup entirely (a term's
+        // ref never changes once built — the cache-clear on flush/retire
+        // is purely defensive). Updated in place so an early exit leaves
+        // exactly the processed prefix cached.
+        let shared = self
+            .gate_terms_cache
+            .iter()
+            .zip(assumptions)
+            .take_while(|(a, b)| *a == *b)
+            .count();
+        self.gate_terms_cache.truncate(shared);
+        self.gate_refs_cache.truncate(shared);
+        for (i, &t) in assumptions.iter().enumerate() {
+            let r = if i < shared {
+                self.gate_refs_cache[i]
+            } else {
+                let r = self.bitblast_bool(t);
+                self.gate_terms_cache.push(t);
+                self.gate_refs_cache.push(r);
+                r
+            };
             let holds = match self.model_ref_fast(r, ModelSource::Banked) {
                 Some(v) => v,
                 None => self.eval_refs_from(&[r], ModelSource::Banked)[0],
@@ -1067,15 +1120,33 @@ impl SmtSolver {
     /// Bitblast each assumption to an AigRef, then materialize its SAT lit.
     /// Runs AFTER `flush_pending` so assumption expressions get their CNF
     /// emitted before the SAT call.
+    ///
+    /// Prefix-cached: the longest prefix shared with the previous call
+    /// reuses its lits outright; only the tail pays bitblast-cache and
+    /// materialization lookups. The tail keeps the historical two-phase
+    /// order (bitblast everything, then materialize) so SAT variable
+    /// allocation order is unchanged — a cold cache is byte-identical to
+    /// the uncached implementation.
     fn build_assumption_lits(&mut self, assumptions: &[BoolTerm]) -> Vec<Lit> {
-        let mut refs: Vec<AigRef> = Vec::with_capacity(assumptions.len());
-        for &t in assumptions {
+        let shared = self
+            .asmp_terms_cache
+            .iter()
+            .zip(assumptions)
+            .take_while(|(a, b)| *a == *b)
+            .count();
+        let mut lits = Vec::with_capacity(assumptions.len());
+        lits.extend_from_slice(&self.asmp_lits_cache[..shared]);
+        let mut refs: Vec<AigRef> = Vec::with_capacity(assumptions.len() - shared);
+        for &t in &assumptions[shared..] {
             refs.push(self.bitblast_bool(t));
         }
-        let mut lits = Vec::with_capacity(refs.len());
         for r in refs {
             lits.push(self.lit_of(r));
         }
+        self.asmp_terms_cache.clear();
+        self.asmp_terms_cache.extend_from_slice(assumptions);
+        self.asmp_lits_cache.clear();
+        self.asmp_lits_cache.extend_from_slice(&lits);
         lits
     }
 
@@ -2589,6 +2660,12 @@ impl SmtSolver {
             // entirely by top-level substitution changes semantics without
             // emitting a single clause, leaving the trail intact.)
             self.invalidate_banked_model();
+            // Flush work can rebind term meanings (substitutions) and
+            // dissolve materialized lits (BVE) — drop the prefix caches.
+            self.asmp_terms_cache.clear();
+            self.asmp_lits_cache.clear();
+            self.gate_terms_cache.clear();
+            self.gate_refs_cache.clear();
             // Variables at or above this index were allocated by (and are
             // only visible to) this batch — eligible for elimination if
             // they're gate outputs. Everything older may be referenced by
@@ -3874,10 +3951,13 @@ impl SmtSolver {
         self.aig_lit[idx as usize] = Some(l);
         self.lit_node[l.var_idx()] = idx;
         // The variable is (re-)gaining defining clauses: make sure it is
-        // branchable again. A no-op for fresh vars; load-bearing when a
-        // cone retired by `retire_dead_cones` (which un-branches its vars)
-        // re-materializes over the same input literals.
-        self.sat.set_decision_var(l.var(), true);
+        // branchable again — load-bearing only when a cone retired by
+        // `retire_dead_cones` (which un-branches its vars) re-materializes
+        // over the same input literals. Gated so sessions that never
+        // retire skip the per-gate store entirely.
+        if self.retirement_used {
+            self.sat.set_decision_var(l.var(), true);
+        }
         // VE dissolved this node once and now something re-materialized it
         // — the elimination was wasted work (see `elim_nodes`).
         if !self.elim_nodes.is_empty() && self.elim_nodes.remove(&idx) {
