@@ -23,7 +23,7 @@
 //! apart on corner cases. This module is the sole source of truth for
 //! bitblasted logic.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::lit::Lit;
 
@@ -142,8 +142,8 @@ impl Aig {
             rw_counts: [0; 6],
             nodes: vec![AigNode::ConstTrue],
             src_terms: vec![None],
-            hash_cons: HashMap::new(),
-            input_lut: HashMap::new(),
+            hash_cons: HashMap::default(),
+            input_lut: HashMap::default(),
         }
     }
 
@@ -1020,7 +1020,7 @@ impl Aig {
             .map(|w| self.simulate(seed.wrapping_add(w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
             .collect();
 
-        let mut buckets: HashMap<[u64; SIM_WORDS], u32> = HashMap::new();
+        let mut buckets: HashMap<[u64; SIM_WORDS], u32> = HashMap::default();
         let mut num_and = 0usize;
         let mut sim_const = 0usize;
         for (idx, &node) in self.nodes.iter().enumerate() {

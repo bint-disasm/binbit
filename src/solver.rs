@@ -648,6 +648,18 @@ pub struct Solver {
     // model from the next, so a caller that copies the assignment out can
     // tell whether its copy is already up to date.
     model_gen: u64,
+    // When false, an assumption-clash Unsat records only the clashing
+    // assumption instead of running `analyze_final`'s O(trail) core walk.
+    // Callers that never read unsat cores (symbex feasibility loops) turn
+    // this off; the default preserves full cores.
+    core_on: bool,
+    // True while the trail still ends in the propagation-complete state a
+    // conflict-free solve left behind — the precondition for reusing its
+    // assumption-decision levels on the next solve instead of rebuilding
+    // them from level 0. Cleared at every solve entry and re-earned at
+    // exit; anything that rewinds the trail to level 0 in between
+    // (add_clause, probes) makes reuse a no-op via `decision_level()`.
+    trail_reusable: bool,
 }
 
 impl Solver {
@@ -716,7 +728,17 @@ impl Solver {
             dead: false,
             has_model: false,
             model_gen: 0,
+            core_on: true,
+            trail_reusable: false,
         }
+    }
+
+    /// Enable/disable unsat-core construction on assumption-clash Unsat
+    /// results. With tracking off, [`unsat_core`] degrades to just the
+    /// clashing assumption — callers that never read cores skip an
+    /// O(trail) walk per Unsat.
+    pub fn set_core_tracking(&mut self, on: bool) {
+        self.core_on = on;
     }
 
     pub fn num_vars(&self) -> usize {
@@ -1957,8 +1979,38 @@ impl Solver {
         }
         let start_conflicts = self.stats_conflicts;
 
+        // Trail reuse: when the previous solve finished without a single
+        // conflict (so no clause was learned, no restart fired, and the DB
+        // is unchanged since — `should_restart` cannot trigger
+        // conflict-free), its trail is still a propagation fixpoint and
+        // its decision levels 1..=k are exactly its first k assumptions.
+        // For the longest prefix the new assumption list shares, rebuilding
+        // those levels from scratch would reproduce them bit for bit —
+        // so keep them and cancel only above. A full match additionally
+        // keeps the search levels: the standing full model re-verifies as
+        // Sat without one decision. Anything that rewound the trail in
+        // between (add_clause, probes) leaves `decision_level() == 0` and
+        // reuse naturally degenerates to the old full reset.
+        let mut keep = 0i32;
+        if self.trail_reusable {
+            let shared = self
+                .assumptions
+                .len()
+                .min(assumptions.len())
+                .min(self.decision_level() as usize);
+            let mut k = 0usize;
+            while k < shared && self.assumptions[k] == assumptions[k] {
+                k += 1;
+            }
+            keep = k as i32;
+            if k == self.assumptions.len() && k == assumptions.len() {
+                keep = self.decision_level();
+            }
+        }
+        self.trail_reusable = false;
+
         // Reset to a clean search state and install the new assumptions.
-        self.cancel_until(0);
+        self.cancel_until(keep);
         self.assumptions.clear();
         self.assumptions.extend_from_slice(assumptions);
         self.conflict_core.clear();
@@ -2053,8 +2105,17 @@ impl Solver {
                         }
                         LBool::False => {
                             // Assumption contradicts existing implications.
-                            // Build an UNSAT core out of it.
-                            self.analyze_final(!a);
+                            // Build an UNSAT core out of it (or, with core
+                            // tracking off, record just the clash and skip
+                            // the O(trail) walk).
+                            if self.core_on {
+                                self.analyze_final(!a);
+                            } else {
+                                self.conflict_core.clear();
+                                self.conflict_core.push(a);
+                            }
+                            self.trail_reusable =
+                                self.stats_conflicts == start_conflicts;
                             return Some(SolveResult::Unsat);
                         }
                         LBool::Undef => {
@@ -2069,6 +2130,8 @@ impl Solver {
                     None => {
                         self.has_model = true;
                         self.model_gen += 1;
+                        self.trail_reusable =
+                            self.stats_conflicts == start_conflicts;
                         return Some(SolveResult::Sat);
                     }
                     Some(lit) => {

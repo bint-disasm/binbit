@@ -507,6 +507,16 @@ impl SmtSolver {
         self.bve_enabled = on;
     }
 
+    /// Enable/disable SAT-level unsat-core construction on Unsat results
+    /// (default on). With tracking off, [`unsat_core_names`] and
+    /// [`failed_assumptions`] degrade to reporting only the single
+    /// assumption whose installation clashed; callers that only ever ask
+    /// "feasible or not?" (symbex branch loops) save an O(trail) core
+    /// walk on every Unsat answer.
+    pub fn set_core_tracking(&mut self, on: bool) {
+        self.sat.set_core_tracking(on);
+    }
+
     /// Enable or disable the ITE-aware branching hint. On (the default)
     /// means every live ITE gate boosts its selector's VSIDS activity at
     /// flush; off disables that boost entirely. Useful to benchmark the
@@ -1289,6 +1299,20 @@ impl SmtSolver {
             };
             if base_asmps.is_none() {
                 let extras = self.build_assumption_lits(assumptions);
+                // A real solve is unavoidable now. Materialize every
+                // still-undecided candidate up front: later per-candidate
+                // solves then emit no CNF between SAT calls, so each one
+                // reuses the previous solve's assumption-prefix trail
+                // (solver trail reuse) instead of rebuilding it. Candidates
+                // a mid-batch model screens Sat after this point pay their
+                // (definitional) CNF without needing it — a bounded price;
+                // fully-screened warm batches never reach here and still
+                // emit nothing.
+                for i in 0..cand_refs.len() {
+                    if results[i].is_none() {
+                        self.lit_of(cand_refs[i]);
+                    }
+                }
                 let asmps = self.built_assumptions(&extras);
                 if !warm {
                     // Cold start: baseline solve with no candidate. Unsat
@@ -1363,6 +1387,11 @@ impl SmtSolver {
             (self.eval_refs_from(&[r], ModelSource::Banked)[0], None)
         } else {
             let extras = self.build_assumption_lits(assumptions);
+            // Materialize the candidate BEFORE the baseline solve: no CNF
+            // then lands between the two solves, so the second one reuses
+            // the baseline's assumption-prefix trail (solver trail reuse)
+            // instead of rebuilding it from level 0.
+            self.lit_of(r);
             let asmps = self.built_assumptions(&extras);
             match self.sat.solve_under_assumptions(&asmps) {
                 SolveResult::Unsat => return (SmtResult::Unsat, SmtResult::Unsat),
