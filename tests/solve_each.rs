@@ -680,6 +680,135 @@ fn pair_forced_sides_are_exact() {
 }
 
 #[test]
+fn pair_known_base_matches_solve_pair() {
+    // Whenever the base really is Sat, solve_pair_assuming_base_sat must
+    // return exactly what solve_pair returns — warm or cold.
+    let mut rng = Rng::new(0xBA5E);
+    for _trial in 0..50 {
+        let spec = TrialSpec {
+            bound: 200 + rng.uniform_u32(200) as u128,
+            cands: vec![(rng.uniform_u32(2) == 0, rng.uniform_u32(600) as u128)],
+            asmps: (0..rng.uniform_u32(3) as usize)
+                .map(|_| rng.uniform_u32(400) as u128)
+                .collect(),
+        };
+        // These bases are always satisfiable (x = y = 0 works).
+        let (mut a, cands_a, asmps_a) = build(&spec);
+        if rng.uniform_u32(2) == 0 {
+            let _ = a.solve_under_assumptions(&asmps_a);
+        }
+        let ra = a.solve_pair_assuming_base_sat(cands_a[0], &asmps_a);
+
+        let (mut b, cands_b, asmps_b) = build(&spec);
+        let rb = b.solve_pair_under_assumptions(cands_b[0], &asmps_b);
+        assert_eq!(ra, rb, "known-base pair diverged from solve_pair");
+    }
+}
+
+#[test]
+fn pair_known_base_forced_branches() {
+    let mut s = SmtSolver::new();
+    let x = s.bv_var(32);
+    let ten = s.bv_const(10, 32);
+    let below = s.bv_ult(x, ten);
+    s.assert(below);
+    let pc = below;
+
+    // Forced-false: x == 20 is impossible under x < 10 — one solve.
+    let twenty = s.bv_const(20, 32);
+    let eq20 = s.bv_eq(x, twenty);
+    assert_eq!(
+        s.solve_pair_assuming_base_sat(eq20, &[pc]),
+        (SmtResult::Unsat, SmtResult::Sat)
+    );
+    // Forced-true: x < 20 covers all of pc's models.
+    let lt20 = s.bv_ult(x, twenty);
+    assert_eq!(
+        s.solve_pair_assuming_base_sat(lt20, &[pc]),
+        (SmtResult::Sat, SmtResult::Unsat)
+    );
+    // Both feasible.
+    let five = s.bv_const(5, 32);
+    let lt5 = s.bv_ult(x, five);
+    assert_eq!(
+        s.solve_pair_assuming_base_sat(lt5, &[pc]),
+        (SmtResult::Sat, SmtResult::Sat)
+    );
+}
+
+#[test]
+fn pair_known_base_contract_on_violated_guarantee() {
+    // Documented contract: with an Unsat base the second component is
+    // vacuous (Unsat, Sat). This test pins the behavior so a change is
+    // deliberate, not accidental.
+    let mut s = SmtSolver::new();
+    let x = s.bv_var(8);
+    let one = s.bv_const(1, 8);
+    let two = s.bv_const(2, 8);
+    let a1 = s.bv_eq(x, one);
+    let a2 = s.bv_eq(x, two);
+    let c = s.bv_ult(x, two);
+    assert_eq!(
+        s.solve_pair_assuming_base_sat(c, &[a1, a2]),
+        (SmtResult::Unsat, SmtResult::Sat)
+    );
+    // Solver not poisoned.
+    assert_eq!(s.solve_under_assumptions(&[a1]), SmtResult::Sat);
+}
+
+#[test]
+fn solve_many_enumerates_exactly() {
+    // Blocking clauses now backtrack one level instead of rewinding the
+    // trail — the enumerated VALUE SET must stay exact regardless.
+    let mut s = SmtSolver::new();
+    let x = s.bv_var(8);
+    let ten = s.bv_const(10, 8);
+    let three = s.bv_const(3, 8);
+    let below = s.bv_ult(x, ten);
+    s.assert(below);
+    let ge3 = s.bv_ule(three, x);
+    let (mut vals, exhausted) = s.solve_many_u_under_assumptions(x, 100, &[ge3]);
+    vals.sort();
+    assert!(exhausted);
+    assert_eq!(vals, vec![3, 4, 5, 6, 7, 8, 9]);
+    // No residue: enumeration again gives the same set.
+    let (mut vals2, ex2) = s.solve_many_u_under_assumptions(x, 100, &[ge3]);
+    vals2.sort();
+    assert!(ex2);
+    assert_eq!(vals2, vec![3, 4, 5, 6, 7, 8, 9]);
+    // And the solver still answers unrelated queries.
+    let nine = s.bv_const(9, 8);
+    let eq9 = s.bv_eq(x, nine);
+    assert_eq!(s.solve_under_assumptions(&[eq9]), SmtResult::Sat);
+}
+
+/// Enumeration timing: values of a 12-bit var. Blocking clauses used to
+/// rewind the whole trail per value; now each value costs a one-level
+/// backtrack.
+///   cargo test --release --test solve_each -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_solve_many_enumeration() {
+    use std::time::Instant;
+    let mut s = SmtSolver::new();
+    let x = s.bv_var(12);
+    let y = s.bv_var(12);
+    let sum = s.bv_add(x, y);
+    let bound = s.bv_const(3000, 12);
+    let below = s.bv_ult(sum, bound);
+    s.assert(below);
+    let k = s.bv_const(2048, 12);
+    let yk = s.bv_ult(y, k);
+    let t0 = Instant::now();
+    let (vals, _) = s.solve_many_u_under_assumptions(x, 3000, &[yk]);
+    println!(
+        "solve_many: {} values in {:?}",
+        vals.len(),
+        t0.elapsed()
+    );
+}
+
+#[test]
 fn empty_candidates_is_a_no_op() {
     let mut s = SmtSolver::new();
     let x = s.bv_var(8);

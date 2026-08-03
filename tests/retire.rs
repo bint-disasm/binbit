@@ -153,6 +153,89 @@ fn retire_then_reuse_input_vars() {
     assert_eq!(s.solve_under_assumptions(&[both]), SmtResult::Unsat);
 }
 
+#[test]
+fn recycling_keeps_var_count_flat() {
+    // Retire/re-materialize cycles must reuse SAT variable ids: the
+    // per-var tables (and the banked-model snapshot) stay bounded by the
+    // live set instead of growing with session length.
+    let mut s = SmtSolver::new();
+    let x = s.bv_var(32);
+    let hundred = s.bv_const(100, 32);
+    let below = s.bv_ult(x, hundred);
+    s.assert(below);
+
+    let mut peak_after_first_cycle = 0;
+    for round in 0..12u32 {
+        let y = s.bv_var(32);
+        let prod = s.bv_mul(x, y);
+        let big = s.bv_const(1 << 20, 32);
+        let c = s.bv_ult(prod, big);
+        assert_eq!(s.solve_under_assumptions(&[c]), SmtResult::Sat);
+        let (retired, _) = s.retire_dead_cones(&[]);
+        assert!(retired > 0);
+        let vars = s.sat_stats().sat_vars;
+        if round == 0 {
+            peak_after_first_cycle = vars;
+        } else {
+            // Fresh y-bits per round can't be recycled (32/round), but the
+            // big mul cone's gate vars must be. Allow the input growth
+            // plus slack, nothing near a full cone per round.
+            let budget = peak_after_first_cycle + (round as usize + 1) * 40;
+            assert!(
+                vars <= budget,
+                "vars grew past recycling budget: {vars} > {budget} at round {round}"
+            );
+        }
+    }
+}
+
+#[test]
+fn warm_screening_correct_after_recycling() {
+    // A recycled variable's banked-model slots are poisoned, so warm
+    // screening must recompute recycled cones structurally — answers
+    // must match a fresh solver even when ids were reused.
+    let mut s = SmtSolver::new();
+    let x = s.bv_var(32);
+    let hundred = s.bv_const(100, 32);
+    let below = s.bv_ult(x, hundred);
+    s.assert(below);
+
+    // Materialize and retire a fat cone to seed the free list.
+    let y = s.bv_var(32);
+    let prod = s.bv_mul(x, y);
+    let big = s.bv_const(1 << 20, 32);
+    let dead = s.bv_ult(prod, big);
+    assert_eq!(s.solve_under_assumptions(&[dead]), SmtResult::Sat);
+    let (retired, _) = s.retire_dead_cones(&[]);
+    assert!(retired > 0);
+
+    // Bank a model of pc, then build NEW cones over recycled ids and
+    // screen them warm.
+    let pc = s.bv_ult(y, hundred);
+    assert_eq!(s.solve_under_assumptions(&[pc]), SmtResult::Sat);
+    let xv = s.get_bv_value(x) as u128;
+    let sum = s.bv_add(x, y);
+    let k = s.bv_const(1 << 10, 32);
+    let c1 = s.bv_ult(sum, k);
+    let not_c1 = s.bool_not(c1);
+    let got = s.solve_each_under_assumptions(&[c1, not_c1], &[pc]);
+
+    let mut f = SmtSolver::new();
+    let fx = f.bv_var(32);
+    let fh = f.bv_const(100, 32);
+    let fb = f.bv_ult(fx, fh);
+    f.assert(fb);
+    let fy = f.bv_var(32);
+    let fpc = f.bv_ult(fy, fh);
+    let fsum = f.bv_add(fx, fy);
+    let fk = f.bv_const(1 << 10, 32);
+    let fc1 = f.bv_ult(fsum, fk);
+    let fnot = f.bool_not(fc1);
+    let want = f.solve_each_under_assumptions(&[fc1, fnot], &[fpc]);
+    assert_eq!(got, want, "recycled-id warm screening diverged");
+    let _ = xv;
+}
+
 /// Accretion bench: a symbex-style session whose live window is a sliding
 /// suffix of the constraint chain. Without retirement the solver keeps
 /// paying for every cone ever built; with periodic retirement per-query

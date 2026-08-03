@@ -125,13 +125,22 @@ pub struct Aig {
     /// style metadata when we allocate SAT lits at CNF emission time.
     /// `None` for the constant and most input nodes.
     pub src_terms: Vec<Option<crate::bv::BvTerm>>,
-    /// Hash cons: `(canonical_lhs, canonical_rhs) → node_idx`. Both sides
-    /// already have their polarity applied. Canonical ordering is
-    /// `lhs.0 <= rhs.0`.
-    hash_cons: HashMap<(AigRef, AigRef), u32>,
-    /// Input dedup: one AIG input per SAT literal. A lit and its negation
-    /// share the same input node (the polarity is carried on the AigRef).
-    input_lut: HashMap<Lit, AigRef>,
+    /// Hash cons: packed `(canonical_lhs << 32) | canonical_rhs` →
+    /// node_idx. Both sides already have their polarity applied.
+    /// Canonical ordering is `lhs.0 <= rhs.0`. The single-u64 key halves
+    /// hasher work and makes probes a word compare — `and()` is the
+    /// hottest front-end call on emission-bound sessions.
+    hash_cons: HashMap<u64, u32>,
+    /// Input dedup: one AIG input per SAT literal, dense-indexed by the
+    /// literal (a lit and its negation share the node; polarity carried on
+    /// the AigRef). `u32::MAX` = no entry. Dense because input creation is
+    /// on the fresh-variable fast path — no hashing.
+    input_lut: Vec<u32>,
+}
+
+#[inline]
+fn cons_key(lhs: AigRef, rhs: AigRef) -> u64 {
+    ((lhs.0 as u64) << 32) | rhs.0 as u64
 }
 
 impl Aig {
@@ -143,7 +152,7 @@ impl Aig {
             nodes: vec![AigNode::ConstTrue],
             src_terms: vec![None],
             hash_cons: HashMap::default(),
-            input_lut: HashMap::default(),
+            input_lut: Vec::new(),
         }
     }
 
@@ -178,24 +187,32 @@ impl Aig {
     /// Register `lit` as a primary input. Lit and !lit dedup to the same
     /// input node — the negation is carried on the returned AigRef.
     pub fn input(&mut self, lit: Lit) -> AigRef {
-        if let Some(&r) = self.input_lut.get(&lit) {
-            return r;
+        let li = lit.0 as usize;
+        if let Some(&raw) = self.input_lut.get(li) {
+            if raw != u32::MAX {
+                return AigRef(raw);
+            }
         }
         // Canonicalize to positive-polarity storage.
         let canonical_lit = Lit(lit.0 & !1);
-        if let Some(&r) = self.input_lut.get(&canonical_lit) {
+        let ci = canonical_lit.0 as usize;
+        let hi = li.max(ci);
+        if self.input_lut.len() <= hi {
+            self.input_lut.resize(hi + 1, u32::MAX);
+        }
+        if self.input_lut[ci] != u32::MAX {
             // Lit we were asked about is the negation of an existing input.
-            let neg = r.negate();
-            self.input_lut.insert(lit, neg);
+            let neg = AigRef(self.input_lut[ci]).negate();
+            self.input_lut[li] = neg.0;
             return neg;
         }
         let idx = self.nodes.len() as u32;
         self.nodes.push(AigNode::Input(canonical_lit));
         self.src_terms.push(None);
         let pos = AigRef::from_parts(idx, false);
-        self.input_lut.insert(canonical_lit, pos);
+        self.input_lut[ci] = pos.0;
         let requested = if lit.0 & 1 != 0 { pos.negate() } else { pos };
-        self.input_lut.insert(lit, requested);
+        self.input_lut[li] = requested.0;
         requested
     }
 
@@ -447,13 +464,13 @@ impl Aig {
         } else {
             (right, left)
         };
-        if let Some(&idx) = self.hash_cons.get(&(lhs, rhs)) {
+        if let Some(&idx) = self.hash_cons.get(&cons_key(lhs, rhs)) {
             return AigRef::from_parts(idx, false);
         }
         let idx = self.nodes.len() as u32;
         self.nodes.push(AigNode::And(lhs, rhs));
         self.src_terms.push(None);
-        self.hash_cons.insert((lhs, rhs), idx);
+        self.hash_cons.insert(cons_key(lhs, rhs), idx);
         AigRef::from_parts(idx, false)
     }
 
@@ -912,7 +929,7 @@ impl Aig {
                     rewrites_this_pass += 1;
                     self.nodes[i] = AigNode::And(lhs, rhs);
                     // Keep hash-consing able to find the simplified form.
-                    self.hash_cons.entry((lhs, rhs)).or_insert(i as u32);
+                    self.hash_cons.entry(cons_key(lhs, rhs)).or_insert(i as u32);
                 }
             }
 

@@ -29,7 +29,9 @@ fn main() {
         x = x2;
 
         let cond = s.bv_ult(x2, k);
-        let (a, b) = s.solve_pair_under_assumptions(cond, &constraints);
+        // The taken-branch invariant makes the base always feasible —
+        // the shape solve_pair_assuming_base_sat is for.
+        let (a, b) = s.solve_pair_assuming_base_sat(cond, &constraints);
         assert!(a == SmtResult::Sat || b == SmtResult::Sat);
         constraints.push(if a == SmtResult::Sat { cond } else { s.bool_not(cond) });
 

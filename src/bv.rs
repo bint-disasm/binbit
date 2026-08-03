@@ -241,6 +241,11 @@ pub struct BvContext {
     pub bool_nodes: Vec<BoolOp>,
     /// Width of each symbolic BV variable, keyed by variable id.
     pub bv_var_widths: Vec<u32>,
+    /// Var id → its (unique, hash-consed) `Var` term. O(1) reverse lookup
+    /// for metadata tagging at bitblast time — the alternative is a linear
+    /// scan of `bv_nodes`, which made fresh-variable creation O(total
+    /// terms) and long sessions quadratic.
+    bv_var_terms: Vec<BvTerm>,
     /// Number of boolean variables allocated.
     pub num_bool_vars: u32,
 
@@ -308,6 +313,7 @@ impl BvContext {
             bv_nodes: Vec::new(),
             bool_nodes: Vec::new(),
             bv_var_widths: Vec::new(),
+            bv_var_terms: Vec::new(),
             num_bool_vars: 0,
             bv_hashcons: HashMap::default(),
             bool_hashcons: HashMap::default(),
@@ -359,7 +365,15 @@ impl BvContext {
         );
         let var_id = self.bv_var_widths.len() as u32;
         self.bv_var_widths.push(width);
-        self.push_bv(BvOp::Var(var_id), width, 0)
+        let t = self.push_bv(BvOp::Var(var_id), width, 0);
+        self.bv_var_terms.push(t);
+        t
+    }
+
+    /// The `Var` term for a variable id, O(1). `None` only for ids never
+    /// allocated through [`bv_var`].
+    pub fn var_term(&self, id: u32) -> Option<BvTerm> {
+        self.bv_var_terms.get(id as usize).copied()
     }
 
     /// Build a BV literal at widths ≤ 128 (the fast path). Value is masked

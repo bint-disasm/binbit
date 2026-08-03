@@ -660,6 +660,15 @@ pub struct Solver {
     // exit; anything that rewinds the trail to level 0 in between
     // (add_clause, probes) makes reuse a no-op via `decision_level()`.
     trail_reusable: bool,
+    // Reused buffer backing `add_clause_from_slice` — gate emission adds
+    // 3-4 clauses per gate, and one persistent allocation replaces a
+    // malloc/free pair per clause.
+    clause_scratch: Vec<Lit>,
+    // Variable ids freed by `purge_vars`, recycled by `new_var` before
+    // any fresh allocation. Retire-heavy sessions would otherwise grow
+    // every per-variable table (and the caller's model snapshots) without
+    // bound while the live set stays flat.
+    free_vars: Vec<Var>,
 }
 
 impl Solver {
@@ -730,6 +739,8 @@ impl Solver {
             model_gen: 0,
             core_on: true,
             trail_reusable: false,
+            clause_scratch: Vec::new(),
+            free_vars: Vec::new(),
         }
     }
 
@@ -784,6 +795,27 @@ impl Solver {
     }
 
     pub fn new_var(&mut self) -> Var {
+        // Recycle a purged id when one exists: its clause-side state is
+        // already clean (no clauses, no watchers, unassigned); reset the
+        // scalar per-var state to fresh-var defaults. (If the id lingers
+        // in the order heap from its previous life, the stale entry pops
+        // once and re-sorts under its reset activity — harmless.)
+        if let Some(v) = self.free_vars.pop() {
+            let vi = v.idx();
+            self.activity[vi] = 0.0;
+            self.polarity[vi] = false;
+            self.decision[vi] = true;
+            self.seen[vi] = false;
+            self.lbd_stamp[vi] = 0;
+            self.vardata[vi] = VarInfo {
+                level: -1,
+                reason: Reason::Decision,
+            };
+            self.lit_value[vi << 1] = LBool::Undef;
+            self.lit_value[(vi << 1) | 1] = LBool::Undef;
+            self.order_heap.insert(v.0, &self.activity);
+            return v;
+        }
         let v = Var((self.lit_value.len() >> 1) as u32);
         // Per-literal value table — two entries per variable, both Undef.
         self.lit_value.push(LBool::Undef);
@@ -860,19 +892,39 @@ impl Solver {
     /// across CNF emission, so the next solve can reuse it. Returns false
     /// iff the formula is trivially unsatisfiable as a result (recorded
     /// persistently so later `solve*` calls also return UNSAT).
-    pub fn add_clause(&mut self, lits: Vec<Lit>) -> bool {
+    pub fn add_clause(&mut self, mut lits: Vec<Lit>) -> bool {
         self.has_model = false;
         if self.dead {
             return false;
         }
-        let ok = self.add_clause_inner(lits);
+        let ok = self.add_clause_inner(&mut lits);
         if !ok {
             self.dead = true;
         }
         ok
     }
 
-    fn add_clause_inner(&mut self, mut lits: Vec<Lit>) -> bool {
+    /// [`add_clause`] from a borrowed slice: the literals are copied into
+    /// a reused internal buffer, so callers emitting many short clauses
+    /// (gate encoders) pay no allocation per clause. Same semantics and
+    /// return value as `add_clause`.
+    pub fn add_clause_from_slice(&mut self, lits: &[Lit]) -> bool {
+        self.has_model = false;
+        if self.dead {
+            return false;
+        }
+        let mut scratch = std::mem::take(&mut self.clause_scratch);
+        scratch.clear();
+        scratch.extend_from_slice(lits);
+        let ok = self.add_clause_inner(&mut scratch);
+        self.clause_scratch = scratch;
+        if !ok {
+            self.dead = true;
+        }
+        ok
+    }
+
+    fn add_clause_inner(&mut self, lits: &mut Vec<Lit>) -> bool {
         // Sort + filter against ROOT facts only (`value_fixed`): drop
         // false-at-level-0 lits, detect tautology / root-satisfied.
         // Search-level assignments must not filter anything — the clause
@@ -945,7 +997,21 @@ impl Solver {
                         .count()
                 };
                 if nonfalse_count(self, &lits) == 0 {
-                    self.cancel_until(0);
+                    // Conflicting under the search trail — the standing
+                    // shape is a blocking clause over the current model
+                    // (solve_many enumeration). Free just the deepest
+                    // false level: the clause regains watchable literals
+                    // while everything below stays for trail reuse, so
+                    // enumeration pays a one-level backtrack per value
+                    // instead of a full rebuild. Root-false lits were
+                    // filtered out, so every false lit sits at level ≥ 1.
+                    let deepest = lits
+                        .iter()
+                        .map(|&l| self.vardata[l.var_idx()].level)
+                        .max()
+                        .unwrap();
+                    debug_assert!(deepest >= 1);
+                    self.cancel_until(deepest - 1);
                 }
                 let nf = nonfalse_count(self, &lits);
                 debug_assert!(nf >= 1);
@@ -1968,11 +2034,22 @@ impl Solver {
         }
 
         // Marked variables can never be forced again — take them out of
-        // branching so model completion doesn't pay decisions for them.
+        // branching so model completion doesn't pay decisions for them,
+        // and hand their ids to `new_var` for recycling so long
+        // retire/re-materialize sessions stop growing the per-var tables.
         for v in 0..marked.len().min(self.num_vars()) {
             if marked[v] {
                 self.set_decision_var(Var(v as u32), false);
+                self.free_vars.push(Var(v as u32));
             }
+        }
+
+        // Deleted words are only marked; feasibility-heavy sessions may
+        // never trip reduce_db's compaction (few conflicts, few
+        // reductions), so reclaim the arena eagerly when this purge left
+        // enough of it dead. GC is trajectory-neutral plumbing.
+        if self.clauses.wasted() * 5 > self.clauses.word_size() {
+            self.garbage_collect();
         }
         deleted
     }
@@ -2170,28 +2247,36 @@ impl Solver {
         // Sat without one decision. Anything that rewound the trail in
         // between (add_clause, probes) leaves `decision_level() == 0` and
         // reuse naturally degenerates to the old full reset.
-        let mut keep = 0i32;
-        if self.trail_reusable {
-            let shared = self
-                .assumptions
-                .len()
-                .min(assumptions.len())
-                .min(self.decision_level() as usize);
+        // Longest prefix shared with the previous solve's assumptions —
+        // drives trail reuse AND the O(suffix) install below. Append-only
+        // lists hit one vectorized slice compare.
+        let prev = self.assumptions.len();
+        let shared = if assumptions.len() >= prev
+            && assumptions[..prev] == self.assumptions[..]
+        {
+            prev
+        } else {
+            let cap = prev.min(assumptions.len());
             let mut k = 0usize;
-            while k < shared && self.assumptions[k] == assumptions[k] {
+            while k < cap && self.assumptions[k] == assumptions[k] {
                 k += 1;
             }
-            keep = k as i32;
-            if k == self.assumptions.len() && k == assumptions.len() {
+            k
+        };
+        let mut keep = 0i32;
+        if self.trail_reusable {
+            keep = shared.min(self.decision_level() as usize) as i32;
+            if shared == prev && shared == assumptions.len() {
                 keep = self.decision_level();
             }
         }
         self.trail_reusable = false;
 
-        // Reset to a clean search state and install the new assumptions.
+        // Reset to a clean search state and install the new assumptions —
+        // only the divergent suffix is written.
         self.cancel_until(keep);
-        self.assumptions.clear();
-        self.assumptions.extend_from_slice(assumptions);
+        self.assumptions.truncate(shared);
+        self.assumptions.extend_from_slice(&assumptions[shared..]);
         self.conflict_core.clear();
         self.restart.on_new_solve();
 
@@ -2372,14 +2457,20 @@ impl Solver {
         // every exit leaves the trail as reusable as it was found.
         let mut keep = 0usize;
         if self.trail_reusable {
-            let shared = self
+            let cap = self
                 .assumptions
                 .len()
                 .min(assumptions.len())
                 .min(self.decision_level() as usize);
-            while keep < shared && self.assumptions[keep] == assumptions[keep] {
-                keep += 1;
-            }
+            keep = if assumptions[..cap] == self.assumptions[..cap] {
+                cap
+            } else {
+                let mut k = 0usize;
+                while k < cap && self.assumptions[k] == assumptions[k] {
+                    k += 1;
+                }
+                k
+            };
         }
         let keep = keep as i32;
         self.cancel_until(keep);

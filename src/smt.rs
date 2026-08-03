@@ -1066,12 +1066,18 @@ impl SmtSolver {
         // ref never changes once built — the cache-clear on flush/retire
         // is purely defensive). Updated in place so an early exit leaves
         // exactly the processed prefix cached.
-        let shared = self
-            .gate_terms_cache
-            .iter()
-            .zip(assumptions)
-            .take_while(|(a, b)| *a == *b)
-            .count();
+        let cached = self.gate_terms_cache.len();
+        let shared = if assumptions.len() >= cached
+            && assumptions[..cached] == self.gate_terms_cache[..]
+        {
+            cached
+        } else {
+            self.gate_terms_cache
+                .iter()
+                .zip(assumptions)
+                .take_while(|(a, b)| *a == *b)
+                .count()
+        };
         self.gate_terms_cache.truncate(shared);
         self.gate_refs_cache.truncate(shared);
         for (i, &t) in assumptions.iter().enumerate() {
@@ -1128,12 +1134,20 @@ impl SmtSolver {
     /// allocation order is unchanged — a cold cache is byte-identical to
     /// the uncached implementation.
     fn build_assumption_lits(&mut self, assumptions: &[BoolTerm]) -> Vec<Lit> {
-        let shared = self
-            .asmp_terms_cache
-            .iter()
-            .zip(assumptions)
-            .take_while(|(a, b)| *a == *b)
-            .count();
+        // Append-only fast path: one vectorized slice compare instead of a
+        // branchy per-element scan.
+        let cached = self.asmp_terms_cache.len();
+        let shared = if assumptions.len() >= cached
+            && assumptions[..cached] == self.asmp_terms_cache[..]
+        {
+            cached
+        } else {
+            self.asmp_terms_cache
+                .iter()
+                .zip(assumptions)
+                .take_while(|(a, b)| *a == *b)
+                .count()
+        };
         let mut lits = Vec::with_capacity(assumptions.len());
         lits.extend_from_slice(&self.asmp_lits_cache[..shared]);
         let mut refs: Vec<AigRef> = Vec::with_capacity(assumptions.len() - shared);
@@ -1143,10 +1157,11 @@ impl SmtSolver {
         for r in refs {
             lits.push(self.lit_of(r));
         }
-        self.asmp_terms_cache.clear();
-        self.asmp_terms_cache.extend_from_slice(assumptions);
-        self.asmp_lits_cache.clear();
-        self.asmp_lits_cache.extend_from_slice(&lits);
+        // O(suffix) cache maintenance: the shared prefix is already right.
+        self.asmp_terms_cache.truncate(shared);
+        self.asmp_terms_cache.extend_from_slice(&assumptions[shared..]);
+        self.asmp_lits_cache.truncate(shared);
+        self.asmp_lits_cache.extend_from_slice(&lits[shared..]);
         lits
     }
 
@@ -1480,6 +1495,10 @@ impl SmtSolver {
                     // standing model already witnessed the base as sat.
                     match self.sat.solve_under_assumptions(&asmps) {
                         SolveResult::Sat => {
+                            // Bank the baseline model: even if every
+                            // later per-candidate solve is Unsat, this
+                            // witness of the base warms the next query.
+                            self.bank_model();
                             base_asmps = Some(asmps);
                             model_valid = true;
                             screen_src = ModelSource::Trail;
@@ -1494,11 +1513,15 @@ impl SmtSolver {
             }
             // Materializing the candidate lit may emit CNF, which rewinds
             // the trail — safe for the banked model, but done only now so
-            // a fully-screened batch emits nothing.
+            // a fully-screened batch emits nothing. The candidate lit is
+            // pushed onto the shared base list and popped after the solve
+            // (no per-candidate clone).
             let lit = self.lit_of(cand_refs[next]);
-            let mut asmps = base_asmps.as_ref().unwrap().clone();
+            let asmps = base_asmps.as_mut().unwrap();
             asmps.push(lit);
-            match self.sat.solve_under_assumptions(&asmps) {
+            let res = self.sat.solve_under_assumptions(asmps);
+            asmps.pop();
+            match res {
                 SolveResult::Sat => {
                     results[next] = Some(SmtResult::Sat);
                     model_valid = true;
@@ -1537,6 +1560,36 @@ impl SmtSolver {
         cond: BoolTerm,
         assumptions: &[BoolTerm],
     ) -> (SmtResult, SmtResult) {
+        self.solve_pair_impl(cond, assumptions, false)
+    }
+
+    /// [`solve_pair_under_assumptions`] for callers that KNOW the base
+    /// (assertions ∧ assumptions) is satisfiable — the symbex invariant
+    /// that the current path was already reached. When the banked model
+    /// can't screen, the baseline solve is skipped and side `cond` is
+    /// solved directly; if it comes back Unsat, every base model
+    /// satisfies `¬cond`, so the whole pair is decided with ONE solve.
+    /// Forced branches (the majority in real programs) drop from two
+    /// solves to one; both-feasible pairs still take two.
+    ///
+    /// CONTRACT: if the guarantee is violated (the base is in fact
+    /// Unsat), the result is `(Unsat, Sat)` whose second component is
+    /// vacuous. Use [`solve_pair_under_assumptions`] when base
+    /// feasibility is not established.
+    pub fn solve_pair_assuming_base_sat(
+        &mut self,
+        cond: BoolTerm,
+        assumptions: &[BoolTerm],
+    ) -> (SmtResult, SmtResult) {
+        self.solve_pair_impl(cond, assumptions, true)
+    }
+
+    fn solve_pair_impl(
+        &mut self,
+        cond: BoolTerm,
+        assumptions: &[BoolTerm],
+        base_known_sat: bool,
+    ) -> (SmtResult, SmtResult) {
         self.last_result = None;
         self.flush_pending();
         let r = self.bitblast_bool(cond);
@@ -1546,16 +1599,44 @@ impl SmtSolver {
             (self.eval_refs_from(&[r], ModelSource::Banked)[0], None)
         } else {
             let extras = self.build_assumption_lits(assumptions);
-            // Materialize the candidate BEFORE the baseline solve: no CNF
-            // then lands between the two solves, so the second one reuses
-            // the baseline's assumption-prefix trail (solver trail reuse)
+            // Materialize the candidate BEFORE the first solve: no CNF
+            // then lands between the solves, so the second one reuses the
+            // first's assumption-prefix trail (solver trail reuse)
             // instead of rebuilding it from level 0.
-            self.lit_of(r);
-            let asmps = self.built_assumptions(&extras);
+            let lit = self.lit_of(r);
+            let mut asmps = self.built_assumptions(&extras);
+            if base_known_sat {
+                // Base feasibility is vouched for — no baseline solve.
+                // Decide side `cond` directly; Unsat here means the pair
+                // is done in a single solve.
+                asmps.push(lit);
+                match self.sat.solve_under_assumptions(&asmps) {
+                    SolveResult::Unsat => {
+                        return (SmtResult::Unsat, SmtResult::Sat);
+                    }
+                    SolveResult::Sat => {}
+                }
+                // Bank this side's model now: if ¬cond turns out Unsat
+                // (forced-true branch), this witness still warms the next
+                // query.
+                self.bank_model();
+                asmps.pop();
+                asmps.push(!lit);
+                let other = match self.sat.solve_under_assumptions(&asmps) {
+                    SolveResult::Sat => SmtResult::Sat,
+                    SolveResult::Unsat => SmtResult::Unsat,
+                };
+                self.bank_model();
+                return (SmtResult::Sat, other);
+            }
             match self.sat.solve_under_assumptions(&asmps) {
                 SolveResult::Unsat => return (SmtResult::Unsat, SmtResult::Unsat),
                 SolveResult::Sat => {}
             }
+            // Bank the baseline model: if the one real solve below comes
+            // back Unsat, this witness of the base still warms the next
+            // query.
+            self.bank_model();
             (self.eval_refs_from(&[r], ModelSource::Trail)[0], Some(asmps))
         };
 
@@ -4034,9 +4115,9 @@ impl SmtSolver {
             term: self.aig.src_term(idx),
         };
         let o = self.new_sat_lit_tagged(origin);
-        self.emit_clause(vec![!al, !bl, o]);
-        self.emit_clause(vec![al, !o]);
-        self.emit_clause(vec![bl, !o]);
+        self.emit_clause_slice(&[!al, !bl, o]);
+        self.emit_clause_slice(&[al, !o]);
+        self.emit_clause_slice(&[bl, !o]);
         self.set_node_lit(idx, o);
         self.charge_cost(idx, 1, 3);
     }
@@ -4050,10 +4131,10 @@ impl SmtSolver {
             term: self.aig.src_term(idx),
         };
         let o = self.new_sat_lit_tagged(origin);
-        self.emit_clause(vec![!xl, !yl, !o]);
-        self.emit_clause(vec![xl, yl, !o]);
-        self.emit_clause(vec![xl, !yl, o]);
-        self.emit_clause(vec![!xl, yl, o]);
+        self.emit_clause_slice(&[!xl, !yl, !o]);
+        self.emit_clause_slice(&[xl, yl, !o]);
+        self.emit_clause_slice(&[xl, !yl, o]);
+        self.emit_clause_slice(&[!xl, yl, o]);
         self.set_node_lit(idx, o);
         self.charge_cost(idx, 1, 4);
     }
@@ -4068,10 +4149,10 @@ impl SmtSolver {
             term: self.aig.src_term(idx),
         };
         let o = self.new_sat_lit_tagged(origin);
-        self.emit_clause(vec![!sl, !tl, o]);
-        self.emit_clause(vec![!sl, tl, !o]);
-        self.emit_clause(vec![sl, !el, o]);
-        self.emit_clause(vec![sl, el, !o]);
+        self.emit_clause_slice(&[!sl, !tl, o]);
+        self.emit_clause_slice(&[!sl, tl, !o]);
+        self.emit_clause_slice(&[sl, !el, o]);
+        self.emit_clause_slice(&[sl, el, !o]);
         self.set_node_lit(idx, !o);
         self.charge_cost(idx, 1, 4);
     }
@@ -4092,13 +4173,29 @@ impl SmtSolver {
 
     // ---------- Low-level helpers ----------
 
-    /// Allocate a fresh SAT literal tagged with the given metadata.
+    /// Allocate a SAT literal tagged with the given metadata. The id may
+    /// be recycled from a retired cone (see `Solver::purge_vars`) — then
+    /// the per-var metadata is overwritten in place, and the id's slots
+    /// in the banked model are poisoned: they hold values from the
+    /// variable's previous life, and warm screening must recompute this
+    /// node structurally instead of trusting them.
     fn new_sat_lit_tagged(&mut self, origin: VarOrigin) -> Lit {
         let v = self.sat.new_var();
-        // Keep var_origin aligned 1-to-1 with SAT variables.
-        debug_assert_eq!(self.var_origin.len(), v.idx());
-        self.var_origin.push(origin);
-        self.lit_node.push(u32::MAX);
+        let vi = v.idx();
+        if vi < self.var_origin.len() {
+            self.var_origin[vi] = origin;
+            self.lit_node[vi] = u32::MAX;
+            let li = vi << 1;
+            if li + 1 < self.banked_model.len() {
+                self.banked_model[li] = LBool::Undef;
+                self.banked_model[li + 1] = LBool::Undef;
+            }
+        } else {
+            // Fresh id: keep var_origin aligned 1-to-1 with SAT variables.
+            debug_assert_eq!(self.var_origin.len(), vi);
+            self.var_origin.push(origin);
+            self.lit_node.push(u32::MAX);
+        }
         Lit::new(v, false)
     }
 
@@ -4114,6 +4211,19 @@ impl SmtSolver {
         }
     }
 
+    /// [`emit_clause`] from a stack slice: in direct mode the literals go
+    /// through the solver's reused buffer (no allocation); buffered mode
+    /// still owns its Vec, unchanged.
+    #[inline]
+    fn emit_clause_slice(&mut self, c: &[Lit]) {
+        match self.cnf_buffer.as_mut() {
+            Some(buf) => buf.push(c.to_vec()),
+            None => {
+                self.sat.add_clause_from_slice(c);
+            }
+        }
+    }
+
     fn get_or_make_bv_var(&mut self, id: u32, width: u32) -> Vec<AigRef> {
         // Route through the union-find root: aliased vars share SAT literals
         // (and therefore AIG input nodes).
@@ -4121,20 +4231,10 @@ impl SmtSolver {
         if let Some(cached) = self.bv_var_refs.get(&id) {
             return cached.clone();
         }
-        // We need the BvTerm handle to tag each bit. Look it up by scanning
-        // the context — BV variables are leaves with `BvOp::Var(id)`.
-        let term = {
-            let mut found = None;
-            for (idx, node) in self.ctx.bv_nodes.iter().enumerate() {
-                if let BvOp::Var(vid) = node.op {
-                    if vid == id {
-                        found = Some(BvTerm(idx as u32));
-                        break;
-                    }
-                }
-            }
-            found
-        };
+        // The BvTerm handle tags each bit's metadata — O(1) reverse map
+        // (this was a linear scan of every term ever built, which made
+        // fresh-variable creation quadratic over a long session).
+        let term = self.ctx.var_term(id);
         let refs: Vec<AigRef> = (0..width)
             .map(|bit| {
                 let origin = match term {
