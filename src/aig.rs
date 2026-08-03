@@ -151,7 +151,7 @@ impl Aig {
             rw_counts: [0; 6],
             nodes: vec![AigNode::ConstTrue],
             src_terms: vec![None],
-            hash_cons: HashMap::default(),
+            hash_cons: HashMap::with_capacity_and_hasher(1 << 15, Default::default()),
             input_lut: Vec::new(),
         }
     }

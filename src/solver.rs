@@ -991,43 +991,45 @@ impl Solver {
                 //  - 0 non-false: conflicting under the search trail (never
                 //    the case for fresh-gate definitional clauses) — full
                 //    rewind, after which every remaining lit is Undef.
-                let nonfalse_count = |s: &Self, ls: &[Lit]| {
-                    ls.iter()
-                        .filter(|&&l| s.value_of(l) != LBool::False)
-                        .count()
+                // One classification pass: count non-false lits, remember
+                // the first two, and track the deepest false level. Loops
+                // only through the rare all-false case (a blocking clause
+                // over the standing model — solve_many enumeration),
+                // which frees just the deepest false level so the clause
+                // regains watchable literals while everything below stays
+                // for trail reuse: enumeration pays a one-level backtrack
+                // per value instead of a full rebuild. Root-false lits
+                // were filtered out, so every false lit sits at level ≥ 1.
+                let (nf, w0, w1, deepest) = loop {
+                    let mut n = 0usize;
+                    let mut p0 = usize::MAX;
+                    let mut p1 = usize::MAX;
+                    let mut deep = 0i32;
+                    for (k, &l) in lits.iter().enumerate() {
+                        if self.value_of(l) == LBool::False {
+                            let lv = self.vardata[l.var_idx()].level;
+                            if lv > deep {
+                                deep = lv;
+                            }
+                        } else {
+                            n += 1;
+                            if p0 == usize::MAX {
+                                p0 = k;
+                            } else if p1 == usize::MAX {
+                                p1 = k;
+                            }
+                        }
+                    }
+                    if n == 0 {
+                        debug_assert!(deep >= 1);
+                        self.cancel_until(deep - 1);
+                        continue;
+                    }
+                    break (n, p0, p1, deep);
                 };
-                if nonfalse_count(self, &lits) == 0 {
-                    // Conflicting under the search trail — the standing
-                    // shape is a blocking clause over the current model
-                    // (solve_many enumeration). Free just the deepest
-                    // false level: the clause regains watchable literals
-                    // while everything below stays for trail reuse, so
-                    // enumeration pays a one-level backtrack per value
-                    // instead of a full rebuild. Root-false lits were
-                    // filtered out, so every false lit sits at level ≥ 1.
-                    let deepest = lits
-                        .iter()
-                        .map(|&l| self.vardata[l.var_idx()].level)
-                        .max()
-                        .unwrap();
-                    debug_assert!(deepest >= 1);
-                    self.cancel_until(deepest - 1);
-                }
-                let nf = nonfalse_count(self, &lits);
-                debug_assert!(nf >= 1);
                 let unit_undef = if nf == 1 {
-                    let u_pos = lits
-                        .iter()
-                        .position(|&l| self.value_of(l) != LBool::False)
-                        .unwrap();
-                    let deepest = lits
-                        .iter()
-                        .filter(|&&l| self.value_of(l) == LBool::False)
-                        .map(|&l| self.vardata[l.var_idx()].level)
-                        .max()
-                        .unwrap();
                     self.cancel_until(deepest);
-                    lits.swap(0, u_pos);
+                    lits.swap(0, w0);
                     let f_pos = (1..lits.len())
                         .find(|&k| {
                             self.value_of(lits[k]) == LBool::False
@@ -1037,17 +1039,11 @@ impl Solver {
                     lits.swap(1, f_pos);
                     self.value_of(lits[0]) == LBool::Undef
                 } else {
-                    // ≥2 non-false: move the first two non-false lits into
-                    // the watch positions (no-op on a clean trail).
-                    let first = lits
-                        .iter()
-                        .position(|&l| self.value_of(l) != LBool::False)
-                        .unwrap();
-                    lits.swap(0, first);
-                    let second = (1..lits.len())
-                        .find(|&k| self.value_of(lits[k]) != LBool::False)
-                        .unwrap();
-                    lits.swap(1, second);
+                    // ≥2 non-false: the first two move into the watch
+                    // positions (no-op on a clean trail; w1 > w0 ≥ 0, so
+                    // the first swap never disturbs position w1).
+                    lits.swap(0, w0);
+                    lits.swap(1, w1);
                     false
                 };
 
@@ -2164,7 +2160,22 @@ impl Solver {
         // monomorphizes this call into a version that inlines the closure
         // and dead-codes the stop-check — so the hot loop pays zero
         // overhead compared to pre-bounded-solve days.
-        self.solve_bounded_inner(assumptions, |_, _| false)
+        self.solve_bounded_inner(assumptions, 0, |_, _| false)
+            .expect("unbounded solve always resolves")
+    }
+
+    /// [`solve_under_assumptions`] with a caller-vouched prefix: the first
+    /// `trusted_prefix` literals are guaranteed equal to the previous
+    /// solve's, so the entry-point prefix scan starts past them. Callers
+    /// that append to (or flip the tail of) a standing assumption list
+    /// make every solve O(changed suffix) instead of O(list). The
+    /// contract is checked in debug builds.
+    pub fn solve_under_assumptions_hinted(
+        &mut self,
+        assumptions: &[Lit],
+        trusted_prefix: usize,
+    ) -> SolveResult {
+        self.solve_bounded_inner(assumptions, trusted_prefix, |_, _| false)
             .expect("unbounded solve always resolves")
     }
 
@@ -2186,7 +2197,7 @@ impl Solver {
         if max_conflicts == 0 {
             return Some(self.solve_under_assumptions(assumptions));
         }
-        self.solve_bounded_inner(assumptions, move |s, start| {
+        self.solve_bounded_inner(assumptions, 0, move |s, start| {
             s.stats_conflicts - start >= max_conflicts
         })
     }
@@ -2212,7 +2223,7 @@ impl Solver {
         // fast-conflict workloads (≈25ns × 100k conflicts/sec = 2.5ms/sec).
         // A bitmask throttle skips the clock query 255 times out of 256;
         // the amortised cost is under 0.1ns per conflict.
-        self.solve_bounded_inner(assumptions, move |s, start| {
+        self.solve_bounded_inner(assumptions, 0, move |s, start| {
             let conflicts_since = s.stats_conflicts - start;
             if conflicts_since & 0xFF != 0 {
                 return false;
@@ -2224,6 +2235,7 @@ impl Solver {
     fn solve_bounded_inner<F>(
         &mut self,
         assumptions: &[Lit],
+        trusted_prefix: usize,
         should_stop: F,
     ) -> Option<SolveResult>
     where
@@ -2248,16 +2260,23 @@ impl Solver {
         // between (add_clause, probes) leaves `decision_level() == 0` and
         // reuse naturally degenerates to the old full reset.
         // Longest prefix shared with the previous solve's assumptions —
-        // drives trail reuse AND the O(suffix) install below. Append-only
-        // lists hit one vectorized slice compare.
+        // drives trail reuse AND the O(suffix) install below. The
+        // caller-vouched `trusted_prefix` is skipped outright (checked in
+        // debug builds); append-only lists additionally hit one
+        // vectorized slice compare instead of an element scan.
         let prev = self.assumptions.len();
+        let trusted = trusted_prefix.min(prev).min(assumptions.len());
+        debug_assert!(
+            assumptions[..trusted] == self.assumptions[..trusted],
+            "hinted prefix diverges from the previous assumption list"
+        );
         let shared = if assumptions.len() >= prev
-            && assumptions[..prev] == self.assumptions[..]
+            && (trusted == prev || assumptions[trusted..prev] == self.assumptions[trusted..])
         {
             prev
         } else {
             let cap = prev.min(assumptions.len());
-            let mut k = 0usize;
+            let mut k = trusted;
             while k < cap && self.assumptions[k] == assumptions[k] {
                 k += 1;
             }

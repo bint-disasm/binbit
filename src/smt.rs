@@ -394,6 +394,14 @@ pub struct SmtSolver {
     // measured 1.5-2% on front-end-bound sessions that never retire.
     retirement_used: bool,
 
+    // When false, the [activations | named controls] block and the
+    // assumption-lit cache both mirror the list the SAT core solved last,
+    // so hinted solves may vouch that prefix as unchanged and the solver
+    // skips scanning it. Set by anything that breaks the mirror: scope
+    // push/pop, named assertions, and build-without-solve paths (probes,
+    // failed_assumptions). Cleared by every hinted solve.
+    built_prefix_dirty: bool,
+
     // Structural-evaluation memo (`eval_refs_from`), node-indexed:
     // `eval_stamp[i] == eval_epoch` marks `eval_value[i]` as computed for
     // the current walk. Persistent buffers with an epoch bump per walk
@@ -479,6 +487,7 @@ impl SmtSolver {
             gate_terms_cache: Vec::new(),
             gate_refs_cache: Vec::new(),
             retirement_used: false,
+            built_prefix_dirty: true,
             eval_stamp: Vec::new(),
             eval_value: Vec::new(),
             eval_epoch: 0,
@@ -489,8 +498,8 @@ impl SmtSolver {
             pp_eliminated: 0,
             pp_subsumed: 0,
             pp_strengthened: 0,
-            bv_cache: HashMap::default(),
-            bool_cache: HashMap::default(),
+            bv_cache: HashMap::with_capacity_and_hasher(1 << 14, Default::default()),
+            bool_cache: HashMap::with_capacity_and_hasher(1 << 14, Default::default()),
             bv_var_refs: HashMap::default(),
             bool_var_refs: HashMap::default(),
             bv_var_parent: Vec::new(),
@@ -875,6 +884,7 @@ impl SmtSolver {
     /// identifies which names are needed.
     pub fn assert_named(&mut self, name: impl Into<String>, t: BoolTerm) {
         self.last_result = None;
+        self.built_prefix_dirty = true;
         let phi_ref = self.bitblast_bool(t);
         self.asserted_roots.push(phi_ref);
         let phi = self.lit_of(phi_ref);
@@ -903,6 +913,7 @@ impl SmtSolver {
     /// Open a new scope. Every subsequent `assert` is retractable via `pop`.
     pub fn push(&mut self) {
         self.last_result = None;
+        self.built_prefix_dirty = true;
         let act = self.new_sat_lit_tagged(VarOrigin::Activation);
         self.activation_stack.push(act);
         self.pending.push(Vec::new());
@@ -912,6 +923,7 @@ impl SmtSolver {
     /// become vacuous. Ignored if no scope is open.
     pub fn pop(&mut self) {
         self.last_result = None;
+        self.built_prefix_dirty = true;
         if let Some(act) = self.activation_stack.pop() {
             // Retraction only weakens the formula, so a standing model
             // survives it semantically — bank it before the retire clause
@@ -1103,7 +1115,8 @@ impl SmtSolver {
     pub fn solve(&mut self) -> SmtResult {
         self.flush_pending();
         let asmps = self.built_assumptions(&[]);
-        let result = match self.sat.solve_under_assumptions(&asmps) {
+        let trusted = self.trusted_for(0);
+        let result = match self.sat_solve_hinted(&asmps, trusted) {
             SolveResult::Sat => SmtResult::Sat,
             SolveResult::Unsat => SmtResult::Unsat,
         };
@@ -1113,9 +1126,10 @@ impl SmtSolver {
 
     pub fn solve_under_assumptions(&mut self, assumptions: &[BoolTerm]) -> SmtResult {
         self.flush_pending();
-        let extras = self.build_assumption_lits(assumptions);
+        let (extras, shared) = self.build_assumption_lits_counted(assumptions);
         let asmps = self.built_assumptions(&extras);
-        let result = match self.sat.solve_under_assumptions(&asmps) {
+        let trusted = self.trusted_for(shared);
+        let result = match self.sat_solve_hinted(&asmps, trusted) {
             SolveResult::Sat => SmtResult::Sat,
             SolveResult::Unsat => SmtResult::Unsat,
         };
@@ -1134,6 +1148,15 @@ impl SmtSolver {
     /// allocation order is unchanged — a cold cache is byte-identical to
     /// the uncached implementation.
     fn build_assumption_lits(&mut self, assumptions: &[BoolTerm]) -> Vec<Lit> {
+        self.build_assumption_lits_counted(assumptions).0
+    }
+
+    /// [`build_assumption_lits`] also returning how many leading lits are
+    /// shared with the previous call — the basis for hinted solves.
+    fn build_assumption_lits_counted(
+        &mut self,
+        assumptions: &[BoolTerm],
+    ) -> (Vec<Lit>, usize) {
         // Append-only fast path: one vectorized slice compare instead of a
         // branchy per-element scan.
         let cached = self.asmp_terms_cache.len();
@@ -1162,7 +1185,27 @@ impl SmtSolver {
         self.asmp_terms_cache.extend_from_slice(&assumptions[shared..]);
         self.asmp_lits_cache.truncate(shared);
         self.asmp_lits_cache.extend_from_slice(&lits[shared..]);
-        lits
+        (lits, shared)
+    }
+
+    /// Caller-vouched prefix for the next hinted solve. The standard
+    /// assumption-list shape is [activations | named controls |
+    /// assumption lits]; when the controls block still mirrors the last
+    /// solved list, its length plus the shared lit prefix is provably
+    /// unchanged.
+    fn trusted_for(&self, shared_lits: usize) -> usize {
+        if self.built_prefix_dirty {
+            0
+        } else {
+            self.activation_stack.len() + self.named_controls.len() + shared_lits
+        }
+    }
+
+    /// Hinted solve through the standard list shape; re-arms prefix trust.
+    fn sat_solve_hinted(&mut self, asmps: &[Lit], trusted: usize) -> SolveResult {
+        let r = self.sat.solve_under_assumptions_hinted(asmps, trusted);
+        self.built_prefix_dirty = false;
+        r
     }
 
     /// Bounded variant of [`solve_under_assumptions`]: returns `None` once
@@ -1262,6 +1305,10 @@ impl SmtSolver {
         let refs = self.bitblast_bv(x);
         let bits: Vec<Lit> = refs.iter().map(|&r| self.lit_of(r)).collect();
         let extras = self.build_assumption_lits(assumptions);
+        // Build-without-solve: the assumption cache no longer mirrors the
+        // solver's last-solved list, so later hinted solves must not vouch
+        // for it.
+        self.built_prefix_dirty = true;
         let asmps = self.built_assumptions(&extras);
         let (o, z) = self.sat.probe_under_assumptions(&asmps, |s| {
             let (mut o, mut z) = (0u128, 0u128);
@@ -1354,16 +1401,19 @@ impl SmtSolver {
         self.flush_pending();
         let refs = self.bitblast_bv(x);
         let bits: Vec<Lit> = refs.iter().map(|&r| self.lit_of(r)).collect();
-        let mut extras = self.build_assumption_lits(assumptions);
+        let (mut extras, shared) = self.build_assumption_lits_counted(assumptions);
         let act = self.new_sat_lit_tagged(VarOrigin::Activation);
         extras.push(act);
         let asmps = self.built_assumptions(&extras);
+        let mut trusted = self.trusted_for(shared);
         let mut values: Vec<u128> = Vec::new();
         let exhausted = loop {
             if values.len() >= limit {
                 break false;
             }
-            match self.sat.solve_under_assumptions(&asmps) {
+            let t = trusted.min(asmps.len());
+            trusted = asmps.len();
+            match self.sat_solve_hinted(&asmps, t) {
                 SolveResult::Unsat => break true,
                 SolveResult::Sat => {
                     // Read the value and build the blocking clause BEFORE
@@ -1455,6 +1505,9 @@ impl SmtSolver {
         // Built lazily, at the first candidate needing a real solve — a
         // warm run that screens everything never touches the SAT core.
         let mut base_asmps: Option<Vec<Lit>> = None;
+        // Prefix of the base list vouched unchanged for the next hinted
+        // solve; becomes the full base once any in-batch solve ran.
+        let mut cand_trusted = 0usize;
         loop {
             if model_valid {
                 // One structural walk screens every undecided candidate
@@ -1472,7 +1525,8 @@ impl SmtSolver {
                 break;
             };
             if base_asmps.is_none() {
-                let extras = self.build_assumption_lits(assumptions);
+                let (extras, shared) = self.build_assumption_lits_counted(assumptions);
+                cand_trusted = self.trusted_for(shared);
                 // A real solve is unavoidable now. Materialize every
                 // still-undecided candidate up front: later per-candidate
                 // solves then emit no CNF between SAT calls, so each one
@@ -1493,8 +1547,10 @@ impl SmtSolver {
                     // here decides everything at once; Sat provides the
                     // first screening model. A warm run skips this — the
                     // standing model already witnessed the base as sat.
-                    match self.sat.solve_under_assumptions(&asmps) {
+                    let t = cand_trusted.min(asmps.len());
+                    match self.sat_solve_hinted(&asmps, t) {
                         SolveResult::Sat => {
+                            cand_trusted = asmps.len();
                             // Bank the baseline model: even if every
                             // later per-candidate solve is Unsat, this
                             // witness of the base warms the next query.
@@ -1517,10 +1573,13 @@ impl SmtSolver {
             // pushed onto the shared base list and popped after the solve
             // (no per-candidate clone).
             let lit = self.lit_of(cand_refs[next]);
-            let asmps = base_asmps.as_mut().unwrap();
+            let mut asmps = base_asmps.take().unwrap();
             asmps.push(lit);
-            let res = self.sat.solve_under_assumptions(asmps);
+            let t = cand_trusted.min(asmps.len() - 1);
+            let res = self.sat_solve_hinted(&asmps, t);
             asmps.pop();
+            cand_trusted = asmps.len();
+            base_asmps = Some(asmps);
             match res {
                 SolveResult::Sat => {
                     results[next] = Some(SmtResult::Sat);
@@ -1598,19 +1657,21 @@ impl SmtSolver {
         let (cond_sat, mut asmps) = if self.banked_model_holds(assumptions) {
             (self.eval_refs_from(&[r], ModelSource::Banked)[0], None)
         } else {
-            let extras = self.build_assumption_lits(assumptions);
+            let (extras, shared) = self.build_assumption_lits_counted(assumptions);
             // Materialize the candidate BEFORE the first solve: no CNF
             // then lands between the solves, so the second one reuses the
             // first's assumption-prefix trail (solver trail reuse)
             // instead of rebuilding it from level 0.
             let lit = self.lit_of(r);
             let mut asmps = self.built_assumptions(&extras);
+            let trusted0 = self.trusted_for(shared);
             if base_known_sat {
                 // Base feasibility is vouched for — no baseline solve.
                 // Decide side `cond` directly; Unsat here means the pair
                 // is done in a single solve.
                 asmps.push(lit);
-                match self.sat.solve_under_assumptions(&asmps) {
+                let t = trusted0.min(asmps.len() - 1);
+                match self.sat_solve_hinted(&asmps, t) {
                     SolveResult::Unsat => {
                         return (SmtResult::Unsat, SmtResult::Sat);
                     }
@@ -1622,14 +1683,14 @@ impl SmtSolver {
                 self.bank_model();
                 asmps.pop();
                 asmps.push(!lit);
-                let other = match self.sat.solve_under_assumptions(&asmps) {
+                let other = match self.sat_solve_hinted(&asmps, asmps.len() - 1) {
                     SolveResult::Sat => SmtResult::Sat,
                     SolveResult::Unsat => SmtResult::Unsat,
                 };
                 self.bank_model();
                 return (SmtResult::Sat, other);
             }
-            match self.sat.solve_under_assumptions(&asmps) {
+            match self.sat_solve_hinted(&asmps, trusted0) {
                 SolveResult::Unsat => return (SmtResult::Unsat, SmtResult::Unsat),
                 SolveResult::Sat => {}
             }
@@ -1643,13 +1704,22 @@ impl SmtSolver {
         // The model-falsified side gets the one real solve. Only now may
         // CNF be emitted (assumption lits on the warm path, the candidate
         // lit always) — screening is done reading models.
-        let mut asmps = asmps.take().unwrap_or_else(|| {
-            let extras = self.build_assumption_lits(assumptions);
-            self.built_assumptions(&extras)
-        });
+        let (mut asmps, trusted) = match asmps.take() {
+            // The baseline just solved exactly this list.
+            Some(a) => {
+                let t = a.len();
+                (a, t)
+            }
+            None => {
+                let (extras, shared) = self.build_assumption_lits_counted(assumptions);
+                let t = self.trusted_for(shared);
+                (self.built_assumptions(&extras), t)
+            }
+        };
         let lit = self.lit_of(r);
         asmps.push(if cond_sat { !lit } else { lit });
-        let other = match self.sat.solve_under_assumptions(&asmps) {
+        let t = trusted.min(asmps.len() - 1);
+        let other = match self.sat_solve_hinted(&asmps, t) {
             SolveResult::Sat => SmtResult::Sat,
             SolveResult::Unsat => SmtResult::Unsat,
         };
@@ -1685,6 +1755,8 @@ impl SmtSolver {
     /// makes the lit lookup free. Meaningless after a Sat result.
     pub fn failed_assumptions(&mut self, assumptions: &[BoolTerm]) -> Vec<usize> {
         let extras = self.build_assumption_lits(assumptions);
+        // Build-without-solve (see bv_known_bits): drop prefix trust.
+        self.built_prefix_dirty = true;
         let core: std::collections::HashSet<Lit> =
             self.sat.unsat_core().iter().copied().collect();
         extras
@@ -1782,9 +1854,10 @@ impl SmtSolver {
         // gates.
         let refs = self.bitblast_bv(x);
         let bits: Vec<Lit> = refs.iter().map(|&r| self.lit_of(r)).collect();
-        let extras = self.build_assumption_lits(assumptions);
+        let (extras, shared) = self.build_assumption_lits_counted(assumptions);
         let asmps = self.built_assumptions(&extras);
-        match self.sat.solve_under_assumptions(&asmps) {
+        let trusted = self.trusted_for(shared);
+        match self.sat_solve_hinted(&asmps, trusted) {
             SolveResult::Sat => {
                 self.last_result = Some(SmtResult::Sat);
                 Some((bits, extras))
@@ -1816,27 +1889,43 @@ impl SmtSolver {
         let w = bits.len();
         let nlimbs = (w + 63) / 64;
         let mut limbs = vec![0u64; nlimbs];
-        let mut fixed: Vec<Lit> = Vec::with_capacity(extras.len() + w);
-        fixed.extend_from_slice(extras);
+        // One list for the whole hunt, grown in place: [controls |
+        // extras | bit lits...]. `valid` tracks how much of it provably
+        // equals the SAT core's last-solved list (the prologue solved
+        // exactly [controls | extras]; every hunt solve re-vouches its
+        // own list) — assumption plumbing is O(1) per bit.
+        let mut asmps = self.built_assumptions(extras);
+        let mut valid = asmps.len();
         for i in (0..w).rev() {
             let b = bits[i];
             let prefer_one = want_one(i);
             let first_try = if prefer_one { b } else { !b };
-            fixed.push(first_try);
-            let asmps = self.built_assumptions(&fixed);
-            let sat = matches!(
-                self.sat.solve_under_assumptions(&asmps),
-                SolveResult::Sat
-            );
+            // Model screening: the standing model (the prologue's, or the
+            // last hunt solve's) may already witness prefix ∧ preferred —
+            // exactly what a Sat solve would conclude, so the bit locks
+            // with zero SAT work. Solves happen only where the model
+            // disagrees with the preference.
+            if self.sat.has_model() && self.sat.value_of(first_try) == LBool::True {
+                asmps.push(first_try);
+                if prefer_one {
+                    limbs[i / 64] |= 1u64 << (i % 64);
+                }
+                continue;
+            }
+            asmps.push(first_try);
+            let t = valid.min(asmps.len() - 1);
+            let sat = matches!(self.sat_solve_hinted(&asmps, t), SolveResult::Sat);
+            valid = asmps.len();
             if sat {
                 if prefer_one {
                     limbs[i / 64] |= 1u64 << (i % 64);
                 }
             } else {
-                // The opposite polarity must be sat under `fixed[..-1]`,
-                // by exhaustion of the two possibilities.
-                fixed.pop();
-                fixed.push(!first_try);
+                // The opposite polarity must be sat under the prefix, by
+                // exhaustion of the two possibilities.
+                asmps.pop();
+                asmps.push(!first_try);
+                valid = asmps.len() - 1;
                 if !prefer_one {
                     limbs[i / 64] |= 1u64 << (i % 64);
                 }
@@ -1844,9 +1933,13 @@ impl SmtSolver {
         }
         // Leave the SAT solver in a state whose current model realizes
         // the returned optimum, so the caller can read other terms'
-        // values via `get_bv_value_*` afterward.
-        let asmps = self.built_assumptions(&fixed);
-        let _ = self.sat.solve_under_assumptions(&asmps);
+        // values via `get_bv_value_*` afterward. A standing model at loop
+        // exit already realizes it (every locked bit was screened or
+        // solved against it) — only a trailing Unsat needs the re-solve.
+        if !self.sat.has_model() {
+            let t = valid.min(asmps.len());
+            let _ = self.sat_solve_hinted(&asmps, t);
+        }
         self.last_result = Some(SmtResult::Sat);
         limbs
     }
