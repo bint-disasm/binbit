@@ -74,11 +74,11 @@ fn real_main() -> i32 {
         // Sharing-aware variant: safe build rules + parent-count-gated
         // post-build substitution pass.
         let mut aig2_post = false;
-        // Cut-based CNF technology mapping at materialization — ON by
-        // default at Fast effort. `--no-cnfmap` restores classic
-        // shape-aware Tseitin emission; `--cnfmap-full` spends more
-        // mapping time for better covers on dense arithmetic.
-        let mut cnfmap = true;
+        // Cut-based CNF technology mapping at materialization. Off by
+        // default (replaces the emitted CNF wholesale); `--cnfmap` maps
+        // at Fast effort, `--cnfmap-full` spends more mapping time for
+        // better covers on dense arithmetic.
+        let mut cnfmap = false;
         let mut cnfmap_full = false;
         for a in &args[2..] {
             match a.as_str() {
@@ -87,7 +87,6 @@ fn real_main() -> i32 {
                 "--fraig" => fraig = true,
                 "--aig2" => aig2 = true,
                 "--cnfmap" => cnfmap = true,
-                "--no-cnfmap" => cnfmap = false,
                 "--cnfmap-full" => {
                     cnfmap = true;
                     cnfmap_full = true;
