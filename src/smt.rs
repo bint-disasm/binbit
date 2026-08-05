@@ -433,6 +433,13 @@ pub struct SmtSolver {
     gate_terms_cache: Vec<BoolTerm>,
     gate_refs_cache: Vec<AigRef>,
 
+    // Dead-cone retirement, off by default. When off, the `asserted_roots`
+    // pin list below is not recorded at all (nothing else reads it) and
+    // `retire_dead_cones` is a no-op — so a solver that never retires
+    // pays nothing for the feature. Must be enabled before the first
+    // assertion, since the pin list is built as assertions are emitted.
+    retirement_enabled: bool,
+
     // True once `retire_dead_cones` has run. Until then no variable was
     // ever un-branched by retirement, so `set_node_lit` can skip its
     // re-enable write — a per-gate-materialization cache-line store that
@@ -538,6 +545,7 @@ impl SmtSolver {
             asmp_lits_cache: Vec::new(),
             gate_terms_cache: Vec::new(),
             gate_refs_cache: Vec::new(),
+            retirement_enabled: false,
             retirement_used: false,
             built_prefix_dirty: true,
             eval_stamp: Vec::new(),
@@ -614,6 +622,22 @@ impl SmtSolver {
     /// walk on every Unsat answer.
     pub fn set_core_tracking(&mut self, on: bool) {
         self.sat.set_core_tracking(on);
+    }
+
+    /// Enable dead-cone retirement (off by default).
+    ///
+    /// Must be called BEFORE the first assertion: retirement needs a pin
+    /// list of asserted AIG roots, and that list is built as assertions
+    /// are emitted. While disabled the list is not recorded at all and
+    /// [`retire_dead_cones`] is a no-op, so a solver that never retires
+    /// pays nothing.
+    ///
+    /// Retirement only pays when a long session's history is genuinely
+    /// dead — it measured 5.7× SLOWER when called with a live set that
+    /// still covers most of the formula (the sweep is O(everything),
+    /// finds nothing to delete, and drops the standing trail).
+    pub fn set_cone_retirement(&mut self, on: bool) {
+        self.retirement_enabled = on;
     }
 
     /// Enable/disable cut-based CNF mapping at materialization (see the
@@ -964,7 +988,9 @@ impl SmtSolver {
         self.last_result = None;
         self.built_prefix_dirty = true;
         let phi_ref = self.bitblast_bool(t);
-        self.asserted_roots.push(phi_ref);
+        if self.retirement_enabled {
+            self.asserted_roots.push(phi_ref);
+        }
         let phi = self.lit_of(phi_ref);
         let control = self.new_sat_lit_tagged(VarOrigin::Activation);
         // Clause: `(¬control ∨ phi)` — with any push-scope activation
@@ -1067,6 +1093,15 @@ impl SmtSolver {
     /// (clause deletion only weakens the formula). `last_result` is
     /// cleared. Returns `(retired_sat_vars, deleted_clauses)`.
     pub fn retire_dead_cones(&mut self, live: &[BoolTerm]) -> (u64, u64) {
+        if !self.retirement_enabled {
+            // Without the pin list there is no sound live set to retire
+            // against — every asserted cone would look dead.
+            debug_assert!(
+                false,
+                "retire_dead_cones requires set_cone_retirement(true) before asserting"
+            );
+            return (0, 0);
+        }
         self.last_result = None;
         self.retirement_used = true;
         self.flush_pending();
@@ -2047,8 +2082,10 @@ impl SmtSolver {
                 // per-bit shuffles SAT var numbering, which perturbs VSIDS
                 // tie-breaking / watch selection enough to flip near-cliff
                 // instances.
-                self.asserted_roots.extend_from_slice(&ab);
-                self.asserted_roots.extend_from_slice(&bb);
+                if self.retirement_enabled {
+                    self.asserted_roots.extend_from_slice(&ab);
+                    self.asserted_roots.extend_from_slice(&bb);
+                }
                 let als: Vec<Lit> = ab.iter().map(|&r| self.lit_of(r)).collect();
                 let bls: Vec<Lit> = bb.iter().map(|&r| self.lit_of(r)).collect();
                 for i in 0..ab.len() {
@@ -2091,7 +2128,9 @@ impl SmtSolver {
                     }
                     for i in 0..ab.len() {
                         let x = self.mk_xor(ab[i], bb[i]);
-                        self.asserted_roots.push(x);
+                        if self.retirement_enabled {
+                            self.asserted_roots.push(x);
+                        }
                         let xl = self.lit_of(x);
                         clause.push(xl);
                     }
@@ -2102,7 +2141,9 @@ impl SmtSolver {
         }
         // General path: bitblast to one AIG root, materialize, emit unit.
         let r = self.bitblast_bool(t);
-        self.asserted_roots.push(r);
+        if self.retirement_enabled {
+            self.asserted_roots.push(r);
+        }
         let lit = self.lit_of(r);
         match act_lit {
             None => {

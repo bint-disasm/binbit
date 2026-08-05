@@ -8,6 +8,7 @@ use binbit::{BoolTerm, SmtResult, SmtSolver};
 /// vars, returning (solver, link terms, final var).
 fn chain(count: u32) -> (SmtSolver, Vec<BoolTerm>, binbit::BvTerm) {
     let mut s = SmtSolver::new();
+    s.set_cone_retirement(true);
     let mut x = s.bv_var(32);
     let three = s.bv_const(3, 32);
     let mut links = Vec::new();
@@ -70,6 +71,7 @@ fn assertions_survive_retirement() {
     // Asserted cones are pinned: retiring with an empty live set must not
     // weaken the asserted formula.
     let mut s = SmtSolver::new();
+    s.set_cone_retirement(true);
     let x = s.bv_var(32);
     let ten = s.bv_const(10, 32);
     let below = s.bv_ult(x, ten);
@@ -99,6 +101,7 @@ fn banked_model_survives_retirement() {
     // Retirement only weakens the clause set, so a banked model must keep
     // warming batches whose assumptions stayed live.
     let mut s = SmtSolver::new();
+    s.set_cone_retirement(true);
     let x = s.bv_var(32);
     let hundred = s.bv_const(100, 32);
     let below = s.bv_ult(x, hundred);
@@ -135,6 +138,7 @@ fn retire_then_reuse_input_vars() {
     // Retiring a cone un-branches its input bits; a new cone over the
     // same BV variable must re-enable them and solve correctly.
     let mut s = SmtSolver::new();
+    s.set_cone_retirement(true);
     let x = s.bv_var(32);
     let five = s.bv_const(5, 32);
     let eq5 = s.bv_eq(x, five);
@@ -159,6 +163,7 @@ fn recycling_keeps_var_count_flat() {
     // per-var tables (and the banked-model snapshot) stay bounded by the
     // live set instead of growing with session length.
     let mut s = SmtSolver::new();
+    s.set_cone_retirement(true);
     let x = s.bv_var(32);
     let hundred = s.bv_const(100, 32);
     let below = s.bv_ult(x, hundred);
@@ -195,6 +200,7 @@ fn warm_screening_correct_after_recycling() {
     // screening must recompute recycled cones structurally — answers
     // must match a fresh solver even when ids were reused.
     let mut s = SmtSolver::new();
+    s.set_cone_retirement(true);
     let x = s.bv_var(32);
     let hundred = s.bv_const(100, 32);
     let below = s.bv_ult(x, hundred);
@@ -221,6 +227,7 @@ fn warm_screening_correct_after_recycling() {
     let got = s.solve_each_under_assumptions(&[c1, not_c1], &[pc]);
 
     let mut f = SmtSolver::new();
+    f.set_cone_retirement(true);
     let fx = f.bv_var(32);
     let fh = f.bv_const(100, 32);
     let fb = f.bv_ult(fx, fh);
@@ -252,6 +259,7 @@ fn bench_sliding_window_retirement() {
 
     fn run(retire: bool) -> std::time::Duration {
         let mut s = SmtSolver::new();
+    s.set_cone_retirement(true);
         let mut x = s.bv_var(32);
         let three = s.bv_const(3, 32);
         let k = s.bv_const(1 << 16, 32);
