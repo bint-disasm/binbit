@@ -243,11 +243,11 @@ pub struct SmtSolver {
     /// cuts and give SAT variables to cut roots only, defined by the
     /// ISOP of the cut function.
     ///
-    /// OFF by default. On the single-shot corpus it measured faster than
-    /// classic shape-aware Tseitin on 4 of 5 instances at
-    /// [`cnfmap::Effort::Fast`] (once mapping and BVE stopped competing
-    /// — see `CUT_BVE_MAX_CLAUSES`), but it did NOT hold up in bint's
-    /// real incremental workload, so classic emission stays the default.
+    /// ON by default at [`cnfmap::Effort::Fast`], which beat classic
+    /// shape-aware Tseitin on 4 of 5 corpus instances once mapping and
+    /// BVE stopped competing for the same variables (see
+    /// `CUT_BVE_MAX_CLAUSES`). `set_cnf_mapping(false)` restores classic
+    /// emission.
     cnf_mapping: bool,
     /// Persistent mapper scratch (buffers survive across cones).
     /// One mapper per effort level. The cut stride is a type parameter
@@ -520,7 +520,7 @@ impl SmtSolver {
             stats_xor_gates: 0,
             stats_mux_gates: 0,
             aig2_post: false,
-            cnf_mapping: false,
+            cnf_mapping: true,
             cnfmap_mapper: Default::default(),
             cnfmap_mapper_full: Default::default(),
             cnfmap_plan: Default::default(),

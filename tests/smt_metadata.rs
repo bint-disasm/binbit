@@ -99,7 +99,12 @@ fn gate_outputs_are_tagged_with_kind() {
 fn gate_outputs_inherit_enclosing_term() {
     // Build a 4-bit XOR expression. The gate outputs should be tagged with
     // the XOR term as their enclosing BV term.
+    //
+    // Classic emission only: this asserts the shape-aware encoder's
+    // per-gate metadata, and cut mapping (the default) absorbs XOR gates
+    // into cut roots, which are tagged `GateKind::Cut`/`And` instead.
     let mut s = SmtSolver::new();
+    s.set_cnf_mapping(false);
     let x = s.bv_var(4);
     let y = s.bv_var(4);
     let xor_term: BvTerm = s.bv_xor(x, y);
