@@ -389,6 +389,22 @@ impl RestartState {
 
 /// Indexed binary max-heap ordered by variable activity. `pos[v] == -1` means
 /// variable v is not currently in the heap.
+/// Push without the capacity check.
+///
+/// # Safety
+/// `v.len() < v.capacity()` must hold. Used only on the conflict-analysis
+/// walk buffers, which are sized to the variable count up front and take
+/// at most one push per variable.
+#[inline(always)]
+pub(crate) unsafe fn push_unchecked<T>(v: &mut Vec<T>, x: T) {
+    debug_assert!(v.len() < v.capacity(), "push_unchecked would grow");
+    unsafe {
+        let len = v.len();
+        std::ptr::write(v.as_mut_ptr().add(len), x);
+        v.set_len(len + 1);
+    }
+}
+
 struct OrderHeap {
     heap: Vec<u32>,
     pos: Vec<i32>,
@@ -1572,15 +1588,44 @@ impl Solver {
     /// On failure, any seen[] markers set during THIS call are rolled back,
     /// so later calls can still reach those variables and decide independently.
     fn lit_redundant(&mut self, start: Lit, abstract_levels: u64) -> bool {
+        // Both walk buffers are bounded by the variable count: a variable
+        // enters at most once, because entry sets its `seen` mark and the
+        // loop skips marked vars. Guaranteeing that capacity ONCE per
+        // call lets every push inside the walk skip its capacity check
+        // (they were visible in profiles) — two compares replacing one
+        // branch per push.
+        let nvars = self.lit_value.len() >> 1;
+        if self.analyze_stack.capacity() < nvars {
+            self.analyze_stack.reserve(nvars);
+        }
+        let need = self.analyze_toclear.len() + nvars;
+        if self.analyze_toclear.capacity() < need {
+            self.analyze_toclear.reserve(need - self.analyze_toclear.len());
+        }
         self.analyze_stack.clear();
         self.analyze_stack.push(start);
         let top = self.analyze_toclear.len();
 
-        while let Some(p) = self.analyze_stack.pop() {
+        // Same slice discipline as `propagate` and the order heap: this
+        // is a recursive walk over reason clauses, and `Vec` indexing
+        // (Index → Deref → bounds check) showed up as the dominant cost
+        // under `analyze` on conflict-heavy instances (spear family).
+        // Destructuring once hoists the base pointers into registers.
+        // None of these are resized during the walk — `seen`, `vardata`
+        // and the clause arena only grow in `new_var` / `add_clause`,
+        // neither of which runs mid-analysis.
+        let Solver { seen, vardata, clauses, analyze_stack, analyze_toclear, .. } = self;
+        let seen: &mut [bool] = seen.as_mut_slice();
+        let vardata: &[VarInfo] = vardata.as_slice();
+
+        while let Some(p) = analyze_stack.pop() {
             // Extract p's reason into one of two shapes: Clause (many lits,
             // indices 1..n are the "other" lits) or Binary (single partner).
+            // SAFETY (all unchecked accesses in this loop): every literal
+            // here comes from the trail or a live clause, so its variable
+            // index is < num_vars == seen.len() == vardata.len().
             let (cref_opt, binary_other): (Option<ClauseRef>, Option<Lit>) =
-                match self.vardata[p.var_idx()].reason {
+                match unsafe { vardata.get_unchecked(p.var_idx()) }.reason {
                     // SAFETY: the caller filters decision literals, and we
                     // only push literals onto analyze_stack when we've
                     // verified their reason is not a Decision. Reaching this
@@ -1596,18 +1641,24 @@ impl Solver {
                     Reason::Binary(other) => (None, Some(other)),
                 };
 
-            let n = match binary_other {
-                Some(_) => 1,
-                None => self.clauses.len(cref_opt.unwrap()) - 1,
+            // Walk the reason's other literals as a SLICE, not by index:
+            // the index form paid a `Range` iterator step plus a bounds-
+            // checked `get_lit` per literal, both of which showed up hot
+            // under `analyze`. The binary case borrows a one-element
+            // slice from the stack so both shapes share the loop body.
+            let binary_buf = [binary_other.unwrap_or(start)];
+            let others: &[Lit] = match binary_other {
+                Some(_) => &binary_buf,
+                // SAFETY: a Reason::Clause is always a long clause (len ≥ 3
+                // — binaries use Reason::Binary, units are enqueued as
+                // Decision at level 0), so index 1 is in bounds.
+                None => unsafe { clauses.lits(cref_opt.unwrap()).get_unchecked(1..) },
             };
 
-            for i in 0..n {
-                let q = match binary_other {
-                    Some(other) => other,
-                    None => self.clauses.get_lit(cref_opt.unwrap(), i + 1),
-                };
+            for &q in others {
                 let vq = q.var_idx();
-                if self.seen[vq] || self.vardata[vq].level <= 0 {
+                let vd = unsafe { *vardata.get_unchecked(vq) };
+                if unsafe { *seen.get_unchecked(vq) } || vd.level <= 0 {
                     // Already in learned / visited, or at level 0 (implied).
                     continue;
                 }
@@ -1615,19 +1666,25 @@ impl Solver {
                 // AND its level must match one of the levels present in the
                 // learned clause's 64-bit abstraction — a cheap reject filter
                 // that avoids walking into subgraphs whose levels are absent.
-                let can_recurse = !matches!(self.vardata[vq].reason, Reason::Decision)
-                    && (abstract_levels & (1u64 << (self.vardata[vq].level & 63))) != 0;
+                let can_recurse = !matches!(vd.reason, Reason::Decision)
+                    && (abstract_levels & (1u64 << (vd.level & 63))) != 0;
                 if can_recurse {
-                    self.seen[vq] = true;
-                    self.analyze_stack.push(q);
-                    self.analyze_toclear.push(q);
+                    // SAFETY: `seen` gates re-entry, so at most one push
+                    // per variable into each buffer, and both were sized
+                    // to `nvars` above.
+                    unsafe {
+                        *seen.get_unchecked_mut(vq) = true;
+                        push_unchecked(analyze_stack, q);
+                        push_unchecked(analyze_toclear, q);
+                    }
                 } else {
                     // Roll back everything this call marked so later
                     // minimization attempts can still examine these vars.
-                    for j in top..self.analyze_toclear.len() {
-                        self.seen[self.analyze_toclear[j].var_idx()] = false;
+                    for j in top..analyze_toclear.len() {
+                        let v = unsafe { analyze_toclear.get_unchecked(j) }.var_idx();
+                        unsafe { *seen.get_unchecked_mut(v) = false };
                     }
-                    self.analyze_toclear.truncate(top);
+                    analyze_toclear.truncate(top);
                     return false;
                 }
             }

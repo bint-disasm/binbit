@@ -1,6 +1,7 @@
 pub mod aig;
 pub mod bv;
 pub mod clause;
+pub mod cnfmap;
 pub mod dimacs;
 pub mod fraig;
 pub mod lit;

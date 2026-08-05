@@ -14,6 +14,9 @@ fn main() {
 
     let mut s = SmtSolver::new();
     s.set_core_tracking(cores);
+    if std::env::var_os("BINBIT_CNFMAP").is_some() {
+        s.set_cnf_mapping(true);
+    }
     let mut x = s.bv_var(32);
     let three = s.bv_const(3, 32);
     let k = s.bv_const(1 << 16, 32);

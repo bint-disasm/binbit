@@ -65,6 +65,12 @@ pub enum VarOrigin {
     Unknown,
 }
 
+/// Cut roots with at most this many defining clauses stay eliminable by
+/// BVE. A classic AND gate is 3 clauses and an XOR/MUX 4, so this lets
+/// the eliminator keep working on everything the mapper happened to
+/// leave gate-shaped while protecting the genuinely wide covers.
+const CUT_BVE_MAX_CLAUSES: usize = 4;
+
 /// Which gate produced a SAT variable. Kept deliberately small so that
 /// downstream code can `match` exhaustively. With the AIG pipeline, `And`
 /// covers plain AND nodes; `Xor` / `Ite` cover the pattern-mapped 3-node
@@ -79,6 +85,18 @@ pub enum GateKind {
     FaSum,
     /// Carry-out of a full adder.
     FaCarry,
+    /// Root of a WIDE cut chosen by CNF technology mapping
+    /// (`crate::cnfmap`) — one whose definition is bigger than a Tseitin
+    /// gate's. Bounded variable elimination must not resolve these away:
+    /// the definition is two multi-cube ISOP covers, so eliminating the
+    /// root splices them into far wider resolvents and destroys the
+    /// propagation structure the mapper built.
+    ///
+    /// Cut roots whose definition is gate-sized (see
+    /// `CUT_BVE_MAX_CLAUSES`) are tagged as ordinary gate outputs
+    /// instead, so BVE still gets to eliminate the cheap ones — the two
+    /// passes divide the work rather than competing for it.
+    Cut,
 }
 
 /// Recorded ITE gate: semantically `o ↔ (sel ∧ t) ∨ (¬sel ∧ e)`. Registered
@@ -219,6 +237,32 @@ pub struct SmtSolver {
     /// two-level substitution family applied only where it cannot strand
     /// a co-parent. See `Aig::substitute_pass`.
     aig2_post: bool,
+
+    /// Cut-based CNF technology mapping at materialization (see
+    /// `crate::cnfmap`): cover each unmaterialized cone with k-feasible
+    /// cuts and give SAT variables to cut roots only, defined by the
+    /// ISOP of the cut function.
+    ///
+    /// ON by default at [`cnfmap::Effort::Fast`], which measured faster
+    /// than classic shape-aware Tseitin on 4 of 5 corpus instances once
+    /// mapping and BVE stopped competing (see `CUT_BVE_MAX_CLAUSES`).
+    /// `set_cnf_mapping(false)` restores classic emission.
+    cnf_mapping: bool,
+    /// Persistent mapper scratch (buffers survive across cones).
+    /// One mapper per effort level. The cut stride is a type parameter
+    /// so the Fast mapper's per-node cut array is genuinely half the
+    /// size (the mapper's hottest structure — measured ~6%); the unused
+    /// one holds only empty buffers.
+    cnfmap_mapper: crate::cnfmap::Mapper<{ crate::cnfmap::FAST_CUTS }>,
+    cnfmap_mapper_full: crate::cnfmap::Mapper<{ crate::cnfmap::MAX_CUTS }>,
+    /// Reused plan arena and leaf-literal scratch for mapped emission —
+    /// the plan is a flat arena (cf. `ClauseArena`), so a cone costs no
+    /// allocations once these are warm.
+    cnfmap_plan: crate::cnfmap::Plan,
+    cnfmap_effort: crate::cnfmap::Effort,
+    cnfmap_leaf_lits: Vec<Lit>,
+    /// Cross-cone ISOP cache for the CNF mapper (see `cnfmap::IsopCache`).
+    cnfmap_cache: crate::cnfmap::IsopCache,
     aig2_post_stats: crate::aig::PostPassStats,
 
     /// AIG nodes whose SAT binding was dropped by bounded VE. If a later
@@ -468,6 +512,13 @@ impl SmtSolver {
             stats_xor_gates: 0,
             stats_mux_gates: 0,
             aig2_post: false,
+            cnf_mapping: true,
+            cnfmap_mapper: Default::default(),
+            cnfmap_mapper_full: Default::default(),
+            cnfmap_plan: Default::default(),
+            cnfmap_effort: Default::default(),
+            cnfmap_leaf_lits: Vec::new(),
+            cnfmap_cache: Default::default(),
             aig2_post_stats: crate::aig::PostPassStats::default(),
             elim_nodes: HashSet::default(),
             pp_remat: 0,
@@ -498,8 +549,12 @@ impl SmtSolver {
             pp_eliminated: 0,
             pp_subsumed: 0,
             pp_strengthened: 0,
-            bv_cache: HashMap::with_capacity_and_hasher(1 << 14, Default::default()),
-            bool_cache: HashMap::with_capacity_and_hasher(1 << 14, Default::default()),
+            // Modest seeds only. Pre-sizing these to 16k entries shaved
+            // ~4% of rehashing off long sessions but cost every solver
+            // construction ~600KB of allocate-and-zero — a bad trade for
+            // workloads that run many small queries.
+            bv_cache: HashMap::with_capacity_and_hasher(256, Default::default()),
+            bool_cache: HashMap::with_capacity_and_hasher(256, Default::default()),
             bv_var_refs: HashMap::default(),
             bool_var_refs: HashMap::default(),
             bv_var_parent: Vec::new(),
@@ -560,6 +615,25 @@ impl SmtSolver {
         self.sat.set_core_tracking(on);
     }
 
+    /// Enable/disable cut-based CNF mapping at materialization (see the
+    /// `cnf_mapping` field). Takes effect for cones materialized after
+    /// the call; already-emitted CNF is untouched.
+    pub fn set_cnf_mapping(&mut self, on: bool) {
+        self.cnf_mapping = on;
+    }
+
+    /// Mapping effort for cut-based CNF mapping — see
+    /// [`cnfmap::Mapper::set_effort`]. Default (false) is byte-identical
+    /// to full effort on symbex-shaped instances at ~40% less mapping
+    /// cost; `true` pays off on dense arithmetic (multiplier arrays).
+    pub fn set_cnf_mapping_effort(&mut self, full: bool) {
+        self.cnfmap_effort = if full {
+            crate::cnfmap::Effort::Full
+        } else {
+            crate::cnfmap::Effort::Fast
+        };
+    }
+
     /// Enable or disable the ITE-aware branching hint. On (the default)
     /// means every live ITE gate boosts its selector's VSIDS activity at
     /// flush; off disables that boost entirely. Useful to benchmark the
@@ -573,11 +647,14 @@ impl SmtSolver {
     /// changes circuit structure and search trajectory.
     pub fn set_aig_two_level(&mut self, on: bool) {
         self.aig.set_two_level(on);
-        // Safe-subset escape hatch for mechanism experiments: skip the
-        // node-bypassing substitution/idem-4 families.
-        if std::env::var_os("BINBIT_AIG2_NOSUBST").is_some() {
-            self.aig.set_two_level_subst(false);
-        }
+    }
+
+    /// Restrict two-level rewriting to its safe subset (pure deletions),
+    /// skipping the node-bypassing substitution / idem-4 families — the
+    /// two rules that fragment the learned-clause vocabulary on shared
+    /// DAGs. Only meaningful with [`set_aig_two_level`] on.
+    pub fn set_aig_two_level_subst(&mut self, on: bool) {
+        self.aig.set_two_level_subst(on);
     }
 
     /// Sharing-aware two-level rewriting: construction-time safe subset
@@ -2036,6 +2113,7 @@ impl SmtSolver {
         }
     }
 
+
     /// Scan batch roots for `(= x t)` substitution candidates and install
     /// the sound ones into `bv_var_subst`. Returns how many were added.
     ///
@@ -2952,14 +3030,6 @@ impl SmtSolver {
                     // a rejected batch behaves exactly like the
                     // pre-normalization solver.
                     let accept = cancelled > 0 && merged >= 10_000;
-                    if std::env::var_os("BINBIT_DEBUG_NORM").is_some() {
-                        eprintln!(
-                            "c norm score: cancelled={} merged={} -> {}",
-                            cancelled,
-                            merged,
-                            if accept { "NORM" } else { "ORIG" }
-                        );
-                    }
                     if accept {
                         batch = normalized;
                     }
@@ -3000,8 +3070,8 @@ impl SmtSolver {
                 let stats = crate::fraig::sweep(
                     &mut self.aig,
                     start,
-                    fraig_budget("BINBIT_FRAIG_MAXQ", 20_000),
-                    fraig_budget("BINBIT_FRAIG_CONFL", 100),
+                    FRAIG_MAX_QUERIES,
+                    FRAIG_MAX_CONFLICTS,
                     0x5EED_CAFE_F00D_D00D ^ start as u64,
                 );
                 self.fraig_swept_upto = self.aig.num_nodes() as u32;
@@ -3157,11 +3227,23 @@ impl SmtSolver {
         // gate output allocated by THIS batch (older vars may be referenced
         // by clauses already committed to the SAT core; inputs / activation
         // lits / the true-lit are read elsewhere).
+        // Cut roots are frozen too. A Tseitin gate output is defined by a
+        // handful of narrow clauses, so resolving it away is cheap and
+        // usually a win; a cut root is defined by two wide ISOP covers,
+        // and eliminating one splices them into far wider resolvents,
+        // destroying the propagation structure the mapper chose. On the
+        // XOR-heavy spear instances — where BVE is otherwise the single
+        // biggest lever (36% of variables) — letting BVE at the cut roots
+        // cost 2.2× (mapped-full 0.42s → 0.92s) and more than doubled
+        // conflicts (9053 → 21428).
         let mut frozen: Vec<bool> = Vec::with_capacity(k);
         for &ov in &to_orig {
             let ov = ov as usize;
             let f = ov < batch_start_var
-                || !matches!(self.var_origin[ov], VarOrigin::GateOut { .. });
+                || !matches!(
+                    self.var_origin[ov],
+                    VarOrigin::GateOut { gate, .. } if gate != GateKind::Cut
+                );
             frozen.push(f);
         }
 
@@ -3998,8 +4080,109 @@ impl SmtSolver {
     /// vars only if some other consumer independently materializes them).
     /// This keeps CNF size at parity with a hand-written Tseitin encoder
     /// while everything still flows through one AIG.
+    /// Materialize `root`'s unmaterialized cone through cut-based CNF
+    /// mapping (`crate::cnfmap`): plan a cut cover treating bound nodes,
+    /// inputs, and constants as leaves, then give each chosen cut root a
+    /// variable defined by the ISOP cubes of its cut function over the
+    /// leaf literals. Interior nodes stay unbound (structural model eval
+    /// handles them); clauses are ≤ MAX_K+1 literals, so the wide-clause
+    /// machinery never engages.
+    fn materialize_mapped(&mut self, root: u32) {
+        self.materialize_mapped_multi(&[root]);
+    }
+
+
+    /// Multi-root variant: one cut-mapping plan covering every root's
+    /// unmaterialized cone at once. Used per flush batch so sharing
+    /// across assertions is visible to the mapper and the per-plan fixed
+    /// costs amortize.
+    fn materialize_mapped_multi(&mut self, roots: &[u32]) {
+        let mut cache = std::mem::take(&mut self.cnfmap_cache);
+        let mut plan = std::mem::take(&mut self.cnfmap_plan);
+        let is_leaf = |this: &Self, n: u32| {
+            this.node_lit(n).is_some() || !matches!(this.aig.node(n), AigNode::And(..))
+        };
+        match self.cnfmap_effort {
+            crate::cnfmap::Effort::Fast => {
+                let mut mapper = std::mem::take(&mut self.cnfmap_mapper);
+                mapper.plan(&self.aig, roots, |n| is_leaf(self, n), &mut cache, &mut plan);
+                self.cnfmap_mapper = mapper;
+            }
+            crate::cnfmap::Effort::Full => {
+                let mut mapper = std::mem::take(&mut self.cnfmap_mapper_full);
+                mapper.plan(&self.aig, roots, |n| is_leaf(self, n), &mut cache, &mut plan);
+                self.cnfmap_mapper_full = mapper;
+            }
+        }
+        self.cnfmap_cache = cache;
+        let mut clause: Vec<Lit> = Vec::with_capacity(crate::cnfmap::MAX_K + 1);
+        for e in 0..plan.len() {
+            self.emit_plan_node(&plan, plan.entry(e), &mut clause);
+        }
+        self.cnfmap_plan = plan;
+    }
+
+    /// Emit one plan node: a fresh variable defined by the ISOP cubes of
+    /// its cut function over the leaf literals, bound via `set_node_lit`.
+    fn emit_plan_node(
+        &mut self,
+        plan: &crate::cnfmap::Plan,
+        pn: crate::cnfmap::PlanEntry,
+        clause: &mut Vec<Lit>,
+    ) {
+        // Leaf literals: inputs/constants bind through the classic path
+        // (no clauses); And leaves are already bound. Reused scratch —
+        // one plan node at a time, so a single buffer suffices.
+        let mut leaf_lits = std::mem::take(&mut self.cnfmap_leaf_lits);
+        leaf_lits.clear();
+        for idx in 0..plan.leaves(pn).len() {
+            let l = plan.leaves(pn)[idx];
+            let lit = self.lit_of(AigRef::from_parts(l, false));
+            leaf_lits.push(lit);
+        }
+        let ncl = plan.on_cubes(pn).len() + plan.off_cubes(pn).len();
+        // A cut root is only worth protecting from BVE when its
+        // definition is genuinely wider than a Tseitin gate's; a cut that
+        // came out gate-sized resolves just as cheaply as one, so leaving
+        // it eliminable keeps BVE productive on the mapped CNF.
+        let origin = VarOrigin::GateOut {
+            gate: if ncl > CUT_BVE_MAX_CLAUSES {
+                GateKind::Cut
+            } else {
+                GateKind::And
+            },
+            term: self.aig.src_term(pn.node),
+        };
+        let t = self.new_sat_lit_tagged(origin);
+        // cube → t   becomes   (t ∨ ¬cube);  cube → ¬t   (¬t ∨ ¬cube).
+        for (cubes, tl) in [(plan.on_cubes(pn), t), (plan.off_cubes(pn), !t)] {
+            for cube in cubes {
+                clause.clear();
+                clause.push(tl);
+                for (i, &ll) in leaf_lits.iter().enumerate() {
+                    if cube.pos & (1 << i) != 0 {
+                        clause.push(!ll);
+                    }
+                    if cube.neg & (1 << i) != 0 {
+                        clause.push(ll);
+                    }
+                }
+                self.emit_clause_slice(clause);
+            }
+        }
+        self.cnfmap_leaf_lits = leaf_lits;
+        self.set_node_lit(pn.node, t);
+        self.charge_cost(pn.node, 1, ncl);
+    }
+
     fn lit_of(&mut self, r: AigRef) -> Lit {
         let root_idx = r.node_idx();
+        if self.cnf_mapping
+            && self.node_lit(root_idx).is_none()
+            && matches!(self.aig.node(root_idx), AigNode::And(..))
+        {
+            self.materialize_mapped(root_idx);
+        }
         if self.node_lit(root_idx).is_none() {
             let mut worklist: Vec<u32> = vec![root_idx];
             while let Some(&top) = worklist.last() {
@@ -5175,15 +5358,14 @@ impl Default for SmtSolver {
 }
 
 /// FRAIG sweep budget with an env override — lets budget experiments run
-/// without a recompile (`BINBIT_FRAIG_MAXQ`, `BINBIT_FRAIG_CONFL`). Cold
+/// (`FRAIG_MAX_QUERIES`, `FRAIG_MAX_CONFLICTS`). Cold
 /// path: read once per flush.
-fn fraig_budget(env: &str, default: u64) -> u64 {
-    std::env::var(env)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-        .max(1)
-}
+/// Per-sweep FRAIG budgets: SAT queries, and conflicts per query.
+/// Constants rather than tunables — FRAIG is off by default (measured
+/// strongly net-negative; see the module docs) and these values are the
+/// ones its evaluation used.
+const FRAIG_MAX_QUERIES: u64 = 20_000;
+const FRAIG_MAX_CONFLICTS: u64 = 100;
 
 /// Flip the sign bit (MSB) of a bitblasted BV — used for signed comparisons.
 fn flip_msb(bits: &[AigRef]) -> Vec<AigRef> {

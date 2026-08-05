@@ -74,12 +74,24 @@ fn real_main() -> i32 {
         // Sharing-aware variant: safe build rules + parent-count-gated
         // post-build substitution pass.
         let mut aig2_post = false;
+        // Cut-based CNF technology mapping at materialization — ON by
+        // default at Fast effort. `--no-cnfmap` restores classic
+        // shape-aware Tseitin emission; `--cnfmap-full` spends more
+        // mapping time for better covers on dense arithmetic.
+        let mut cnfmap = true;
+        let mut cnfmap_full = false;
         for a in &args[2..] {
             match a.as_str() {
                 "--stats" => want_stats = true,
                 "--fraig-diag" => want_fraig_diag = true,
                 "--fraig" => fraig = true,
                 "--aig2" => aig2 = true,
+                "--cnfmap" => cnfmap = true,
+                "--no-cnfmap" => cnfmap = false,
+                "--cnfmap-full" => {
+                    cnfmap = true;
+                    cnfmap_full = true;
+                }
                 "--aig2-post" => aig2_post = true,
                 "--no-norm" => norm = false,
                 "--no-subst" => subst = false,
@@ -120,6 +132,8 @@ fn real_main() -> i32 {
         solver.set_bve(bve);
         solver.set_fraig(fraig);
         solver.set_aig_two_level(aig2);
+        solver.set_cnf_mapping(cnfmap);
+        solver.set_cnf_mapping_effort(cnfmap_full);
         if aig2_post {
             solver.set_aig_two_level_post(true);
         }
