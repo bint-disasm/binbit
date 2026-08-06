@@ -161,6 +161,11 @@ impl Aig {
         self.two_level = on;
     }
 
+    /// Whether two-level rewriting is enabled (see `set_two_level`).
+    pub fn two_level_enabled(&self) -> bool {
+        self.two_level
+    }
+
     /// Restrict two-level rewriting to the pure-deletion families
     /// (see `two_level_subst` field docs). `on = false` disables the
     /// substitution / idempotence-4 rules.

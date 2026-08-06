@@ -405,15 +405,39 @@ pub(crate) unsafe fn push_unchecked<T>(v: &mut Vec<T>, x: T) {
     }
 }
 
+/// One heap slot: the variable plus an embedded copy of its activity.
+///
+/// The copy exists purely so sift comparisons read the heap array instead
+/// of chasing `activity[heap[i]]` — on SMT-scale instances the activity
+/// array is megabytes and every sift level paid two random cache misses
+/// for it. The copy is kept exact at all times (`decrease` refreshes it
+/// after every bump, `refresh_all` after a rescale), so every comparison
+/// sees precisely the value the indirect load would have seen — same
+/// swaps, same final layout, same pop order: trajectory-identical to the
+/// indirect heap by construction.
+#[derive(Clone, Copy)]
+struct HeapEntry {
+    act: f64,
+    var: u32,
+}
+
+/// Indexed binary max-heap over `HeapEntry`, **1-indexed**: `heap[0]` is
+/// a permanent dummy and the root lives at index 1, so node `i`'s
+/// children are `2i` and `2i+1`. With 16-byte entries, an even-odd child
+/// pair never straddles a 64-byte cache line — every sift level reads
+/// exactly one line where the 0-indexed layout (children `2i+1`, `2i+2`)
+/// straddled two on half the nodes. The tree is node-for-node isomorphic
+/// to the 0-indexed one (shift every slot by one), so comparisons, swap
+/// decisions, and pop order are bit-identical — pure layout plumbing.
 struct OrderHeap {
-    heap: Vec<u32>,
+    heap: Vec<HeapEntry>,
     pos: Vec<i32>,
 }
 
 impl OrderHeap {
     fn new() -> Self {
         OrderHeap {
-            heap: Vec::new(),
+            heap: vec![HeapEntry { act: 0.0, var: u32::MAX }],
             pos: Vec::new(),
         }
     }
@@ -437,36 +461,73 @@ impl OrderHeap {
         if self.contains(v) {
             return;
         }
-        let idx = self.heap.len();
-        self.heap.push(v);
+        let idx = self.heap.len(); // first real slot is 1 (dummy at 0)
+        self.heap.push(HeapEntry { act: activity[v as usize], var: v });
         self.pos[v as usize] = idx as i32;
-        self.sift_up(idx, activity);
+        self.sift_up(idx);
     }
 
-    /// Called when v's activity just increased. If v is in the heap, move it up.
+    /// Called when v's activity just increased. If v is in the heap,
+    /// refresh the embedded copy and move it up.
     fn decrease(&mut self, v: u32, activity: &[f64]) {
         if !self.contains(v) {
             return;
         }
         let idx = self.pos[v as usize] as usize;
-        self.sift_up(idx, activity);
+        self.heap[idx].act = activity[v as usize];
+        self.sift_up(idx);
     }
 
-    fn pop(&mut self, activity: &[f64]) -> Option<u32> {
-        if self.heap.is_empty() {
+    /// Current maximum-activity entry without removing it. May be stale
+    /// (assigned / non-decision) — callers filter, popping rejects.
+    #[inline]
+    fn top(&self) -> Option<u32> {
+        self.heap.get(1).map(|e| e.var)
+    }
+
+    /// Prefetch `pos[v]` — see `cancel_until`'s re-insert lookahead.
+    #[inline(always)]
+    fn prefetch_pos(&self, v: usize) {
+        prefetch_slot(&self.pos, v);
+    }
+
+    fn pop(&mut self, _activity: &[f64]) -> Option<u32> {
+        if self.heap.len() <= 1 {
             return None;
         }
-        let top = self.heap[0];
+        let top = self.heap[1].var;
         self.pos[top as usize] = -1;
-        if self.heap.len() == 1 {
+        if self.heap.len() == 2 {
             self.heap.pop();
             return Some(top);
         }
         let last = self.heap.pop().unwrap();
-        self.heap[0] = last;
-        self.pos[last as usize] = 0;
-        self.sift_down(0, activity);
+        self.heap[1] = last;
+        self.pos[last.var as usize] = 1;
+        self.sift_down(1);
         Some(top)
+    }
+
+    /// Re-read every embedded activity from the array. Called after a
+    /// global activity rescale so the copies track the rescaled values
+    /// (relative order is preserved by the rescale, but the copies must
+    /// match exactly for future comparisons against fresh insertions).
+    fn refresh_all(&mut self, activity: &[f64]) {
+        for e in self.heap.iter_mut().skip(1) {
+            e.act = activity[e.var as usize];
+        }
+    }
+
+    /// Track an out-of-band activity rewrite for a var that may still be
+    /// in the heap (variable recycling resets activity to 0.0 without
+    /// popping the entry). Updates the embedded copy in place —
+    /// deliberately no re-sift, matching the historical behavior where
+    /// the live array value simply changed under an unmoved heap entry.
+    fn refresh(&mut self, v: u32, activity: &[f64]) {
+        if self.contains(v) {
+            let idx = self.pos[v as usize] as usize;
+            self.heap[idx].act = activity[v as usize];
+        }
     }
 
     // sift_up / sift_down are on the branching hot path (every `pop` and
@@ -476,68 +537,72 @@ impl OrderHeap {
     // slices once and indexing unchecked removes both the deref and the
     // check: heap is never resized during a sift (it's a reorder), heap
     // positions are `< heap.len()`, and every heap value is a valid variable
-    // id `< pos.len() == activity.len()`. `debug_assert`s keep these checked
-    // in dev/test.
-    fn sift_up(&mut self, mut i: usize, activity: &[f64]) {
+    // id `< pos.len()`. `debug_assert`s keep these checked in dev/test.
+    fn sift_up(&mut self, mut i: usize) {
         let OrderHeap { heap, pos } = self;
         let heap = heap.as_mut_slice();
         let pos = pos.as_mut_slice();
-        debug_assert!(i < heap.len());
+        debug_assert!(i >= 1 && i < heap.len());
         // SAFETY: see the note above — all indices are invariants here.
         unsafe {
             let x = *heap.get_unchecked(i);
-            let xa = *activity.get_unchecked(x as usize);
-            while i > 0 {
-                let parent = (i - 1) / 2;
-                let pv = *heap.get_unchecked(parent);
-                if *activity.get_unchecked(pv as usize) < xa {
-                    *heap.get_unchecked_mut(i) = pv;
-                    *pos.get_unchecked_mut(pv as usize) = i as i32;
+            while i > 1 {
+                let parent = i / 2;
+                let pe = *heap.get_unchecked(parent);
+                if pe.act < x.act {
+                    *heap.get_unchecked_mut(i) = pe;
+                    *pos.get_unchecked_mut(pe.var as usize) = i as i32;
                     i = parent;
                 } else {
                     break;
                 }
             }
             *heap.get_unchecked_mut(i) = x;
-            *pos.get_unchecked_mut(x as usize) = i as i32;
+            *pos.get_unchecked_mut(x.var as usize) = i as i32;
         }
     }
 
-    fn sift_down(&mut self, mut i: usize, activity: &[f64]) {
+    fn sift_down(&mut self, mut i: usize) {
         let OrderHeap { heap, pos } = self;
         let heap = heap.as_mut_slice();
         let pos = pos.as_mut_slice();
         let len = heap.len();
-        debug_assert!(i < len);
+        debug_assert!(i >= 1 && i < len);
         // SAFETY: see the note above — all indices are invariants here.
         unsafe {
             let x = *heap.get_unchecked(i);
-            let xa = *activity.get_unchecked(x as usize);
             loop {
-                let left = 2 * i + 1;
+                let left = 2 * i;
                 if left >= len {
                     break;
                 }
                 let right = left + 1;
                 let child = if right < len
-                    && *activity.get_unchecked(*heap.get_unchecked(right) as usize)
-                        > *activity.get_unchecked(*heap.get_unchecked(left) as usize)
+                    && heap.get_unchecked(right).act > heap.get_unchecked(left).act
                 {
                     right
                 } else {
                     left
                 };
-                let cv = *heap.get_unchecked(child);
-                if *activity.get_unchecked(cv as usize) > xa {
-                    *heap.get_unchecked_mut(i) = cv;
-                    *pos.get_unchecked_mut(cv as usize) = i as i32;
+                let ce = *heap.get_unchecked(child);
+                // Prefetch the likely next level: the walk is a chain of
+                // dependent cache-line loads down a multi-megabyte array,
+                // so pulling the grandchild pair in while this level's
+                // compare retires hides most of the next miss. Pure hint.
+                let gl = 2 * child;
+                if gl < len {
+                    prefetch_slot(heap, gl);
+                }
+                if ce.act > x.act {
+                    *heap.get_unchecked_mut(i) = ce;
+                    *pos.get_unchecked_mut(ce.var as usize) = i as i32;
                     i = child;
                 } else {
                     break;
                 }
             }
             *heap.get_unchecked_mut(i) = x;
-            *pos.get_unchecked_mut(x as usize) = i as i32;
+            *pos.get_unchecked_mut(x.var as usize) = i as i32;
         }
     }
 }
@@ -607,6 +672,21 @@ pub struct Solver {
     max_learnts: f64,
     // Glucose-style adaptive restart policy.
     restart: RestartState,
+    // Opt-in reuse-trail on restart (see `restart_reuse_level` for the
+    // corpus verdict that keeps this off by default).
+    restart_reuse: bool,
+    // Phase saving on unassignment (see `cancel_until`). Suppressed while
+    // vivification probes run — probe assignments are scheduling artifacts,
+    // and letting them overwrite saved phases would silently re-roll the
+    // decision-march trajectory even when vivification changes nothing.
+    save_phases: bool,
+    // Opt-in clause vivification (see `vivify_pass` for the corpus verdict
+    // that keeps this off by default).
+    viv_enabled: bool,
+    // Conflict count that arms the next vivification pass.
+    viv_next_conflicts: u64,
+    // Round-robin position in `learnts` where the next pass resumes.
+    viv_cursor: usize,
 
     // === Incremental solving state. ===
     // Literals that must hold for the current solve. Each becomes a pseudo-
@@ -634,6 +714,15 @@ pub struct Solver {
     pub stats_decisions: u64,
     pub stats_propagations: u64,
     pub stats_restarts: u64,
+    /// Total decision levels preserved across restarts by reuse-trail —
+    /// `restarts × avg-kept` diagnostic for the march-reuse heuristic.
+    pub stats_reused_levels: u64,
+    /// Vivification: clauses probed / clauses shortened / clauses deleted
+    /// as implied / unit strengthenings enqueued at the root.
+    pub stats_viv_checked: u64,
+    pub stats_viv_strengthened: u64,
+    pub stats_viv_deleted: u64,
+    pub stats_viv_units: u64,
     pub stats_learned: u64,
     pub stats_deleted: u64,
     pub stats_reductions: u64,
@@ -712,6 +801,19 @@ impl Solver {
     // pre-feature code path — trajectory-identical by construction.
     const SEARCH_POS_MIN_LEN: usize = 128;
 
+    // Vivification cadence: arm a pass every this many conflicts (fired
+    // at the next restart, when the trail is already torn down to the
+    // root), spending at most VIV_BUDGET watcher-visits per pass.
+    const VIV_INTERVAL: u64 = 2_000;
+    const VIV_BUDGET: u64 = 300_000;
+    // Only probe quality learnts. Low-LBD clauses are the ones that keep
+    // re-propagating — shortening them pays every future visit. Probing
+    // garbage-tier learnts both burns the budget and WAKES them up:
+    // a strengthened clause propagates earlier, and on decision-march
+    // instances that extra activity from otherwise-inert clauses measurably
+    // derails the march.
+    const VIV_MAX_LBD: u32 = 6;
+
     pub fn new() -> Self {
         Solver {
             clauses: ClauseArena::new(),
@@ -734,6 +836,11 @@ impl Solver {
             cla_decay: 0.999,
             max_learnts: 0.0,
             restart: RestartState::new(),
+            restart_reuse: false,
+            save_phases: true,
+            viv_enabled: false,
+            viv_next_conflicts: Self::VIV_INTERVAL,
+            viv_cursor: 0,
             assumptions: Vec::new(),
             conflict_core: Vec::new(),
             analyze_toclear: Vec::new(),
@@ -744,6 +851,11 @@ impl Solver {
             stats_decisions: 0,
             stats_propagations: 0,
             stats_restarts: 0,
+            stats_reused_levels: 0,
+            stats_viv_checked: 0,
+            stats_viv_strengthened: 0,
+            stats_viv_deleted: 0,
+            stats_viv_units: 0,
             stats_learned: 0,
             stats_deleted: 0,
             stats_reductions: 0,
@@ -766,6 +878,27 @@ impl Solver {
     /// O(trail) walk per Unsat.
     pub fn set_core_tracking(&mut self, on: bool) {
         self.core_on = on;
+    }
+
+    /// Enable reuse-trail on restarts (JSAT'11 partial restarts). Off by
+    /// default — on the symbex corpus it is a per-instance trajectory
+    /// lottery (see [`Self::restart_reuse_level`]); opt in only for
+    /// workloads where a measurement says otherwise.
+    pub fn set_restart_trail_reuse(&mut self, on: bool) {
+        self.restart_reuse = on;
+    }
+
+    /// Enable clause vivification (CaDiCaL-style distillation of learnts
+    /// at restart boundaries). Off by default: on the symbex corpus
+    /// (2026-08-05, both ungated and LBD≤6-gated candidate selection) it
+    /// is a large per-instance lottery — libmsrpc 3.0s → 1.3s but
+    /// bench_6554 0.52s → 0.70s, and bench_16728 6.9s → 13.6s with
+    /// conflicts nearly doubled — the third straight learnt-set
+    /// perturbation to measure that way on this workload (after the two
+    /// retention policies). The machinery is kept for workloads with
+    /// long-running searches where distillation has time to amortize.
+    pub fn set_vivification(&mut self, on: bool) {
+        self.viv_enabled = on;
     }
 
     pub fn num_vars(&self) -> usize {
@@ -829,6 +962,10 @@ impl Solver {
             };
             self.lit_value[vi << 1] = LBool::Undef;
             self.lit_value[(vi << 1) | 1] = LBool::Undef;
+            // The recycled id may still be sitting in the heap (purge
+            // flags vars off but never pops them): sync its embedded
+            // activity copy with the reset, then (re-)insert if absent.
+            self.order_heap.refresh(v.0, &self.activity);
             self.order_heap.insert(v.0, &self.activity);
             return v;
         }
@@ -1780,10 +1917,22 @@ impl Solver {
             return;
         }
         let target = self.trail_lim[level as usize];
+        let save_phases = self.save_phases;
         for i in (target..self.trail.len()).rev() {
+            // Look ahead down the walk: the per-variable slots the heap
+            // re-insert will touch are random-access into multi-megabyte
+            // arrays; pulling them in ~8 iterations early overlaps the
+            // misses with this iteration's work. Pure hint.
+            if i >= target + 8 {
+                let ahead = self.trail[i - 8].var_idx();
+                prefetch_slot(&self.activity, ahead);
+                self.order_heap.prefetch_pos(ahead);
+            }
             let lit = self.trail[i];
             let vi = lit.var_idx();
-            self.polarity[vi] = !lit.is_negated();
+            if save_phases {
+                self.polarity[vi] = !lit.is_negated();
+            }
             // Reset both polarities in the per-literal table.
             let pos = (lit.0 & !1) as usize;
             self.lit_value[pos] = LBool::Undef;
@@ -1845,6 +1994,9 @@ impl Solver {
             *a *= 1e-100;
         }
         self.var_inc *= 1e-100;
+        // Embedded heap copies must track the rescale: stale copies would
+        // compare 1e100× too high against post-rescale insertions.
+        self.order_heap.refresh_all(&self.activity);
     }
 
     fn decay_var_activity(&mut self) {
@@ -2107,6 +2259,264 @@ impl Solver {
         deleted
     }
 
+    /// Read-only unit propagation for vivification probes: same
+    /// two-watched traversal as [`Self::propagate`], with three deliberate
+    /// differences. (a) `ignore` — the clause being vivified — never
+    /// propagates: a clause must not justify its own redundancy.
+    /// (b) Strictly read-only on watch state: no blocker refresh, no
+    /// watch migration, no saved scan positions. A clause the pass ends
+    /// up keeping retains its exact watch layout, so a vivification pass
+    /// that strengthens nothing leaves the search's future propagation
+    /// trajectory byte-identical. The price is a full body scan per
+    /// non-satisfied long-clause visit, which the budget accounts for.
+    /// (c) Conflicts just return `true` — probe conflicts are consumed
+    /// as "the decided prefix is contradictory", never analyzed.
+    fn vivify_propagate(&mut self, ignore: ClauseRef, budget: &mut u64) -> bool {
+        while self.qhead < self.trail.len() {
+            let p = self.trail[self.qhead];
+            self.qhead += 1;
+            let false_lit = !p;
+            let wl = false_lit.idx();
+            let n = self.watches.len(wl);
+            *budget = budget.saturating_sub(n as u64);
+            for i in 0..n {
+                let w = self.watches.list(wl)[i];
+                if w.is_binary() {
+                    let q = w.blocker;
+                    match self.value_of(q) {
+                        LBool::True => {}
+                        LBool::Undef => {
+                            self.enqueue(q, Reason::Binary(false_lit));
+                        }
+                        LBool::False => return true,
+                    }
+                    continue;
+                }
+                let cref = w.long_cref();
+                if cref == ignore {
+                    continue;
+                }
+                if self.value_of(w.blocker) == LBool::True {
+                    continue;
+                }
+                // Scoped scan so the arena borrow ends before any enqueue.
+                let (satisfied, nonfalse, first_undef) = {
+                    let lits = self.clauses.lits(cref);
+                    let mut satisfied = false;
+                    let mut nonfalse = 0u32;
+                    let mut first_undef = Lit(0);
+                    for &lk in lits {
+                        match self.lit_value[lk.0 as usize] {
+                            LBool::True => {
+                                satisfied = true;
+                                break;
+                            }
+                            LBool::Undef => {
+                                if nonfalse == 0 {
+                                    first_undef = lk;
+                                }
+                                nonfalse += 1;
+                                if nonfalse >= 2 {
+                                    break;
+                                }
+                            }
+                            LBool::False => {}
+                        }
+                    }
+                    (satisfied, nonfalse, first_undef)
+                };
+                if satisfied {
+                    continue;
+                }
+                match nonfalse {
+                    0 => return true, // fully falsified — probe conflict
+                    1 => {
+                        self.enqueue(first_undef, Reason::Clause(cref));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    /// Probe one learned clause at decision level 0 (vivification /
+    /// distillation): walk its literals, deciding each negation in turn
+    /// and propagating with the clause itself masked out.
+    ///
+    /// * a literal already **true** under the accumulated probe decisions
+    ///   (or at the root) — the rest of the formula implies a subclause
+    ///   that subsumes this one: the clause is redundant, delete it
+    ///   (the load-bearing "delete-on-implied" case);
+    /// * a literal already **false** — it can never help satisfy the
+    ///   clause under the prefix that falsified it: drop it;
+    /// * propagation **conflicts** — the decided prefix alone is
+    ///   contradictory, so its literals form an implied clause that
+    ///   subsumes this one: shrink to exactly that prefix.
+    ///
+    /// Returns `None` when a unit strengthening refuted the formula at
+    /// the root (caller must surface UNSAT), otherwise whether the
+    /// learnts entry should be kept / removed / replaced.
+    fn vivify_clause(
+        &mut self,
+        cref: ClauseRef,
+        budget: &mut u64,
+    ) -> Option<VivOutcome> {
+        debug_assert_eq!(self.decision_level(), 0);
+        self.stats_viv_checked += 1;
+        self.clauses.mark_vivified(cref);
+
+        let len = self.clauses.len(cref);
+        let mut probe: Vec<Lit> = Vec::with_capacity(len);
+        probe.extend_from_slice(self.clauses.lits(cref));
+
+        // Literals confirmed into the strengthened clause (the ones we
+        // actually decided on). `dropped` records any excluded literal.
+        let mut kept: Vec<Lit> = Vec::with_capacity(len);
+        let mut dropped = false;
+        let mut implied = false;
+        let mut conflicted = false;
+        for &l in &probe {
+            match self.value_of(l) {
+                LBool::True => {
+                    implied = true;
+                    break;
+                }
+                LBool::False => {
+                    dropped = true;
+                }
+                LBool::Undef => {
+                    kept.push(l);
+                    self.trail_lim.push(self.trail.len());
+                    self.enqueue(!l, Reason::Decision);
+                    if self.vivify_propagate(cref, budget) {
+                        conflicted = true;
+                        break;
+                    }
+                }
+            }
+        }
+        self.cancel_until(0);
+
+        if implied {
+            self.stats_viv_deleted += 1;
+            self.vivify_detach(cref);
+            self.clauses.mark_deleted(cref);
+            return Some(VivOutcome::Removed);
+        }
+        let final_len = if conflicted {
+            kept.len()
+        } else if dropped {
+            kept.len()
+        } else {
+            return Some(VivOutcome::Kept); // nothing learned
+        };
+        if final_len >= len {
+            return Some(VivOutcome::Kept); // conflict only on the last literal
+        }
+
+        // Strengthen: replace the clause with `kept`.
+        self.stats_viv_strengthened += 1;
+        let old_lbd = self.clauses.lbd(cref);
+        self.vivify_detach(cref);
+        self.clauses.mark_deleted(cref);
+        match kept.len() {
+            0 => {
+                // Impossible: a probe conflict needs at least one decision
+                // past the root fixpoint. Treat defensively as UNSAT-proof
+                // absence — keep the solver alive by ignoring.
+                debug_assert!(false, "vivification produced an empty clause");
+                Some(VivOutcome::Removed)
+            }
+            1 => {
+                self.stats_viv_units += 1;
+                if !self.enqueue(kept[0], Reason::Decision) {
+                    return None; // contradicts the root trail: UNSAT
+                }
+                if self.propagate().is_some() {
+                    return None; // root propagation refuted the formula
+                }
+                Some(VivOutcome::Removed)
+            }
+            2 => {
+                let (a, b) = (kept[0], kept[1]);
+                self.watches.push(a.idx(), Watcher::binary(b));
+                self.watches.push(b.idx(), Watcher::binary(a));
+                Some(VivOutcome::Removed)
+            }
+            _ => {
+                let ncref = self.clauses.alloc(&kept, true);
+                self.clauses.mark_vivified(ncref);
+                self.clauses.set_lbd(ncref, old_lbd.min(kept.len() as u32));
+                self.watches.push(kept[0].idx(), Watcher::long(ncref, kept[1]));
+                self.watches.push(kept[1].idx(), Watcher::long(ncref, kept[0]));
+                Some(VivOutcome::Replaced(ncref))
+            }
+        }
+    }
+
+    /// Remove `cref`'s two watch entries (positions 0/1 hold the watched
+    /// literals — the propagate loop maintains that invariant).
+    fn vivify_detach(&mut self, cref: ClauseRef) {
+        let w0 = self.clauses.get_lit(cref, 0);
+        let w1 = self.clauses.get_lit(cref, 1);
+        self.watches
+            .retain(w0.idx(), |w| w.is_binary() || w.long_cref() != cref);
+        self.watches
+            .retain(w1.idx(), |w| w.is_binary() || w.long_cref() != cref);
+    }
+
+    /// One budgeted vivification pass over not-yet-probed learnts,
+    /// resuming round-robin where the previous pass stopped. Runs at a
+    /// restart point (decision level 0). Returns `true` when a root-level
+    /// strengthening refuted the formula — the caller must return UNSAT.
+    fn vivify_pass(&mut self) -> bool {
+        debug_assert_eq!(self.decision_level(), 0);
+        // Probe cost is measured in watcher visits — the same unit that
+        // dominates real propagation. Sized as a fraction of the search
+        // effort since the previous pass so vivification can never take
+        // over the runtime.
+        let mut budget: u64 = Self::VIV_BUDGET;
+        self.save_phases = false;
+        if self.viv_cursor >= self.learnts.len() {
+            self.viv_cursor = 0;
+        }
+        while budget > 0 && self.viv_cursor < self.learnts.len() {
+            let cref = self.learnts[self.viv_cursor];
+            if self.clauses.vivified(cref)
+                || self.clauses.len(cref) < 3
+                || self.clauses.lbd(cref) > Self::VIV_MAX_LBD
+                || self.locked(cref)
+            {
+                self.viv_cursor += 1;
+                continue;
+            }
+            match self.vivify_clause(cref, &mut budget) {
+                None => {
+                    self.save_phases = true;
+                    self.dead = true;
+                    return true;
+                }
+                Some(VivOutcome::Kept) => {
+                    self.viv_cursor += 1;
+                }
+                Some(VivOutcome::Removed) => {
+                    // Order of `learnts` is only meaningful inside
+                    // reduce_db (which re-sorts first), so swap_remove is
+                    // safe and O(1). Do not advance — the swapped-in
+                    // entry takes this slot.
+                    self.learnts.swap_remove(self.viv_cursor);
+                }
+                Some(VivOutcome::Replaced(ncref)) => {
+                    self.learnts[self.viv_cursor] = ncref;
+                    self.viv_cursor += 1;
+                }
+            }
+        }
+        self.save_phases = true;
+        false
+    }
+
     fn pick_branch_lit(&mut self) -> Option<Lit> {
         while let Some(v) = self.order_heap.pop(&self.activity) {
             if self.decision[v as usize]
@@ -2119,6 +2529,60 @@ impl Solver {
             // popping. (It'll re-enter on the next backtrack.)
         }
         None
+    }
+
+    /// Reuse-trail on restart (van der Tak / Ramos / Heule, JSAT'11 —
+    /// Kissat's `reusetrail`): find the variable the next decision would
+    /// pick, and keep every trail level whose decision variable
+    /// out-scores it — those levels would all be re-established before
+    /// it anyway. Levels holding assumptions are always kept: the
+    /// decision loop re-installs them verbatim.
+    ///
+    /// **Off by default** (`set_restart_trail_reuse`). Measured on the
+    /// symbex corpus (2026-08-05): march decisions carry near-zero VSIDS
+    /// activity, so the rule keeps only ~2-9 levels per restart and the
+    /// corpus outcome is a per-instance trajectory lottery (libmsrpc
+    /// 3.2s → 0.7s, but libsmbsharemodes 0.9s → 2.1s; net −4.6% with
+    /// cliff-shaped regressions). The systematic answer to re-march
+    /// waste is trail saving, not activity-gated trail retention.
+    ///
+    /// Returns the level to cancel to (0 = classic full restart).
+    fn restart_reuse_level(&mut self) -> i32 {
+        let dl = self.decision_level();
+        if dl == 0 {
+            return 0;
+        }
+        // Peek the next decision candidate, discarding stale heap tops
+        // (assigned / non-decision vars) exactly as `pick_branch_lit`
+        // would — dropped entries re-enter the heap on unassignment.
+        let vstar = loop {
+            let Some(v) = self.order_heap.top() else {
+                // Nothing left to decide: the trail is one propagation
+                // pass away from a model — keep all of it.
+                return dl;
+            };
+            if self.decision[v as usize]
+                && self.lit_value[(v as usize) << 1] == LBool::Undef
+            {
+                break v;
+            }
+            self.order_heap.pop(&self.activity);
+        };
+        let astar = self.activity[vstar as usize];
+        // Assumption levels (possibly empty — an assumption already true
+        // at a lower level pushes an empty level) are re-created verbatim;
+        // start the scan above them.
+        let base = self.assumptions.len().min(dl as usize);
+        let mut keep = base as i32;
+        for d in base..dl as usize {
+            let dec = self.trail[self.trail_lim[d]];
+            if self.activity[dec.var_idx()] > astar {
+                keep = d as i32 + 1;
+            } else {
+                break;
+            }
+        }
+        keep
     }
 
     /// Jeroslow-Wang one-sided heuristic. For each variable v, score its
@@ -2438,8 +2902,27 @@ impl Solver {
 
                 if self.restart.should_restart(self.trail.len() as u64) {
                     self.stats_restarts += 1;
-                    self.cancel_until(0);
+                    let keep = if self.restart_reuse {
+                        self.restart_reuse_level()
+                    } else {
+                        0
+                    };
+                    self.stats_reused_levels += keep.max(0) as u64;
+                    self.cancel_until(keep);
                     self.restart.on_restart();
+                    // Vivification piggybacks on full restarts — the trail
+                    // is already at the root, so probing costs no extra
+                    // teardown. Armed by conflict count, budgeted inside.
+                    if self.viv_enabled
+                        && self.decision_level() == 0
+                        && self.stats_conflicts >= self.viv_next_conflicts
+                    {
+                        self.viv_next_conflicts =
+                            self.stats_conflicts + Self::VIV_INTERVAL;
+                        if self.vivify_pass() {
+                            return Some(SolveResult::Unsat);
+                        }
+                    }
                 }
 
                 // Pick next decision: installed assumptions take priority.
@@ -2640,12 +3123,57 @@ enum PropConflict {
     Binary(Lit, Lit),
 }
 
+/// What a vivification probe decided about one learnts entry.
+enum VivOutcome {
+    /// Unchanged — advance the cursor past it.
+    Kept,
+    /// Gone from the learnts list: deleted as implied, absorbed as a root
+    /// unit, or demoted to an inline binary watcher pair.
+    Removed,
+    /// Strengthened into a fresh arena clause replacing the old entry.
+    Replaced(ClauseRef),
+}
+
 /// The source being resolved in a given iteration of analyze().
 enum AnalyzeSrc {
     Clause(ClauseRef),
     // Binary reason: resolving on literal at position 0, keeping position 1.
     // Stored as (pivot, other) so we know which to skip.
     Binary(Lit, Lit),
+}
+
+/// Prefetch an arbitrary slice slot's cache line — companion to
+/// `prefetch_lit_value_slot` for `OrderHeap::sift_down`'s dependent
+/// grandchild loads and `cancel_until`'s re-insert lookahead.
+#[inline(always)]
+fn prefetch_slot<T>(heap: &[T], idx: usize) {
+    if idx >= heap.len() {
+        return;
+    }
+    // SAFETY: bounded above; prefetch is a pure CPU hint that tolerates
+    // any pointer not causing an access violation.
+    unsafe {
+        let ptr = heap.as_ptr().add(idx);
+        #[cfg(target_arch = "x86_64")]
+        {
+            core::arch::x86_64::_mm_prefetch(
+                ptr as *const i8,
+                core::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            core::arch::asm!(
+                "prfm pldl1keep, [{p}]",
+                p = in(reg) ptr,
+                options(readonly, nostack, preserves_flags),
+            );
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let _ = ptr;
+        }
+    }
 }
 
 /// Hint the CPU to start loading the `lit_value` byte at `idx` into L1.

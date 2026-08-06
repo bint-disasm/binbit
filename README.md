@@ -320,6 +320,9 @@ These fire automatically at `solve` time; you don't need to invoke them, but kno
 - **ITE chain folding** — nested ITEs with selector aliasing collapse; common-branch factoring hoists shared sub-branches.
 - **Constant-bound chain collapse** — `and(a ∧ (bvslt k_1 v) ∧ (bvslt k_2 v) ∧ …)` keeps only the tightest bound per variable.
 - **BV1-as-Bool substitution** — `assert(bool_eq(bool_eq(X_1bit, bv1_1), rhs))` substitutes X throughout (SMT-LIB frontend only).
+- **Flush-time variable substitution** — every pending `assert(bv_eq(x, t))` whose `x` is un-bitblasted installs `x → t` before any CNF is emitted (with an occurs check), regardless of assert order.
+- **Gaussian elimination over Z/2^w** — coupled linear equality systems (`x+y=a, x+2y=b`) are solved at flush time; pivots only on odd (invertible) coefficients; inconsistent rows refute the formula outright.
+- **CNF preprocessing per flush** — the batch's clauses run unit propagation, backward subsumption/strengthening, and bounded variable elimination before touching the CDCL core. VE additionally recognizes AND/OR Tseitin gate definitions and falls back to Eén-Biere definition substitution when plain resolution would blow the clause budget — this is what dissolves ~50% of freshly emitted gate variables on typical symbex traces.
 
 Bits-known is the most-leveraged of these for symbex workloads because symbex code tends to produce lots of `zero_extend` + `bv_and(x, mask)` + shift operations — exactly the shapes where masks propagate furthest. You'll see it fold away significant portions of the formula before any SAT work.
 
@@ -327,11 +330,38 @@ Bits-known is the most-leveraged of these for symbex workloads because symbex co
 
 ## Configuration knobs
 
-```rust
-s.set_ite_branching_hints(on: bool);   // default: on
-```
+Defaults are the measured-best configuration for single-shot symbex corpora; everything below is opt-in/out with the corpus verdict noted.
 
-When on, each bitblasted ITE bumps its selector's VSIDS priority. Empirically a large win on deep ITE trees (symbex memory reads, state merges). Leave it on unless profiling says otherwise.
+```rust
+s.set_ite_branching_hints(on);        // default ON: each bitblasted ITE bumps its
+                                      // selector's VSIDS priority — large win on deep
+                                      // ITE trees (memory reads, state merges).
+
+// Pipeline ablation (all default ON; --no-* CLI equivalents exist):
+s.set_normalization(on);              // gated arithmetic reassociation/flattening
+s.set_substitution(on);               // flush-time variable substitution
+s.set_gaussian(on);                   // Gaussian elimination over Z/2^w
+s.set_bve(on);                        // per-flush CNF preprocessing (units/subsumption/VE)
+
+// Circuit minimizers — pick at most one per workload:
+s.set_aig_two_level(on);              // default OFF here, ON in bint. Brummayer-Biere
+                                      // two-level AIG rewriting. When ON, the VE
+                                      // gate-substitution fallback auto-disables
+                                      // (stacked minimizers measured net-negative);
+                                      // override with set_ve_gate_substitution(Some(true))
+                                      // only after measuring on your workload.
+s.set_cnf_mapping(on);                // default OFF: cut-based CNF technology mapping.
+s.set_fraig(on);                      // default OFF: SAT-sweep equivalence merging.
+
+// Search-side opt-ins (both measured as per-instance lotteries on the
+// symbex corpus — enable only with workload-specific evidence):
+// via the SAT core: reuse-trail partial restarts; clause vivification
+// (vivification did measure −31% on one long-running UNSAT instance).
+s.set_vivification(on);               // default OFF; CLI: --vivify
+
+s.set_core_tracking(on);              // default ON; OFF skips analyze_final's O(trail)
+                                      // walk for feasibility-only callers.
+```
 
 ---
 

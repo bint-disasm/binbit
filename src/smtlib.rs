@@ -23,7 +23,10 @@
 //! overflow predicates (we have them in the Rust API but not yet wired to
 //! SMT-LIB syntax — the standard doesn't mandate names for these).
 
-use std::collections::HashMap;
+// FxHashMap over the std map: symbol / let-binding lookups run per parsed
+// token, and SipHash showed up directly in front-end profiles. The only
+// iteration over these maps is get-model printing (cosmetic order).
+use rustc_hash::{FxHashMap as HashMap, FxHashSet};
 
 use crate::bv::{self, BoolTerm, BvTerm};
 use crate::smt::{SmtResult, SmtSolver};
@@ -79,7 +82,29 @@ pub fn run_script_with(solver: &mut SmtSolver, script: &str) -> Result<String, S
     Ok(runner.output)
 }
 
-struct Runner<'a> {
+/// A parameterized `define-fun` — an SMT-LIB macro. The body borrows the
+/// script text (like every parsed S-expression) and is expanded at each
+/// application site with the parameters bound through the same shadow
+/// stacks `let` uses.
+#[derive(Clone)]
+struct FunDef<'s> {
+    params: Vec<String>,
+    ret: Sort,
+    body: SExpr<'s>,
+}
+
+/// One replayable declaration/definition for `reset-assertions`: the
+/// command keeps declarations and definitions alive while dropping every
+/// assertion, and the simplest sound implementation here is a fresh
+/// solver + an in-order replay of this log (declared names become fresh
+/// unconstrained variables of the right sort — exactly the post-reset
+/// semantics; definition bodies re-evaluate against the new solver).
+enum Decl<'s> {
+    Var { name: String, sort: Sort },
+    Def { name: String, sort: Sort, body: SExpr<'s> },
+}
+
+struct Runner<'a, 's> {
     solver: &'a mut SmtSolver,
     // Global symbol table (populated by declare/define).
     symbols: HashMap<String, TaggedTerm>,
@@ -89,7 +114,7 @@ struct Runner<'a> {
     // can safely rebind the symbol to `expr` and drop the assertion, because
     // nothing has captured the old fresh-var term yet. First lookup through
     // `eval_atom` evicts the name from this set.
-    declared: std::collections::HashSet<String>,
+    declared: FxHashSet<String>,
     // Let bindings: per-name shadow stacks + per-scope frames recording
     // which names to unbind on pop. O(1) lookup regardless of nesting
     // depth — Sage2-style dumps nest `let` thousands deep, and a
@@ -97,22 +122,33 @@ struct Runner<'a> {
     // (bench_3335: 5.7s of pure lookup, zero SAT conflicts).
     let_bindings: HashMap<String, Vec<TaggedTerm>>,
     let_frames: Vec<Vec<String>>,
+    /// Parameterized define-fun macros, expanded at application.
+    defined_funs: HashMap<String, FunDef<'s>>,
+    /// In-order declaration/definition log for `reset-assertions`.
+    decl_log: Vec<Decl<'s>>,
+    /// Expansion depth guard — SMT-LIB definitions are non-recursive, so
+    /// crossing this means a name captured itself somehow; error instead
+    /// of overflowing the stack.
+    fun_depth: usize,
     output: String,
 }
 
-impl<'a> Runner<'a> {
+impl<'a, 's> Runner<'a, 's> {
     fn new(solver: &'a mut SmtSolver) -> Self {
         Runner {
             solver,
-            symbols: HashMap::new(),
-            declared: std::collections::HashSet::new(),
-            let_bindings: HashMap::new(),
+            symbols: HashMap::default(),
+            declared: FxHashSet::default(),
+            let_bindings: HashMap::default(),
             let_frames: Vec::new(),
+            defined_funs: HashMap::default(),
+            decl_log: Vec::new(),
+            fun_depth: 0,
             output: String::new(),
         }
     }
 
-    fn run(&mut self, script: &str) -> Result<(), String> {
+    fn run(&mut self, script: &'s str) -> Result<(), String> {
         let mut parser = Parser::new(script);
         while let Some(expr) = parser.next_sexpr()? {
             self.run_command(&expr)?;
@@ -120,7 +156,7 @@ impl<'a> Runner<'a> {
         Ok(())
     }
 
-    fn run_command(&mut self, expr: &SExpr) -> Result<(), String> {
+    fn run_command(&mut self, expr: &SExpr<'s>) -> Result<(), String> {
         let list = match expr {
             SExpr::List(xs) => xs,
             SExpr::Atom(_) => {
@@ -128,13 +164,54 @@ impl<'a> Runner<'a> {
             }
         };
         let head = match list.first() {
-            Some(SExpr::Atom(s)) => s.as_str(),
+            Some(SExpr::Atom(s)) => *s,
             _ => return Err(format!("empty command")),
         };
 
         match head {
             // No-ops we parse but don't need to do anything with.
             "set-logic" | "set-option" | "set-info" => Ok(()),
+
+            "reset-assertions" => {
+                // Drop every assertion, keep declarations and definitions
+                // (SMT-LIB 2.6 §4.2.2). Implemented as a fresh solver plus
+                // an in-order replay of the declaration log: declared
+                // names rebind to fresh unconstrained variables of their
+                // sort — exactly the post-reset semantics — and
+                // definition bodies re-evaluate against the new solver.
+                *self.solver = SmtSolver::new();
+                self.symbols.clear();
+                self.declared.clear();
+                self.let_bindings.clear();
+                self.let_frames.clear();
+                let log = std::mem::take(&mut self.decl_log);
+                for d in &log {
+                    match d {
+                        Decl::Var { name, sort } => {
+                            let term = match sort {
+                                Sort::Bool => TaggedTerm::Bool(self.solver.bool_var()),
+                                Sort::Bv(w) => TaggedTerm::Bv(self.solver.bv_var(*w), *w),
+                            };
+                            self.symbols.insert(name.clone(), term);
+                            self.declared.insert(name.clone());
+                        }
+                        Decl::Def { name, sort, body } => {
+                            let v = self.eval_expr(body)?;
+                            if v.sort() != *sort {
+                                return Err(format!(
+                                    "reset-assertions: {} re-evaluated to {:?}, expected {:?}",
+                                    name,
+                                    v.sort(),
+                                    sort
+                                ));
+                            }
+                            self.symbols.insert(name.clone(), v);
+                        }
+                    }
+                }
+                self.decl_log = log;
+                Ok(())
+            }
 
             "declare-const" => {
                 // (declare-const <name> <sort>)
@@ -146,6 +223,7 @@ impl<'a> Runner<'a> {
                 };
                 self.symbols.insert(name.to_string(), term);
                 self.declared.insert(name.to_string());
+                self.decl_log.push(Decl::Var { name: name.to_string(), sort });
                 Ok(())
             }
 
@@ -163,6 +241,7 @@ impl<'a> Runner<'a> {
                 };
                 self.symbols.insert(name.to_string(), term);
                 self.declared.insert(name.to_string());
+                self.decl_log.push(Decl::Var { name: name.to_string(), sort });
                 Ok(())
             }
 
@@ -170,7 +249,8 @@ impl<'a> Runner<'a> {
                 // (define-const <name> <sort> <expr>)
                 let name = atom(list.get(1))?;
                 let expected = parse_sort(list.get(2).ok_or("define-const: missing sort")?)?;
-                let body = self.eval_expr(list.get(3).ok_or("define-const: missing body")?)?;
+                let body_expr = list.get(3).ok_or("define-const: missing body")?;
+                let body = self.eval_expr(body_expr)?;
                 if body.sort() != expected {
                     return Err(format!(
                         "define-const {}: expected {:?}, got {:?}",
@@ -180,27 +260,63 @@ impl<'a> Runner<'a> {
                     ));
                 }
                 self.symbols.insert(name.to_string(), body);
+                self.decl_log.push(Decl::Def {
+                    name: name.to_string(),
+                    sort: expected,
+                    body: body_expr.clone(),
+                });
                 Ok(())
             }
 
             "define-fun" => {
-                // (define-fun <name> () <sort> <expr>) — 0-arity.
+                // (define-fun <name> ((p sort)...) <sort> <expr>).
+                // 0-arity: evaluate eagerly and bind like define-const —
+                // this keeps the substitution machinery's view unchanged.
+                // n-arity: store as a macro (SMT-LIB definitions are
+                // non-recursive) expanded at each application, parameters
+                // bound through the `let` shadow stacks.
                 let name = atom(list.get(1))?;
-                match list.get(2) {
-                    Some(SExpr::List(params)) if params.is_empty() => {}
-                    _ => return Err("define-fun: only 0-arity supported".into()),
-                }
+                let params_list = match list.get(2) {
+                    Some(SExpr::List(ps)) => ps,
+                    _ => return Err("define-fun: expected parameter list".into()),
+                };
                 let expected = parse_sort(list.get(3).ok_or("define-fun: missing sort")?)?;
-                let body = self.eval_expr(list.get(4).ok_or("define-fun: missing body")?)?;
-                if body.sort() != expected {
-                    return Err(format!(
-                        "define-fun {}: expected {:?}, got {:?}",
-                        name,
-                        expected,
-                        body.sort()
-                    ));
+                if params_list.is_empty() {
+                    let body_expr = list.get(4).ok_or("define-fun: missing body")?;
+                    let body = self.eval_expr(body_expr)?;
+                    if body.sort() != expected {
+                        return Err(format!(
+                            "define-fun {}: expected {:?}, got {:?}",
+                            name,
+                            expected,
+                            body.sort()
+                        ));
+                    }
+                    self.symbols.insert(name.to_string(), body);
+                    self.decl_log.push(Decl::Def {
+                        name: name.to_string(),
+                        sort: expected,
+                        body: body_expr.clone(),
+                    });
+                    return Ok(());
                 }
-                self.symbols.insert(name.to_string(), body);
+                let mut params: Vec<String> = Vec::with_capacity(params_list.len());
+                for p in params_list {
+                    match p {
+                        SExpr::List(pv) if pv.len() == 2 => {
+                            let pname = atom(pv.first())?;
+                            // The sort is validated implicitly when the
+                            // body evaluates an application's argument.
+                            params.push(pname.to_string());
+                        }
+                        _ => return Err("define-fun: expected (param sort)".into()),
+                    }
+                }
+                let body = list.get(4).ok_or("define-fun: missing body")?.clone();
+                self.defined_funs.insert(
+                    name.to_string(),
+                    FunDef { params, ret: expected, body },
+                );
                 Ok(())
             }
 
@@ -362,7 +478,7 @@ impl<'a> Runner<'a> {
     }
 
     /// Convert an S-expression into a `TaggedTerm` in the solver's term DAG.
-    fn eval_expr(&mut self, expr: &SExpr) -> Result<TaggedTerm, String> {
+    fn eval_expr(&mut self, expr: &SExpr<'s>) -> Result<TaggedTerm, String> {
         match expr {
             SExpr::Atom(s) => self.eval_atom(s),
             SExpr::List(xs) => self.eval_list(xs),
@@ -421,19 +537,19 @@ impl<'a> Runner<'a> {
         Err(format!("unknown symbol: {}", s))
     }
 
-    fn eval_list(&mut self, xs: &[SExpr]) -> Result<TaggedTerm, String> {
+    fn eval_list(&mut self, xs: &[SExpr<'s>]) -> Result<TaggedTerm, String> {
         let head = xs.first().ok_or("empty expression list")?;
 
         // Indexed identifiers: `(_ <name> <args...>)`.
         if let SExpr::Atom(a) = head {
-            if a == "_" {
+            if *a == "_" {
                 return self.eval_indexed(&xs[1..]);
             }
             // Attribute wrapper `(! expr :attr ...)` — attributes are
             // discarded in non-assert contexts (they're metadata only).
             // For `(assert (! phi :named foo))` the assert handler pulls
             // out the name before reaching here.
-            if a == "!" {
+            if *a == "!" {
                 let inner = xs.get(1).ok_or("!: missing inner expr")?;
                 return self.eval_expr(inner);
             }
@@ -739,13 +855,68 @@ impl<'a> Runner<'a> {
                 Ok(TaggedTerm::Bv(term, width))
             }
 
-            other => Err(format!("unsupported operator: {}", other)),
+            other => {
+                // Parameterized define-fun application: expand the macro
+                // with arguments bound through the `let` shadow stacks
+                // (parallel binding: every argument evaluates in the
+                // caller's scope before any parameter takes effect).
+                if let Some(fd) = self.defined_funs.get(other) {
+                    let fd = fd.clone();
+                    if args.len() != fd.params.len() {
+                        return Err(format!(
+                            "{}: expected {} arguments, got {}",
+                            other,
+                            fd.params.len(),
+                            args.len()
+                        ));
+                    }
+                    self.fun_depth += 1;
+                    if self.fun_depth > 256 {
+                        self.fun_depth -= 1;
+                        return Err(format!(
+                            "define-fun expansion too deep at {}",
+                            other
+                        ));
+                    }
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.eval_expr(a) {
+                            Ok(v) => vals.push(v),
+                            Err(e) => {
+                                self.fun_depth -= 1;
+                                return Err(e);
+                            }
+                        }
+                    }
+                    for (p, v) in fd.params.iter().zip(vals) {
+                        self.let_bindings.entry(p.clone()).or_default().push(v);
+                    }
+                    let out = self.eval_expr(&fd.body);
+                    for p in &fd.params {
+                        if let Some(stack) = self.let_bindings.get_mut(p) {
+                            stack.pop();
+                        }
+                    }
+                    self.fun_depth -= 1;
+                    let out = out?;
+                    if out.sort() != fd.ret {
+                        return Err(format!(
+                            "{}: body sort {:?} does not match declared {:?}",
+                            other,
+                            out.sort(),
+                            fd.ret
+                        ));
+                    }
+                    return Ok(out);
+                }
+                Err(format!("unsupported operator: {}", other))
+            }
         }
     }
 
     /// Parse `(_ <name> <args...>)` — either a BV constant literal or a
     /// pre-composed indexed operator that happens to appear bare.
-    fn eval_indexed(&mut self, rest: &[SExpr]) -> Result<TaggedTerm, String> {
+    fn eval_indexed(&mut self, rest: &[SExpr<'s>]) -> Result<TaggedTerm, String> {
         // Literal form: `(_ bvN WIDTH)`.
         let name = atom(rest.first())?;
         if let Some(num_str) = name.strip_prefix("bv") {
@@ -771,8 +942,8 @@ impl<'a> Runner<'a> {
     /// `((_ extract h l) x)`, `((_ zero_extend n) x)`, `((_ sign_extend n) x)`.
     fn eval_indexed_apply(
         &mut self,
-        head: &[SExpr],
-        args: &[SExpr],
+        head: &[SExpr<'s>],
+        args: &[SExpr<'s>],
     ) -> Result<TaggedTerm, String> {
         if atom(head.first())? != "_" {
             return Err("expected `_` prefix in indexed application".into());
@@ -860,18 +1031,18 @@ impl<'a> Runner<'a> {
 
     // ---------- small helpers ----------
 
-    fn eval_bool(&mut self, expr: Option<&SExpr>) -> Result<BoolTerm, String> {
+    fn eval_bool(&mut self, expr: Option<&SExpr<'s>>) -> Result<BoolTerm, String> {
         let e = expr.ok_or("missing argument")?;
         self.eval_expr(e)?.as_bool()
     }
 
-    fn eval_bool_args(&mut self, args: &[SExpr]) -> Result<Vec<BoolTerm>, String> {
+    fn eval_bool_args(&mut self, args: &[SExpr<'s>]) -> Result<Vec<BoolTerm>, String> {
         args.iter().map(|a| self.eval_expr(a)?.as_bool()).collect()
     }
 
     fn bool_fold<F>(
         &mut self,
-        args: &[SExpr],
+        args: &[SExpr<'s>],
         mut f: F,
         identity: bool,
     ) -> Result<TaggedTerm, String>
@@ -896,7 +1067,7 @@ impl<'a> Runner<'a> {
 
     fn bv_binary_fold<F>(
         &mut self,
-        args: &[SExpr],
+        args: &[SExpr<'s>],
         mut f: F,
     ) -> Result<TaggedTerm, String>
     where
@@ -917,7 +1088,7 @@ impl<'a> Runner<'a> {
         Ok(TaggedTerm::Bv(acc, w))
     }
 
-    fn bv_binary<F>(&mut self, args: &[SExpr], mut f: F) -> Result<TaggedTerm, String>
+    fn bv_binary<F>(&mut self, args: &[SExpr<'s>], mut f: F) -> Result<TaggedTerm, String>
     where
         F: FnMut(&mut Self, BvTerm, BvTerm) -> BvTerm,
     {
@@ -932,7 +1103,7 @@ impl<'a> Runner<'a> {
         Ok(TaggedTerm::Bv(f(self, a, b), wa))
     }
 
-    fn bv_unary<F>(&mut self, args: &[SExpr], mut f: F) -> Result<TaggedTerm, String>
+    fn bv_unary<F>(&mut self, args: &[SExpr<'s>], mut f: F) -> Result<TaggedTerm, String>
     where
         F: FnMut(&mut Self, BvTerm, u32) -> BvTerm,
     {
@@ -943,7 +1114,7 @@ impl<'a> Runner<'a> {
         Ok(TaggedTerm::Bv(f(self, a, w), w))
     }
 
-    fn bv_compare<F>(&mut self, args: &[SExpr], mut f: F) -> Result<TaggedTerm, String>
+    fn bv_compare<F>(&mut self, args: &[SExpr<'s>], mut f: F) -> Result<TaggedTerm, String>
     where
         F: FnMut(&mut Self, BvTerm, BvTerm) -> BoolTerm,
     {
@@ -963,12 +1134,12 @@ impl<'a> Runner<'a> {
     /// A lot of symbolic-execution output bundles hundreds of independent
     /// conditions under one big `(assert (and ...))` — decomposing exposes
     /// substitutable equalities that would otherwise be buried.
-    fn assert_body(&mut self, body_expr: &SExpr) -> Result<(), String> {
+    fn assert_body(&mut self, body_expr: &SExpr<'s>) -> Result<(), String> {
         // `(and P1 P2 ... Pn)` at the top level: recurse on each conjunct.
         // `(and)` = true, `(and P)` = P — both handled by the general loop.
         if let SExpr::List(xs) = body_expr {
             if let Some(SExpr::Atom(head)) = xs.first() {
-                if head == "and" {
+                if *head == "and" {
                     for arg in &xs[1..] {
                         self.assert_body(arg)?;
                     }
@@ -976,13 +1147,13 @@ impl<'a> Runner<'a> {
                 }
                 // `(not (or P1 P2 ...))` = `(and (not P1) (not P2) ...)` —
                 // De Morgan gives us another decomposition opportunity.
-                if head == "not" && xs.len() == 2 {
+                if *head == "not" && xs.len() == 2 {
                     if let SExpr::List(inner) = &xs[1] {
                         if let Some(SExpr::Atom(ih)) = inner.first() {
-                            if ih == "or" {
+                            if *ih == "or" {
                                 for arg in &inner[1..] {
                                     let negated = SExpr::List(vec![
-                                        SExpr::Atom("not".to_string()),
+                                        SExpr::Atom("not"),
                                         arg.clone(),
                                     ]);
                                     self.assert_body(&negated)?;
@@ -998,9 +1169,19 @@ impl<'a> Runner<'a> {
         if let Some((name, rhs_expr)) = self.match_substitution(body_expr) {
             let name = name.to_string();
             let rhs = self.eval_expr(rhs_expr)?;
-            self.symbols.insert(name.clone(), rhs);
-            self.declared.remove(&name);
-            return Ok(());
+            // Occurs check: evaluating the rhs resolves every symbol it
+            // references, and the first resolution of a name evicts it
+            // from `declared` (see `eval_atom`). If `name` is no longer
+            // eligible, the rhs mentioned X itself — e.g.
+            // `(assert (= x (bvnot x)))` — and rebinding X := rhs would
+            // silently DROP the constraint (that exact shape answered
+            // `sat` on an unsat cvc5 regression file until 2026-08-05).
+            // Fall through and assert the equality like any other.
+            if self.declared.contains(&name) {
+                self.symbols.insert(name.clone(), rhs);
+                self.declared.remove(&name);
+                return Ok(());
+            }
         }
         // BV1-as-Bool substitution: `(assert (= (= X 1bv1) rhs_bool))` or
         // `(= (= X 0bv1) rhs_bool)` (either order). When X is a fresh BV1
@@ -1013,21 +1194,26 @@ impl<'a> Runner<'a> {
         if let Some((name, k, rhs_expr)) = self.match_bv1_as_bool_subst(body_expr) {
             let name = name.to_string();
             let rhs_bool = self.eval_expr(rhs_expr)?.as_bool()?;
-            let (t_br, e_br) = if k {
-                (
-                    self.solver.bv_const(1, 1),
-                    self.solver.bv_const(0, 1),
-                )
-            } else {
-                (
-                    self.solver.bv_const(0, 1),
-                    self.solver.bv_const(1, 1),
-                )
-            };
-            let ite_term = self.solver.bv_ite(rhs_bool, t_br, e_br);
-            self.symbols.insert(name.clone(), TaggedTerm::Bv(ite_term, 1));
-            self.declared.remove(&name);
-            return Ok(());
+            // Same occurs check as above: a self-referential rhs evicts
+            // `name` during evaluation, and rebinding would drop the
+            // biconditional. Fall through to a plain assertion instead.
+            if self.declared.contains(&name) {
+                let (t_br, e_br) = if k {
+                    (
+                        self.solver.bv_const(1, 1),
+                        self.solver.bv_const(0, 1),
+                    )
+                } else {
+                    (
+                        self.solver.bv_const(0, 1),
+                        self.solver.bv_const(1, 1),
+                    )
+                };
+                let ite_term = self.solver.bv_ite(rhs_bool, t_br, e_br);
+                self.symbols.insert(name.clone(), TaggedTerm::Bv(ite_term, 1));
+                self.declared.remove(&name);
+                return Ok(());
+            }
         }
         // Union-find equality over atom-vs-atom pairs.
         if let Some((lt, rt)) = self.match_var_var_equality(body_expr) {
@@ -1053,10 +1239,10 @@ impl<'a> Runner<'a> {
     /// Match `(= (= X k_bv1) rhs)` or `(= rhs (= X k_bv1))` where X is a
     /// declare-fun BV1 atom that hasn't been resolved yet, and k_bv1 is
     /// either `(_ bv0 1)` or `(_ bv1 1)`. Returns `(X_name, k_is_one, rhs_expr)`.
-    fn match_bv1_as_bool_subst<'e>(
+    fn match_bv1_as_bool_subst<'x>(
         &self,
-        expr: &'e SExpr,
-    ) -> Option<(&'e str, bool, &'e SExpr)> {
+        expr: &'x SExpr<'s>,
+    ) -> Option<(&'s str, bool, &'x SExpr<'s>)> {
         let xs = match expr {
             SExpr::List(xs) => xs,
             _ => return None,
@@ -1065,7 +1251,7 @@ impl<'a> Runner<'a> {
             return None;
         }
         match &xs[0] {
-            SExpr::Atom(s) if s == "=" => {}
+            SExpr::Atom(s) if *s == "=" => {}
             _ => return None,
         }
         // Try both (lhs = inner-eq, rhs = rhs_bool) and the reversed order.
@@ -1073,11 +1259,11 @@ impl<'a> Runner<'a> {
             .or_else(|| self.try_bv1_subst_side(&xs[2], &xs[1]))
     }
 
-    fn try_bv1_subst_side<'e>(
+    fn try_bv1_subst_side<'x>(
         &self,
-        inner_eq: &'e SExpr,
-        rhs: &'e SExpr,
-    ) -> Option<(&'e str, bool, &'e SExpr)> {
+        inner_eq: &'x SExpr<'s>,
+        rhs: &'x SExpr<'s>,
+    ) -> Option<(&'s str, bool, &'x SExpr<'s>)> {
         // `inner_eq` must be `(= X <bv1 const>)` or `(= <bv1 const> X)`.
         let inner_xs = match inner_eq {
             SExpr::List(xs) => xs,
@@ -1087,15 +1273,15 @@ impl<'a> Runner<'a> {
             return None;
         }
         match &inner_xs[0] {
-            SExpr::Atom(s) if s == "=" => {}
+            SExpr::Atom(s) if *s == "=" => {}
             _ => return None,
         }
         let match_const = |e: &SExpr| -> Option<bool> {
             if let SExpr::Atom(s) = e {
-                if s == "#b0" {
+                if *s == "#b0" {
                     return Some(false);
                 }
-                if s == "#b1" {
+                if *s == "#b1" {
                     return Some(true);
                 }
             }
@@ -1117,7 +1303,7 @@ impl<'a> Runner<'a> {
                                     Some(SExpr::Atom(w)),
                                 ) = (xs.first(), xs.get(1), xs.get(2))
                                 {
-                                    if underscore == "_" && w == "1" {
+                                    if *underscore == "_" && *w == "1" {
                                         if let Some(num) = numname.strip_prefix("bv") {
                                             if num == "0" {
                                                 return Some(false);
@@ -1142,7 +1328,7 @@ impl<'a> Runner<'a> {
                 }
             };
         let name = match name_expr {
-            SExpr::Atom(s) => s.as_str(),
+            SExpr::Atom(s) => *s,
             _ => return None,
         };
         // Shadowing check — let binds must not capture `name`.
@@ -1164,16 +1350,16 @@ impl<'a> Runner<'a> {
         // Determine whether the const is 1 or 0.
         let k_is_one = {
             if let SExpr::Atom(s) = const_expr {
-                if s == "#b0" {
+                if *s == "#b0" {
                     false
-                } else if s == "#b1" {
+                } else if *s == "#b1" {
                     true
                 } else {
                     return None;
                 }
             } else if let SExpr::List(xs) = const_expr {
                 let numname = match xs.get(1) {
-                    Some(SExpr::Atom(s)) => s.as_str(),
+                    Some(SExpr::Atom(s)) => *s,
                     _ => return None,
                 };
                 let num = numname.strip_prefix("bv")?;
@@ -1194,7 +1380,7 @@ impl<'a> Runner<'a> {
     /// If `expr` is `(= X Y)` with X and Y both atoms pointing at globals
     /// whose bindings are bare `BvVar` / `BoolVar` (not expressions), return
     /// those two TaggedTerms for union-find aliasing. Otherwise None.
-    fn match_var_var_equality(&self, expr: &SExpr) -> Option<(TaggedTerm, TaggedTerm)> {
+    fn match_var_var_equality(&self, expr: &SExpr<'s>) -> Option<(TaggedTerm, TaggedTerm)> {
         let xs = match expr {
             SExpr::List(xs) => xs,
             _ => return None,
@@ -1203,12 +1389,12 @@ impl<'a> Runner<'a> {
             return None;
         }
         match &xs[0] {
-            SExpr::Atom(s) if s == "=" => {}
+            SExpr::Atom(s) if *s == "=" => {}
             _ => return None,
         }
         let name_of = |e: &SExpr| -> Option<String> {
             match e {
-                SExpr::Atom(s) => Some(s.clone()),
+                SExpr::Atom(s) => Some(s.to_string()),
                 _ => None,
             }
         };
@@ -1252,7 +1438,7 @@ impl<'a> Runner<'a> {
     /// If `expr` is `(= X rhs)` or `(= rhs X)` with X a declare-fun atom
     /// whose fresh-var binding has not been resolved anywhere yet, return
     /// (X, rhs). Otherwise None.
-    fn match_substitution<'e>(&self, expr: &'e SExpr) -> Option<(&'e str, &'e SExpr)> {
+    fn match_substitution<'x>(&self, expr: &'x SExpr<'s>) -> Option<(&'s str, &'x SExpr<'s>)> {
         let xs = match expr {
             SExpr::List(xs) => xs,
             _ => return None,
@@ -1261,13 +1447,13 @@ impl<'a> Runner<'a> {
             return None;
         }
         let head = match &xs[0] {
-            SExpr::Atom(s) if s == "=" => s,
+            SExpr::Atom(s) if *s == "=" => s,
             _ => return None,
         };
         let _ = head;
-        let try_side = |name_expr: &'e SExpr, other: &'e SExpr| -> Option<(&'e str, &'e SExpr)> {
+        let try_side = |name_expr: &'x SExpr<'s>, other: &'x SExpr<'s>| -> Option<(&'s str, &'x SExpr<'s>)> {
             let name = match name_expr {
-                SExpr::Atom(s) => s.as_str(),
+                SExpr::Atom(s) => *s,
                 _ => return None,
             };
             // Skip built-in literals and names bound by an outer `let` —
@@ -1286,7 +1472,7 @@ impl<'a> Runner<'a> {
     }
 }
 
-fn atom(e: Option<&SExpr>) -> Result<&str, String> {
+fn atom<'b>(e: Option<&'b SExpr<'b>>) -> Result<&'b str, String> {
     match e {
         Some(SExpr::Atom(s)) => Ok(s),
         _ => Err("expected atom".into()),
@@ -1296,22 +1482,22 @@ fn atom(e: Option<&SExpr>) -> Result<&str, String> {
 /// Recognise the `(! <expr> :named <sym> ...)` wrapper used to attach a
 /// name to an assertion for UNSAT core extraction. Returns the inner
 /// expression and the name when the pattern matches.
-fn extract_named(expr: &SExpr) -> Option<(&SExpr, &str)> {
+fn extract_named<'x, 'y>(expr: &'x SExpr<'y>) -> Option<(&'x SExpr<'y>, &'y str)> {
     let xs = match expr {
         SExpr::List(xs) => xs,
         _ => return None,
     };
     match xs.first()? {
-        SExpr::Atom(s) if s == "!" => {}
+        SExpr::Atom(s) if *s == "!" => {}
         _ => return None,
     }
     let inner = xs.get(1)?;
     let mut i = 2;
     while i < xs.len() {
         if let SExpr::Atom(k) = &xs[i] {
-            if k == ":named" {
+            if *k == ":named" {
                 if let SExpr::Atom(name) = xs.get(i + 1)? {
-                    return Some((inner, name.as_str()));
+                    return Some((inner, *name));
                 }
             }
         }
@@ -1323,7 +1509,7 @@ fn extract_named(expr: &SExpr) -> Option<(&SExpr, &str)> {
 
 fn parse_sort(e: &SExpr) -> Result<Sort, String> {
     match e {
-        SExpr::Atom(s) if s == "Bool" => Ok(Sort::Bool),
+        SExpr::Atom(s) if *s == "Bool" => Ok(Sort::Bool),
         SExpr::List(xs) if xs.len() == 3 => {
             // (_ BitVec n)
             if atom(xs.first())? == "_" && atom(xs.get(1))? == "BitVec" {
@@ -1341,7 +1527,7 @@ fn parse_sort(e: &SExpr) -> Result<Sort, String> {
 
 fn format_sexpr(e: &SExpr) -> String {
     match e {
-        SExpr::Atom(s) => s.clone(),
+        SExpr::Atom(s) => s.to_string(),
         SExpr::List(xs) => {
             let inner: Vec<String> = xs.iter().map(format_sexpr).collect();
             format!("({})", inner.join(" "))
@@ -1352,9 +1538,9 @@ fn format_sexpr(e: &SExpr) -> String {
 // ==================== S-expression parser ====================
 
 #[derive(Debug, Clone)]
-enum SExpr {
-    Atom(String),
-    List(Vec<SExpr>),
+enum SExpr<'a> {
+    Atom(&'a str),
+    List(Vec<SExpr<'a>>),
 }
 
 struct Parser<'a> {
@@ -1367,7 +1553,7 @@ impl<'a> Parser<'a> {
         Parser { src, pos: 0 }
     }
 
-    fn next_sexpr(&mut self) -> Result<Option<SExpr>, String> {
+    fn next_sexpr(&mut self) -> Result<Option<SExpr<'a>>, String> {
         self.skip_ws_and_comments();
         if self.pos >= self.src.len() {
             return Ok(None);
@@ -1375,7 +1561,7 @@ impl<'a> Parser<'a> {
         Ok(Some(self.parse_one()?))
     }
 
-    fn parse_one(&mut self) -> Result<SExpr, String> {
+    fn parse_one(&mut self) -> Result<SExpr<'a>, String> {
         self.skip_ws_and_comments();
         let b = self.peek_byte().ok_or("unexpected end of input")?;
         if b == b'(' {
@@ -1399,7 +1585,7 @@ impl<'a> Parser<'a> {
             let start = self.pos;
             while let Some(c) = self.peek_byte() {
                 if c == b'|' {
-                    let s = self.src[start..self.pos].to_string();
+                    let s = &self.src[start..self.pos];
                     self.pos += 1;
                     return Ok(SExpr::Atom(s));
                 }
@@ -1413,7 +1599,7 @@ impl<'a> Parser<'a> {
             while let Some(c) = self.peek_byte() {
                 self.pos += 1;
                 if c == b'"' {
-                    return Ok(SExpr::Atom(self.src[start..self.pos - 1].to_string()));
+                    return Ok(SExpr::Atom(&self.src[start..self.pos - 1]));
                 }
             }
             Err("unclosed string literal".into())
@@ -1429,7 +1615,7 @@ impl<'a> Parser<'a> {
             if start == self.pos {
                 return Err(format!("unexpected byte: {:?}", b as char));
             }
-            Ok(SExpr::Atom(self.src[start..self.pos].to_string()))
+            Ok(SExpr::Atom(&self.src[start..self.pos]))
         }
     }
 

@@ -68,23 +68,27 @@ fn real_main() -> i32 {
         // FRAIG sweep: prove + merge equivalent AIG nodes before CNF
         // emission. Off by default (changes search trajectory).
         let mut fraig = false;
+        // Clause vivification in the SAT core. Off by default (per-
+        // instance trajectory lottery on the symbex corpus).
+        let mut vivify = false;
         // Two-level AIG rewriting (Brummayer-Biere) in the bitblaster.
         // Off by default (changes search trajectory).
         let mut aig2 = false;
         // Sharing-aware variant: safe build rules + parent-count-gated
         // post-build substitution pass.
         let mut aig2_post = false;
-        // Cut-based CNF technology mapping at materialization — ON by
-        // default at Fast effort. `--no-cnfmap` restores classic
-        // shape-aware Tseitin emission; `--cnfmap-full` spends more
-        // mapping time for better covers on dense arithmetic.
-        let mut cnfmap = true;
+        // Cut-based CNF technology mapping at materialization. Off by
+        // default (see `SmtSolver::cnf_mapping`); `--cnfmap` maps at Fast
+        // effort, `--cnfmap-full` spends more mapping time for better
+        // covers on dense arithmetic.
+        let mut cnfmap = false;
         let mut cnfmap_full = false;
         for a in &args[2..] {
             match a.as_str() {
                 "--stats" => want_stats = true,
                 "--fraig-diag" => want_fraig_diag = true,
                 "--fraig" => fraig = true,
+                "--vivify" => vivify = true,
                 "--aig2" => aig2 = true,
                 "--cnfmap" => cnfmap = true,
                 "--no-cnfmap" => cnfmap = false,
@@ -131,6 +135,7 @@ fn real_main() -> i32 {
         solver.set_gaussian(gauss);
         solver.set_bve(bve);
         solver.set_fraig(fraig);
+        solver.set_vivification(vivify);
         solver.set_aig_two_level(aig2);
         solver.set_cnf_mapping(cnfmap);
         solver.set_cnf_mapping_effort(cnfmap_full);
@@ -148,6 +153,15 @@ fn real_main() -> i32 {
                     eprintln!("c conflicts   : {}", s.conflicts);
                     eprintln!("c decisions   : {}", s.decisions);
                     eprintln!("c restarts    : {}", s.restarts);
+                    eprintln!("c reused_lvls : {}", s.reused_levels);
+                    eprintln!(
+                        "c vivify      : checked {} strengthened {} deleted {} units {}",
+                        s.viv_checked, s.viv_strengthened, s.viv_deleted, s.viv_units
+                    );
+                    eprintln!(
+                        "c phase_times : front {:.3}s emit {:.3}s preprocess {:.3}s sat {:.3}s",
+                        s.time_front, s.time_emit, s.time_preprocess, s.time_sat
+                    );
                     eprintln!("c learned     : {}", s.learned);
                     eprintln!("c propagations: {}", s.propagations);
                     eprintln!("c reductions  : {}", s.reductions);

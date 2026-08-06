@@ -10,10 +10,22 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let rounds: u32 = args.next().and_then(|a| a.parse().ok()).unwrap_or(3000);
     let retire_every: u32 = args.next().and_then(|a| a.parse().ok()).unwrap_or(0);
-    let cores: bool = args.next().map(|a| a == "cores").unwrap_or(false);
+    // Third arg: "cores" enables core tracking; "aig2" runs the bint
+    // config (two-level AIG rewriting on); "aig2subst" additionally
+    // forces VE gate-substitution back ON under aig2 — the A/B lever
+    // for the stacked-minimizer question (see smt.rs
+    // `set_ve_gate_substitution`).
+    let mode = args.next().unwrap_or_default();
+    let cores: bool = mode == "cores";
 
     let mut s = SmtSolver::new();
     s.set_core_tracking(cores);
+    if mode == "aig2" || mode == "aig2subst" {
+        s.set_aig_two_level(true);
+    }
+    if mode == "aig2subst" {
+        s.set_ve_gate_substitution(Some(true));
+    }
     if std::env::var_os("BINBIT_CNFMAP").is_some() {
         s.set_cnf_mapping(true);
     }

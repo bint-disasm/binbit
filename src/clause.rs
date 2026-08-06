@@ -46,6 +46,11 @@ const FLAG_DELETED: u32 = 2;
 // arena. Its forwarding pointer (the new ClauseRef) lives in the LBD slot
 // (header word 1). Never persists past a GC — the flagged buffer is dropped.
 const FLAG_RELOC: u32 = 4;
+// Set once a vivification pass has probed this clause — probing the same
+// clause again cannot strengthen it further unless the formula changed
+// around it, and the budget is better spent on fresh learnts. Survives GC
+// (the flags word is copied by `reloc`).
+const FLAG_VIVIFIED: u32 = 8;
 
 impl ClauseArena {
     pub fn new() -> Self {
@@ -146,6 +151,16 @@ impl ClauseArena {
             }
             pos += HDR + len;
         }
+    }
+
+    #[inline]
+    pub fn vivified(&self, c: ClauseRef) -> bool {
+        (self.data[c.0 as usize] & FLAG_VIVIFIED) != 0
+    }
+
+    #[inline]
+    pub fn mark_vivified(&mut self, c: ClauseRef) {
+        self.data[c.0 as usize] |= FLAG_VIVIFIED;
     }
 
     #[inline]

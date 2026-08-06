@@ -241,3 +241,154 @@ fn smtlib_hex_literal_wider_than_64() {
         out
     );
 }
+
+#[test]
+fn self_referential_substitution_is_not_dropped() {
+    // `(assert (= x (bvnot x)))` is UNSAT for every width. The parser's
+    // top-level equality substitution must NOT rebind x := (bvnot x) —
+    // evaluating the rhs resolves x (evicting it from the substitutable
+    // set), and rebinding after that silently dropped the constraint:
+    // this exact file (cvc5 regress bv/holes/not-neq.smt2) answered
+    // `sat` until 2026-08-05.
+    let script = r#"
+        (set-logic QF_BV)
+        (declare-const x (_ BitVec 4))
+        (assert (= x (bvnot x)))
+        (check-sat)
+    "#;
+    let out = binbit::run_script(script).expect("parse ok");
+    assert!(out.contains("unsat"), "output = {}", out);
+}
+
+#[test]
+fn self_referential_rhs_deeper_occurrence() {
+    // Same hole, one level deeper: x = (bvadd x 1) has no fixed point
+    // (x = x + 1 is unsatisfiable in any modulus? no — bvadd wraps, and
+    // x = x+1 mod 16 is still unsat since 1 ≠ 0 mod 16).
+    let script = r#"
+        (set-logic QF_BV)
+        (declare-const x (_ BitVec 4))
+        (assert (= x (bvadd x #x1)))
+        (check-sat)
+    "#;
+    let out = binbit::run_script(script).expect("parse ok");
+    assert!(out.contains("unsat"), "output = {}", out);
+}
+
+#[test]
+fn self_referential_bv1_bool_substitution() {
+    // BV1-as-Bool shape with a self-referential rhs: the biconditional
+    // `(= (= x #b1) (= x #b0))` says x=1 ⟺ x=0 — unsatisfiable. The
+    // bv1-as-Bool rebinding path must take the occurs-check fallthrough.
+    let script = r#"
+        (set-logic QF_BV)
+        (declare-const x (_ BitVec 1))
+        (assert (= (= x #b1) (= x #b0)))
+        (check-sat)
+    "#;
+    let out = binbit::run_script(script).expect("parse ok");
+    assert!(out.contains("unsat"), "output = {}", out);
+}
+
+#[test]
+fn define_fun_with_parameters_expands() {
+    // Parameterized define-fun is macro expansion; abs2 uses its
+    // parameter twice and nests an ite.
+    let script = r#"
+        (set-logic QF_BV)
+        (define-fun abs2 ((s (_ BitVec 8))) (_ BitVec 8)
+            (ite (= ((_ extract 7 7) s) #b1) (bvneg s) s))
+        (declare-const x (_ BitVec 8))
+        (assert (= x (_ bv200 8)))
+        (assert (= (abs2 x) (_ bv56 8)))
+        (check-sat)
+    "#;
+    let out = binbit::run_script(script).expect("parse ok");
+    assert!(out.contains("sat"), "output = {}", out);
+}
+
+#[test]
+fn define_fun_parameters_shadow_globals() {
+    // The parameter name deliberately collides with a global; inside the
+    // body the parameter must win (bound through the let shadow stacks).
+    let script = r#"
+        (set-logic QF_BV)
+        (declare-const s (_ BitVec 4))
+        (define-fun id ((s (_ BitVec 4))) (_ BitVec 4) s)
+        (assert (= s (_ bv3 4)))
+        (assert (= (id (_ bv9 4)) (_ bv9 4)))
+        (check-sat)
+    "#;
+    let out = binbit::run_script(script).expect("parse ok");
+    assert!(out.contains("sat"), "output = {}", out);
+}
+
+#[test]
+fn define_fun_two_parameters() {
+    let script = r#"
+        (set-logic QF_BV)
+        (define-fun mymax ((a (_ BitVec 8)) (b (_ BitVec 8))) (_ BitVec 8)
+            (ite (bvult a b) b a))
+        (assert (= (mymax (_ bv3 8) (_ bv7 8)) (_ bv7 8)))
+        (assert (= (mymax (_ bv9 8) (_ bv2 8)) (_ bv9 8)))
+        (check-sat)
+    "#;
+    let out = binbit::run_script(script).expect("parse ok");
+    assert!(out.contains("sat"), "output = {}", out);
+}
+
+#[test]
+fn mul_of_negs_cancels() {
+    // mul(-a, -b) = mul(a, b) mod 2^w: with hash-consing both sides of
+    // the disequality become the same term, so this refutes at the term
+    // level (cvc5 regress mul-neg-unsat timed out bitblasting two 32-bit
+    // multipliers before the rewrite landed).
+    let script = r#"
+        (set-logic QF_BV)
+        (declare-fun a () (_ BitVec 32))
+        (declare-fun b () (_ BitVec 32))
+        (assert (not (= (bvmul a b) (bvmul (bvneg a) (bvneg b)))))
+        (check-sat)
+    "#;
+    let out = binbit::run_script(script).expect("parse ok");
+    assert!(out.contains("unsat"), "output = {}", out);
+}
+
+#[test]
+fn reset_assertions_drops_constraints_keeps_declarations() {
+    // After reset-assertions the first constraint must be gone (the two
+    // sums CAN be equal), and the declared names must still exist.
+    let script = r#"
+        (set-logic QF_BV)
+        (declare-const a (_ BitVec 8))
+        (declare-const b (_ BitVec 8))
+        (assert (distinct a b))
+        (check-sat)
+        (reset-assertions)
+        (assert (= a b))
+        (check-sat)
+    "#;
+    let out = binbit::run_script(script).expect("parse ok");
+    let sats: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(sats, vec!["sat", "sat"], "output = {}", out);
+}
+
+#[test]
+fn reset_assertions_replays_definitions() {
+    // Definitions survive the reset: `two` must still equal 2 afterwards
+    // (its body re-evaluates against the fresh solver).
+    let script = r#"
+        (set-logic QF_BV)
+        (declare-const x (_ BitVec 8))
+        (define-fun two () (_ BitVec 8) (_ bv2 8))
+        (assert (= x (_ bv7 8)))
+        (check-sat)
+        (reset-assertions)
+        (assert (= x two))
+        (check-sat)
+        (get-value (x))
+    "#;
+    let out = binbit::run_script(script).expect("parse ok");
+    assert!(out.matches("sat").count() >= 2, "output = {}", out);
+    assert!(out.contains("(_ bv2 8)"), "output = {}", out);
+}

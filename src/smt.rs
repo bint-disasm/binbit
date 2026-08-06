@@ -116,6 +116,19 @@ pub struct SmtSolverStats {
     /// Cumulative decisions across all `solve*` calls this session.
     pub decisions: u64,
     pub restarts: u64,
+    /// Decision levels preserved across restarts by reuse-trail.
+    pub reused_levels: u64,
+    /// Vivification: probed / shortened / deleted-as-implied / root units.
+    pub viv_checked: u64,
+    pub viv_strengthened: u64,
+    pub viv_deleted: u64,
+    pub viv_units: u64,
+    /// Flush-phase wall clocks (seconds): term-level front end, AIG
+    /// bitblast + CNF emission, CNF preprocessing, SAT search.
+    pub time_front: f64,
+    pub time_emit: f64,
+    pub time_preprocess: f64,
+    pub time_sat: f64,
     pub learned: u64,
     pub propagations: u64,
     /// Learned-DB reductions and clause-arena garbage collections.
@@ -197,6 +210,29 @@ enum ModelSource {
     Banked,
 }
 
+/// Flat clause batch for one flush: every literal in one buffer, clause
+/// `i` occupying `ends[i-1]..ends[i]`. The emission sink, the CNF
+/// pre-filter, the preprocessor arena, and the final SAT commit all share
+/// this storage — see `commit_batch`.
+#[derive(Default)]
+struct CnfBuffer {
+    data: Vec<Lit>,
+    ends: Vec<u32>,
+}
+
+impl CnfBuffer {
+    #[inline]
+    fn push_slice(&mut self, c: &[Lit]) {
+        self.data.extend_from_slice(c);
+        self.ends.push(self.data.len() as u32);
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+        self.ends.clear();
+    }
+}
+
 pub struct SmtSolver {
     pub ctx: BvContext,
     sat: Solver,
@@ -232,6 +268,14 @@ pub struct SmtSolver {
     fraig_swept_upto: u32,
     fraig_stats: crate::fraig::FraigStats,
     fraig_time: std::time::Duration,
+    /// Cumulative flush-phase wall clocks — front-end attribution for
+    /// instances the SAT engine barely touches (`--stats` prints them):
+    /// term-level work (substitution / Gaussian / normalization),
+    /// AIG bitblast + CNF emission, CNF preprocessing, and SAT search.
+    time_front: std::time::Duration,
+    time_emit: std::time::Duration,
+    time_preprocess: std::time::Duration,
+    time_sat: std::time::Duration,
 
     /// Sharing-aware post-build substitution pass (`--aig2-post`): the
     /// two-level substitution family applied only where it cannot strand
@@ -243,11 +287,17 @@ pub struct SmtSolver {
     /// cuts and give SAT variables to cut roots only, defined by the
     /// ISOP of the cut function.
     ///
-    /// ON by default at [`cnfmap::Effort::Fast`], which beat classic
-    /// shape-aware Tseitin on 4 of 5 corpus instances once mapping and
-    /// BVE stopped competing for the same variables (see
-    /// `CUT_BVE_MAX_CLAUSES`). `set_cnf_mapping(false)` restores classic
-    /// emission.
+    /// OFF by default, and the reason is worth recording: on every
+    /// single-shot artifact available here mapping wins (4 of 5 corpus
+    /// instances, and nobranch.smt2 at 27.3s vs 32.8s classic), but in
+    /// bint's real incremental session the SAME workload is 2.4× SLOWER
+    /// (66.7s vs 27.8s) with BVE eliminating 4× fewer variables
+    /// (164k → 40k) and propagations up 2.45× against only +39%
+    /// conflicts — i.e. much wider clauses. Whatever bint builds
+    /// incrementally is not what the .smt2 dumps replay (their variable
+    /// counts differ by ~30%), so the dumps cannot currently validate
+    /// this feature. Do not flip this default again without measuring in
+    /// the real tool.
     cnf_mapping: bool,
     /// Persistent mapper scratch (buffers survive across cones).
     /// One mapper per effort level. The cut stride is a type parameter
@@ -288,8 +338,28 @@ pub struct SmtSolver {
     /// the SAT core — active during `flush_pending` so the whole batch can
     /// be preprocessed (subsumption + bounded variable elimination) before
     /// commitment. `None` = direct mode (model probes, assumptions,
-    /// named assertions).
-    cnf_buffer: Option<Vec<Vec<Lit>>>,
+    /// named assertions). Flat CSR layout (all literals in one buffer,
+    /// exclusive end offsets per clause): the buffer flows straight into
+    /// the preprocessor's arena and back out — no per-clause `Vec`
+    /// anywhere on the flush path.
+    cnf_buffer: Option<CnfBuffer>,
+    /// Retired flush buffers, reused across flushes so a steady-state
+    /// session stops allocating for emission entirely.
+    cnf_buffer_pool: CnfBuffer,
+    /// VE gate-substitution policy: `None` = automatic (enabled unless
+    /// two-level AIG rewriting is active — the two circuit minimizers
+    /// stacked measured strongly net-negative on Sage2-class instances,
+    /// +122% on bench_16728 under --aig2, while EACH ALONE wins);
+    /// `Some(x)` forces it. The override exists so bint can A/B the
+    /// combination on real incremental sessions — the one validated
+    /// aig2 dump (nobranch2) actually LIKED the combination (−9% props),
+    /// so the auto policy is conservative, not optimal, under aig2.
+    ve_gate_subst: Option<bool>,
+    /// Recycled per-flush preprocessor storage (see `PreprocessPool`).
+    pp_pool: crate::preprocess::PreprocessPool,
+    /// Recycled compact-remap buffers for `commit_batch`.
+    pp_to_orig: Vec<u32>,
+    pp_to_compact: HashMap<u32, u32>,
 
     /// Top-level variable substitution: `x → t` for every flush-time
     /// assertion root `(= x t)` where `x` is an un-bitblasted variable not
@@ -516,11 +586,15 @@ impl SmtSolver {
             fraig_swept_upto: 0,
             fraig_stats: crate::fraig::FraigStats::default(),
             fraig_time: std::time::Duration::ZERO,
+            time_front: std::time::Duration::ZERO,
+            time_emit: std::time::Duration::ZERO,
+            time_preprocess: std::time::Duration::ZERO,
+            time_sat: std::time::Duration::ZERO,
             stats_and_gates: 0,
             stats_xor_gates: 0,
             stats_mux_gates: 0,
             aig2_post: false,
-            cnf_mapping: true,
+            cnf_mapping: false,
             cnfmap_mapper: Default::default(),
             cnfmap_mapper_full: Default::default(),
             cnfmap_plan: Default::default(),
@@ -531,6 +605,11 @@ impl SmtSolver {
             elim_nodes: HashSet::default(),
             pp_remat: 0,
             cnf_buffer: None,
+            cnf_buffer_pool: CnfBuffer::default(),
+            ve_gate_subst: None,
+            pp_pool: Default::default(),
+            pp_to_orig: Vec::new(),
+            pp_to_compact: HashMap::default(),
             bv_var_subst: HashMap::default(),
             subst_bool_memo: HashMap::default(),
             subst_bv_memo: HashMap::default(),
@@ -701,6 +780,20 @@ impl SmtSolver {
     /// trajectory — benchmark per-corpus before adopting.
     pub fn set_fraig(&mut self, on: bool) {
         self.fraig_enabled = on;
+    }
+
+    /// Override the automatic VE gate-substitution policy (see the
+    /// `ve_gate_subst` field doc). `set_ve_gate_substitution(None)`
+    /// restores the automatic rule.
+    pub fn set_ve_gate_substitution(&mut self, forced: Option<bool>) {
+        self.ve_gate_subst = forced;
+    }
+
+    /// Enable clause vivification in the SAT core (see
+    /// [`crate::solver::Solver::set_vivification`] for the corpus verdict
+    /// that keeps it off by default).
+    pub fn set_vivification(&mut self, on: bool) {
+        self.sat.set_vivification(on);
     }
 
     /// Cumulative FRAIG sweep statistics and wall-clock time spent.
@@ -1316,7 +1409,9 @@ impl SmtSolver {
 
     /// Hinted solve through the standard list shape; re-arms prefix trust.
     fn sat_solve_hinted(&mut self, asmps: &[Lit], trusted: usize) -> SolveResult {
+        let t0 = std::time::Instant::now();
         let r = self.sat.solve_under_assumptions_hinted(asmps, trusted);
+        self.time_sat += t0.elapsed();
         self.built_prefix_dirty = false;
         r
     }
@@ -2960,6 +3055,7 @@ impl SmtSolver {
             self.asmp_lits_cache.clear();
             self.gate_terms_cache.clear();
             self.gate_refs_cache.clear();
+            let t_front = std::time::Instant::now();
             // Variables at or above this index were allocated by (and are
             // only visible to) this batch — eligible for elimination if
             // they're gate outputs. Everything older may be referenced by
@@ -3121,7 +3217,13 @@ impl SmtSolver {
                 self.fraig_time += t0.elapsed();
             }
 
-            self.cnf_buffer = Some(Vec::new());
+            self.time_front += t_front.elapsed();
+            let t_emit = std::time::Instant::now();
+            // Reuse the retired flush buffer — steady-state emission
+            // allocates nothing.
+            let mut buf = std::mem::take(&mut self.cnf_buffer_pool);
+            buf.clear();
+            self.cnf_buffer = Some(buf);
             for (depth, terms) in batch {
                 let act_lit = if depth == 0 {
                     None
@@ -3133,13 +3235,16 @@ impl SmtSolver {
                 }
             }
             let buffer = self.cnf_buffer.take().unwrap_or_default();
+            self.time_emit += t_emit.elapsed();
             // Resolve ITE metadata + selector boosts BEFORE the batch is
             // preprocessed: bounded VE may dissolve a live mux's output
             // var entirely (a good outcome — its function got resolved
             // into the neighbours), but the gate was real and its selector
             // still deserves the branching hint.
             self.resolve_pending_ites();
+            let t_pp = std::time::Instant::now();
             self.commit_batch(buffer, batch_start_var);
+            self.time_preprocess += t_pp.elapsed();
         }
         self.resolve_pending_ites();
     }
@@ -3209,8 +3314,10 @@ impl SmtSolver {
     /// invisible outside the batch, so eliminating them is sound: their
     /// AIG-node binding is dropped, and any later consumer re-materializes
     /// the node under a fresh variable with fresh defining clauses.
-    fn commit_batch(&mut self, buffer: Vec<Vec<Lit>>, batch_start_var: usize) {
-        if buffer.is_empty() {
+    fn commit_batch(&mut self, buffer: CnfBuffer, batch_start_var: usize) {
+        let CnfBuffer { mut data, mut ends } = buffer;
+        if ends.is_empty() {
+            self.cnf_buffer_pool = CnfBuffer { data, ends };
             return;
         }
         // Remap the batch's literals into a compact variable space [0, k)
@@ -3221,19 +3328,29 @@ impl SmtSolver {
         // across an incremental session that keeps adding small batches.
         //
         // The remap is folded into the pre-filter pass that already
-        // rewrites each clause in place: drop clauses satisfied by a
+        // rewrites the flat buffer in place: drop clauses satisfied by a
         // root-level fact (the pinned true-lit especially) and strip
         // level-0-false literals via `value_fixed`, which ignores stale
-        // search-trail assignments above level 0.
-        let mut to_orig: Vec<u32> = Vec::new(); // compact var id → original
-        let mut to_compact: HashMap<u32, u32> = HashMap::default();
-        let mut clauses: Vec<Vec<Lit>> = Vec::with_capacity(buffer.len());
-        'clause: for mut c in buffer {
-            let mut w = 0;
-            for i in 0..c.len() {
-                let l = c[i];
+        // search-trail assignments above level 0. Both cursors trail the
+        // read position, so the compaction never moves a literal forward.
+        let mut to_orig = std::mem::take(&mut self.pp_to_orig); // compact → original
+        let mut to_compact = std::mem::take(&mut self.pp_to_compact);
+        to_orig.clear();
+        to_compact.clear();
+        let mut w = 0usize; // literal write cursor
+        let mut kept = 0usize; // clause write cursor
+        let mut start = 0usize;
+        for r in 0..ends.len() {
+            let end = ends[r] as usize;
+            let clause_w = w;
+            let mut satisfied = false;
+            for i in start..end {
+                let l = data[i];
                 match self.sat.value_fixed(l) {
-                    LBool::True => continue 'clause,
+                    LBool::True => {
+                        satisfied = true;
+                        break;
+                    }
                     LBool::False => {}
                     LBool::Undef => {
                         let ov = l.var().0;
@@ -3242,25 +3359,37 @@ impl SmtSolver {
                             to_orig.push(ov);
                             id
                         });
-                        c[w] = Lit::new(Var(cv), l.is_negated());
+                        data[w] = Lit::new(Var(cv), l.is_negated());
                         w += 1;
                     }
                 }
             }
-            c.truncate(w);
-            clauses.push(c);
+            if satisfied {
+                w = clause_w; // discard the partial write
+            } else {
+                ends[kept] = w as u32;
+                kept += 1;
+            }
+            start = end;
         }
+        data.truncate(w);
+        ends.truncate(kept);
 
         // BVE disabled: commit the (pre-filtered) clauses directly, mapping
-        // compact lits back to originals. Skips the Preprocessor entirely.
+        // compact lits back to originals in place. Skips the Preprocessor.
         if !self.bve_enabled {
-            for c in &clauses {
-                let orig: Vec<Lit> = c
-                    .iter()
-                    .map(|&l| Lit::new(Var(to_orig[l.var_idx()]), l.is_negated()))
-                    .collect();
-                self.sat.add_clause(orig);
+            let mut start = 0usize;
+            for &e in &ends {
+                let end = e as usize;
+                for l in data[start..end].iter_mut() {
+                    *l = Lit::new(Var(to_orig[l.var_idx()]), l.is_negated());
+                }
+                self.sat.add_clause_from_slice(&data[start..end]);
+                start = end;
             }
+            self.cnf_buffer_pool = CnfBuffer { data, ends };
+            self.pp_to_orig = to_orig;
+            self.pp_to_compact = to_compact;
             return;
         }
 
@@ -3278,7 +3407,9 @@ impl SmtSolver {
         // biggest lever (36% of variables) — letting BVE at the cut roots
         // cost 2.2× (mapped-full 0.42s → 0.92s) and more than doubled
         // conflicts (9053 → 21428).
-        let mut frozen: Vec<bool> = Vec::with_capacity(k);
+        let mut frozen = std::mem::take(&mut self.pp_pool.frozen);
+        frozen.clear();
+        frozen.reserve(k);
         for &ov in &to_orig {
             let ov = ov as usize;
             let f = ov < batch_start_var
@@ -3289,7 +3420,23 @@ impl SmtSolver {
             frozen.push(f);
         }
 
-        let result = crate::preprocess::Preprocessor::new(clauses, k, frozen).run();
+        let mut pp = crate::preprocess::Preprocessor::from_flat(
+            data,
+            &ends,
+            k,
+            frozen,
+            std::mem::take(&mut self.pp_pool),
+        );
+        // Gate substitution and two-level AIG rewriting are both circuit
+        // minimizers; stacked they measured strongly net-negative on the
+        // Sage2 family (see the field doc in preprocess.rs). One at a
+        // time by default: aig2 sessions keep classic full VE only,
+        // unless the caller overrides (see `set_ve_gate_substitution`).
+        pp.set_gate_substitution(
+            self.ve_gate_subst
+                .unwrap_or_else(|| !self.aig.two_level_enabled()),
+        );
+        let result = pp.run();
         self.pp_eliminated += result.eliminated.len() as u64;
         self.pp_subsumed += result.subsumed as u64;
         self.pp_strengthened += result.strengthened as u64;
@@ -3319,14 +3466,22 @@ impl SmtSolver {
             self.sat.set_decision_var(Var(ov as u32), false);
         }
 
-        // Map surviving clauses back to original variable ids and commit.
-        for c in &result.clauses {
-            let orig: Vec<Lit> = c
-                .iter()
-                .map(|&l| Lit::new(Var(to_orig[l.var_idx()]), l.is_negated()))
-                .collect();
-            self.sat.add_clause(orig);
+        // Map surviving clauses back to original variable ids in place
+        // (`result.data` is the same arena the emission buffer became —
+        // no per-clause storage exists anywhere on this path) and commit.
+        let mut arena = result.data;
+        for &(off, len) in &result.clauses {
+            let range = &mut arena[off as usize..(off + len) as usize];
+            for l in range.iter_mut() {
+                *l = Lit::new(Var(to_orig[l.var_idx()]), l.is_negated());
+            }
+            self.sat.add_clause_from_slice(&arena[off as usize..(off + len) as usize]);
         }
+        // Retire every reusable buffer for the next flush.
+        self.cnf_buffer_pool = CnfBuffer { data: arena, ends };
+        self.pp_pool = result.pool;
+        self.pp_to_orig = to_orig;
+        self.pp_to_compact = to_compact;
     }
 
     /// Returns true iff the solver currently holds a valid SAT model —
@@ -3366,6 +3521,15 @@ impl SmtSolver {
             conflicts: self.sat.stats_conflicts,
             decisions: self.sat.stats_decisions,
             restarts: self.sat.stats_restarts,
+            reused_levels: self.sat.stats_reused_levels,
+            viv_checked: self.sat.stats_viv_checked,
+            viv_strengthened: self.sat.stats_viv_strengthened,
+            viv_deleted: self.sat.stats_viv_deleted,
+            viv_units: self.sat.stats_viv_units,
+            time_front: self.time_front.as_secs_f64(),
+            time_emit: self.time_emit.as_secs_f64(),
+            time_preprocess: self.time_preprocess.as_secs_f64(),
+            time_sat: self.time_sat.as_secs_f64(),
             learned: self.sat.stats_learned,
             propagations: self.sat.stats_propagations,
             reductions: self.sat.stats_reductions,
@@ -4522,20 +4686,20 @@ impl SmtSolver {
     #[inline]
     fn emit_clause(&mut self, c: Vec<Lit>) {
         match self.cnf_buffer.as_mut() {
-            Some(buf) => buf.push(c),
+            Some(buf) => buf.push_slice(&c),
             None => {
                 self.sat.add_clause(c);
             }
         }
     }
 
-    /// [`emit_clause`] from a stack slice: in direct mode the literals go
-    /// through the solver's reused buffer (no allocation); buffered mode
-    /// still owns its Vec, unchanged.
+    /// [`emit_clause`] from a stack slice: no allocation in either mode —
+    /// direct mode routes through the solver's reused buffer, buffered
+    /// mode appends to the flat CSR arena.
     #[inline]
     fn emit_clause_slice(&mut self, c: &[Lit]) {
         match self.cnf_buffer.as_mut() {
-            Some(buf) => buf.push(c.to_vec()),
+            Some(buf) => buf.push_slice(c),
             None => {
                 self.sat.add_clause_from_slice(c);
             }

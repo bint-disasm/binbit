@@ -722,6 +722,14 @@ impl BvContext {
         if let (Some(vx), Some(vy)) = (self.const_val(x), self.const_val(y)) {
             return self.bv_const(vx.wrapping_mul(vy), w);
         }
+        // mul(-x, -y) = mul(x, y): the sign circuits cancel modulo 2^w.
+        // With hash-consing this makes `(bvmul a b)` and
+        // `(bvmul (bvneg a) (bvneg b))` the same term — the cvc5 regress
+        // file mul-neg-unsat refutes at the term level instead of
+        // bitblasting two 32-bit multipliers (timeout → instant).
+        if let (BvOp::Neg(nx), BvOp::Neg(ny)) = (self.bv_op(x), self.bv_op(y)) {
+            return self.bv_mul(nx, ny);
+        }
         if let Some(vy) = self.const_val(y) {
             let vy_m = vy & mask(w);
             if vy_m == 0 {
