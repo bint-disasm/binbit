@@ -28,6 +28,13 @@ pub const MAX_BV_WIDTH: u32 = 1 << 16; // 64K bits
 /// `value` field (width ≤ 128), nothing to look up in the wide pool.
 pub const WIDE_NONE: u32 = u32::MAX;
 
+/// How many distinct `Ite` nodes an equality-against-a-constant is willing
+/// to push itself through (see `bv_eq`). Sized to cover the guarded-fold
+/// chains symbolic execution emits for `strcmp`/`memcmp` — two ites per
+/// compared byte, so this clears a 128-byte comparison — while leaving
+/// genuinely wide mux structures on their mux encoding, where they belong.
+const EQ_ITE_MAX_NODES: usize = 256;
+
 /// Opaque handle to a bitvector-sorted term. `Ord` follows creation order
 /// (arena index) — used by the normalization pass for canonical operand
 /// ordering.
@@ -180,7 +187,7 @@ pub struct SelectTable {
 /// One node in the BV term DAG. Width is always set. For constants:
 ///   - `wide == WIDE_NONE`:  `value` is the inline constant (width ≤ 128)
 ///   - `wide != WIDE_NONE`:  `value` is meaningless (always 0); the actual
-///      limb content lives at `ctx.wide_values[wide as usize]`
+///     limb content lives at `ctx.wide_values[wide as usize]`
 ///
 /// Wide constants are interned — identical limb content produces the same
 /// `wide` index — so two `BvNode`s that represent the same constant always
@@ -267,6 +274,15 @@ pub struct BvContext {
     /// valid for the context's lifetime.
     extract_cache: HashMap<(BvTerm, u32, u32), BvTerm>,
 
+    /// Epoch-stamped visited marks for [`BvContext::ite_dag_size_within`],
+    /// dense over `bv_nodes`. A scan costs one visit per distinct node and
+    /// allocates nothing; bumping the epoch retires the previous scan in
+    /// O(1). Sized lazily on first use so contexts that never hit the
+    /// constant-vs-ite equality rule pay nothing.
+    ite_scan_mark: Vec<u32>,
+    ite_scan_epoch: u32,
+    ite_scan_stack: Vec<BvTerm>,
+
     /// Storage for wide constants (width > 128). Each entry is the limb
     /// representation of a unique constant value — little-endian, length
     /// exactly `ceil(width / 64)`. Indexed by `BvNode::wide`.
@@ -281,6 +297,18 @@ pub struct BvContext {
     /// construction, and scanning every prior table on each build would be
     /// O(N·M) for no measurable dedup gain.
     pub select_tables: Vec<SelectTable>,
+
+    /// Whether `bv_eq` may push a constant equality through an ite chain
+    /// (see the rule's comment there). **Off by default**, because it is
+    /// corpus-negative as a default: on the symex corpus it costs +10.8%
+    /// wall for +1.9% conflicts even with the profitability guard, and
+    /// nearly all of that damage lands on a single verification-condition
+    /// instance whose muxes have other consumers — decomposing one
+    /// equality doesn't retire the mux there, it just adds a disjunction
+    /// beside it. Clients whose formulas are dominated by guarded-fold
+    /// comparisons (`strcmp`/`memcmp` against zero) turn it on and win
+    /// large; see `SmtSolver::set_eq_ite_pushdown`.
+    pub eq_ite_pushdown: bool,
 
     /// Cumulative count of addends cancelled by `norm_eq_add` (terms whose
     /// coefficients zeroed out when the two sides of an equality merged).
@@ -318,9 +346,13 @@ impl BvContext {
             bv_hashcons: HashMap::default(),
             bool_hashcons: HashMap::default(),
             extract_cache: HashMap::default(),
+            ite_scan_mark: Vec::new(),
+            ite_scan_epoch: 0,
+            ite_scan_stack: Vec::new(),
             wide_values: Vec::new(),
             wide_interner: HashMap::default(),
             select_tables: Vec::new(),
+            eq_ite_pushdown: false,
             norm_cancelled: 0,
             norm_merged: 0,
             known_bits: Vec::new(),
@@ -389,7 +421,7 @@ impl BvContext {
             self.push_bv(BvOp::Const, width, v)
         } else {
             // Widen the u128 into a full-width limb array.
-            let nlimbs = ((width as usize) + 63) / 64;
+            let nlimbs = (width as usize).div_ceil(64);
             let mut limbs = vec![0u64; nlimbs];
             limbs[0] = value as u64;
             limbs[1] = (value >> 64) as u64;
@@ -409,7 +441,7 @@ impl BvContext {
             "BV width must be 1..={}",
             MAX_BV_WIDTH
         );
-        let nlimbs = ((width as usize) + 63) / 64;
+        let nlimbs = (width as usize).div_ceil(64);
         assert_eq!(
             limbs.len(),
             nlimbs,
@@ -447,13 +479,12 @@ impl BvContext {
         // Push `bvnot` through an `ite` whose branches are both constants:
         // `~ite(c, k1, k2)` = `ite(c, ~k1, ~k2)`. This keeps the result a
         // "boolean selector" shape that `bv_eq(const, ...)` can collapse.
-        if let BvOp::Ite(c, t, e) = self.bv_op(x) {
-            if let (Some(vt), Some(ve)) = (self.const_val(t), self.const_val(e)) {
+        if let BvOp::Ite(c, t, e) = self.bv_op(x)
+            && let (Some(vt), Some(ve)) = (self.const_val(t), self.const_val(e)) {
                 let nt = self.bv_const(!vt, w);
                 let ne = self.bv_const(!ve, w);
                 return self.bv_ite(c, nt, ne);
             }
-        }
         self.push_bv(BvOp::Not(x), w, 0)
     }
 
@@ -474,12 +505,11 @@ impl BvContext {
                 return x; // x & ~0 = x
             }
             // Associative rollup: (a & c) & c' = a & (c & c').
-            if let BvOp::And(a, b) = self.bv_op(x) {
-                if let Some(vb) = self.const_val(b) {
+            if let BvOp::And(a, b) = self.bv_op(x)
+                && let Some(vb) = self.const_val(b) {
                     let merged = self.bv_const(vb & vy, w);
                     return self.bv_and(a, merged);
                 }
-            }
             // NOTE: a constant-mask structural rewrite (concat tree of
             // extracts + zero-consts) was tried here and reverted — the
             // bitblaster's `mk_and` already short-circuits T/F operands at
@@ -506,12 +536,11 @@ impl BvContext {
                 return self.bv_const(mask(w), w); // x | ~0 = ~0
             }
             // Associative rollup: (a | c) | c' = a | (c | c').
-            if let BvOp::Or(a, b) = self.bv_op(x) {
-                if let Some(vb) = self.const_val(b) {
+            if let BvOp::Or(a, b) = self.bv_op(x)
+                && let Some(vb) = self.const_val(b) {
                     let merged = self.bv_const(vb | vy, w);
                     return self.bv_or(a, merged);
                 }
-            }
             // NOTE: see bv_and — `mk_or` already short-circuits T/F at the
             // literal level, so a term-level constant-mask rewrite was
             // tried here and reverted as redundant.
@@ -537,12 +566,11 @@ impl BvContext {
                 return self.bv_not(x); // x ^ ~0 = ~x
             }
             // Associative rollup: (a ^ c) ^ c' = a ^ (c ^ c').
-            if let BvOp::Xor(a, b) = self.bv_op(x) {
-                if let Some(vb) = self.const_val(b) {
+            if let BvOp::Xor(a, b) = self.bv_op(x)
+                && let Some(vb) = self.const_val(b) {
                     let merged = self.bv_const(vb ^ vy_m, w);
                     return self.bv_xor(a, merged);
                 }
-            }
             // NOTE: a constant-mask structural rewrite (per-bit pass-through
             // or invert via `bvnot`) was tried here but destroys the
             // `BvOp::Xor` shape that downstream `(a ^ c) ^ c'` chains rely
@@ -566,19 +594,17 @@ impl BvContext {
                 return x;
             }
             // Associative rollup: (a + c) + c' = a + (c + c').
-            if let BvOp::Add(a, b) = self.bv_op(x) {
-                if let Some(vb) = self.const_val(b) {
+            if let BvOp::Add(a, b) = self.bv_op(x)
+                && let Some(vb) = self.const_val(b) {
                     let merged = self.bv_const(vb.wrapping_add(vy), w);
                     return self.bv_add(a, merged);
                 }
-            }
             // (a - c) + c' = a + (c' - c).
-            if let BvOp::Sub(a, b) = self.bv_op(x) {
-                if let Some(vb) = self.const_val(b) {
+            if let BvOp::Sub(a, b) = self.bv_op(x)
+                && let Some(vb) = self.const_val(b) {
                     let merged = self.bv_const(vy.wrapping_sub(vb), w);
                     return self.bv_add(a, merged);
                 }
-            }
         }
         self.push_bv(BvOp::Add(x, y), w, 0)
     }
@@ -745,12 +771,11 @@ impl BvContext {
                 return self.bv_shl(x, amt);
             }
             // Associative rollup: (a * c) * c' = a * (c * c').
-            if let BvOp::Mul(a, b) = self.bv_op(x) {
-                if let Some(vb) = self.const_val(b) {
+            if let BvOp::Mul(a, b) = self.bv_op(x)
+                && let Some(vb) = self.const_val(b) {
                     let merged = self.bv_const(vb.wrapping_mul(vy), w);
                     return self.bv_mul(a, merged);
                 }
-            }
         }
         self.push_bv(BvOp::Mul(x, y), w, 0)
     }
@@ -759,12 +784,9 @@ impl BvContext {
     pub fn bv_udiv(&mut self, x: BvTerm, y: BvTerm) -> BvTerm {
         let w = self.check_same_width(x, y);
         if let (Some(vx), Some(vy)) = (self.const_val(x), self.const_val(y)) {
+            // SMT-LIB: division by zero yields all-ones.
             let vy_masked = vy & mask(w);
-            let result = if vy_masked == 0 {
-                mask(w) // ~0
-            } else {
-                (vx & mask(w)) / vy_masked
-            };
+            let result = (vx & mask(w)).checked_div(vy_masked).unwrap_or(mask(w));
             return self.bv_const(result, w);
         }
         if let Some(vy) = self.const_val(y) {
@@ -925,13 +947,12 @@ impl BvContext {
                 return x;
             }
             // (x << c) << c' = x << (c + c'), saturating at width.
-            if let BvOp::Shl(inner, amt) = self.bv_op(x) {
-                if let Some(va) = self.const_val(amt) {
+            if let BvOp::Shl(inner, amt) = self.bv_op(x)
+                && let Some(va) = self.const_val(amt) {
                     let total = va.saturating_add(vy).min(w as u128);
                     let combined = self.bv_const(total, w);
                     return self.bv_shl(inner, combined);
                 }
-            }
             // Constant-amount shift: replace the variable-shift MUX tree
             // with a structural concat. `x << c` is just `x`'s low (w-c)
             // bits placed in the high (w-c) positions, with c zero bits at
@@ -959,13 +980,12 @@ impl BvContext {
                 return x;
             }
             // (x >>L c) >>L c' = x >>L (c + c').
-            if let BvOp::Lshr(inner, amt) = self.bv_op(x) {
-                if let Some(va) = self.const_val(amt) {
+            if let BvOp::Lshr(inner, amt) = self.bv_op(x)
+                && let Some(va) = self.const_val(amt) {
                     let total = va.saturating_add(vy).min(w as u128);
                     let combined = self.bv_const(total, w);
                     return self.bv_lshr(inner, combined);
                 }
-            }
             // Constant-amount logical shift right: `x >>L c` is x's high
             // (w-c) bits placed in the low (w-c) positions, with c zero
             // bits at the top. Structural concat — zero SAT gates.
@@ -1200,36 +1220,30 @@ impl BvContext {
         // structurally distinct terms, losing hash-cons-based CSE.
         //
         // Left case: concat(concat(a, b_const), y_const) → concat(a, b++y)
-        if let Some(vy) = self.const_val(y) {
-            if let BvOp::Concat(a, b) = self.bv_op(x) {
-                if let Some(vb) = self.const_val(b) {
+        if let Some(vy) = self.const_val(y)
+            && let BvOp::Concat(a, b) = self.bv_op(x)
+                && let Some(vb) = self.const_val(b) {
                     let wb = self.width_of(b);
                     let merged = ((vb & mask(wb)) << wy) | (vy & mask(wy));
                     let merged_const = self.bv_const(merged, wb + wy);
                     return self.bv_concat(a, merged_const);
                 }
-            }
-        }
         // Right case: concat(x_const, concat(a_const, b)) → concat(x++a, b)
-        if let Some(vx) = self.const_val(x) {
-            if let BvOp::Concat(a, b) = self.bv_op(y) {
-                if let Some(va) = self.const_val(a) {
+        if let Some(vx) = self.const_val(x)
+            && let BvOp::Concat(a, b) = self.bv_op(y)
+                && let Some(va) = self.const_val(a) {
                     let wa = self.width_of(a);
                     let merged = ((vx & mask(wx)) << wa) | (va & mask(wa));
                     let merged_const = self.bv_const(merged, wx + wa);
                     return self.bv_concat(merged_const, b);
                 }
-            }
-        }
         // concat(extract(z, h1, l1), extract(z, h2, l2)) collapses to a
         // single extract when the slices are adjacent on the same BV.
         if let (BvOp::Extract(za, ha, la), BvOp::Extract(zb, hb, lb)) =
             (self.bv_op(x), self.bv_op(y))
-        {
-            if za == zb && la == hb + 1 {
+            && za == zb && la == hb + 1 {
                 return self.bv_extract(za, ha, lb);
             }
-        }
         self.push_bv(BvOp::Concat(x, y), w, 0)
     }
 
@@ -1316,8 +1330,7 @@ impl BvContext {
         // one side of a nested condition.
         if let (BvOp::Ite(tc, tt, te), BvOp::Ite(ec, et, ee)) =
             (self.bv_op(t), self.bv_op(e))
-        {
-            if tc == ec {
+            && tc == ec {
                 if tt == et {
                     // Common "then" branch (tt == et): hoist it outside.
                     let inner = self.bv_ite(c, te, ee);
@@ -1329,7 +1342,6 @@ impl BvContext {
                     return self.bv_ite(tc, inner, te);
                 }
             }
-        }
         self.push_bv(BvOp::Ite(c, t, e), w, 0)
     }
 
@@ -1417,7 +1429,6 @@ impl BvContext {
         // Default position: the default is only reached when every selector
         // is false, so a same-selector inner select also falls through —
         // all its values are dead. Chase to the innermost default.
-        let mut default = default;
         while let Some(idx) = same_sel_table(self, default) {
             default = self.select_tables[idx as usize].default;
         }
@@ -1487,6 +1498,16 @@ impl BvContext {
             (Some(false), _) | (_, Some(false)) => return self.bool_false(),
             _ => {}
         }
+        // `x ∧ ¬x = ⊥`. Negation is a hash-consed `Not` node, so a
+        // complementary pair is two `bool_op` lookups to spot. Worth having
+        // on its own, but the reason it earns its keep is the equality
+        // rewrites below: pushing `= k` through an ite chain regularly
+        // produces `guard ∧ (branch = k)` where the guard is literally the
+        // negation of that equality (see `bv_eq`'s ite rule), and without
+        // this fold the dead arm survives all the way to the bitblaster.
+        if self.is_complement(x, y) {
+            return self.bool_false();
+        }
         // Constant-bound chain collapse. When `x = and(l, r)` and both `r`
         // and `y` are comparisons of the same BV variable against constants
         // in the same direction (e.g., both `(bvslt k v)` for the same v),
@@ -1494,10 +1515,10 @@ impl BvContext {
         // of `(bvslt k_i N)` terms chained left-associative; every one after
         // the max is semantically redundant and without this fold each would
         // bitblast into a full 32-bit subtractor (~128 clauses) for nothing.
-        if let BoolOp::And(l, r) = self.bool_op(x) {
-            if let Some((ya_v, ya_k, ya_kind)) = self.extract_const_bound(y) {
-                if let Some((rb_v, rb_k, rb_kind)) = self.extract_const_bound(r) {
-                    if ya_v == rb_v && ya_kind == rb_kind {
+        if let BoolOp::And(l, r) = self.bool_op(x)
+            && let Some((ya_v, ya_k, ya_kind)) = self.extract_const_bound(y)
+                && let Some((rb_v, rb_k, rb_kind)) = self.extract_const_bound(r)
+                    && ya_v == rb_v && ya_kind == rb_kind {
                         // Same var, same comparison direction. Pick the
                         // bound that subsumes the other.
                         let w = self.width_of(ya_v);
@@ -1510,9 +1531,6 @@ impl BvContext {
                             x
                         };
                     }
-                }
-            }
-        }
         self.push_bool(BoolOp::And(x, y))
     }
 
@@ -1549,7 +1567,19 @@ impl BvContext {
             (_, Some(false)) => return x,
             _ => {}
         }
+        // `x ∨ ¬x = ⊤` — dual of the fold in `bool_and`.
+        if self.is_complement(x, y) {
+            return self.bool_true();
+        }
         self.push_bool(BoolOp::Or(x, y))
+    }
+
+    /// True iff `a` and `b` are a complementary pair (`b = ¬a` or `a = ¬b`).
+    /// `bool_not` hash-conses its `Not` node and collapses double negation,
+    /// so the check is exact rather than a heuristic.
+    fn is_complement(&self, a: BoolTerm, b: BoolTerm) -> bool {
+        matches!(self.bool_op(a), BoolOp::Not(i) if i == b)
+            || matches!(self.bool_op(b), BoolOp::Not(i) if i == a)
     }
 
     pub fn bool_implies(&mut self, x: BoolTerm, y: BoolTerm) -> BoolTerm {
@@ -1559,6 +1589,47 @@ impl BvContext {
     }
 
     // ---------- BV comparisons (bridge to Bool) ----------
+
+    /// Walk the ite sub-DAG rooted at `root` and report whether it holds at
+    /// most `budget` distinct `Ite` nodes. Bails the moment the count is
+    /// exceeded, so the cost is O(budget) even against a DAG whose tree
+    /// expansion is exponential — which the `strcmp` fold's shared
+    /// accumulator arm very much is.
+    fn ite_dag_size_within(&mut self, root: BvTerm, budget: usize) -> bool {
+        if self.ite_scan_mark.len() < self.bv_nodes.len() {
+            self.ite_scan_mark.resize(self.bv_nodes.len(), 0);
+        }
+        self.ite_scan_epoch += 1;
+        if self.ite_scan_epoch == u32::MAX {
+            // Only reachable after 4 billion scans; hard-reset and carry on.
+            self.ite_scan_mark.iter_mut().for_each(|m| *m = 0);
+            self.ite_scan_epoch = 1;
+        }
+        let epoch = self.ite_scan_epoch;
+        let mut stack = std::mem::take(&mut self.ite_scan_stack);
+        stack.clear();
+        stack.push(root);
+        let mut seen = 0usize;
+        let mut ok = true;
+        while let Some(t) = stack.pop() {
+            let BvOp::Ite(_, a, b) = self.bv_op(t) else { continue };
+            let slot = &mut self.ite_scan_mark[t.0 as usize];
+            if *slot == epoch {
+                continue;
+            }
+            *slot = epoch;
+            seen += 1;
+            if seen > budget {
+                ok = false;
+                break;
+            }
+            stack.push(a);
+            stack.push(b);
+        }
+        stack.clear();
+        self.ite_scan_stack = stack;
+        ok
+    }
 
     pub fn bv_eq(&mut self, x: BvTerm, y: BvTerm) -> BoolTerm {
         let w = self.check_same_width(x, y);
@@ -1578,8 +1649,8 @@ impl BvContext {
         // matches every known bit while no unknown bits remain, it's true
         // (already caught by the both-constants arm after push_bv's full-fold,
         // but handled here for clarity).
-        if w <= 128 {
-            if let Some(vy) = self.const_val(y) {
+        if w <= 128
+            && let Some(vy) = self.const_val(y) {
                 let (ox, zx) = self.bv_known_bits(x);
                 let m = mask(w);
                 let target = vy & m;
@@ -1589,13 +1660,12 @@ impl BvContext {
                     return self.bool_false();
                 }
             }
-        }
         // Constant-vs-ite with constant branches: collapse the equality to a
         // Boolean selector. Common in symbolic-execution encodings that emit
         // `(= 1 (ite cond 1 0))` to lift a Bool into a BV and then test it.
-        if let Some(vy) = self.const_val(y) {
-            if let BvOp::Ite(c, t, e) = self.bv_op(x) {
-                if let (Some(vt), Some(ve)) = (self.const_val(t), self.const_val(e)) {
+        if let Some(vy) = self.const_val(y)
+            && let BvOp::Ite(c, t, e) = self.bv_op(x)
+                && let (Some(vt), Some(ve)) = (self.const_val(t), self.const_val(e)) {
                     let m = mask(w);
                     let eq_t = (vt & m) == (vy & m);
                     let eq_e = (ve & m) == (vy & m);
@@ -1606,8 +1676,81 @@ impl BvContext {
                         (false, true) => self.bool_not(c),
                     };
                 }
+        // `sub(a, b) = 0  ↔  a = b`, with neither side constant (the
+        // constant-operand cases are handled by the arithmetic-solving arm
+        // below). Kills the subtractor outright rather than comparing its
+        // output against zero.
+        if let Some(vy) = self.const_val(y)
+            && vy & mask(w) == 0
+            && let BvOp::Sub(a, b) = self.bv_op(x) {
+                return self.bv_eq(a, b);
             }
+        // Equal-width extensions compare exactly as their payloads do:
+        // `ext(a, n) = ext(b, n)  ↔  a = b`, for zero- and sign-extension
+        // alike (both are injective and agree on the added bits). Narrows
+        // the comparator to the operand width.
+        match (self.bv_op(x), self.bv_op(y)) {
+            (BvOp::ZeroExtend(a, na), BvOp::ZeroExtend(b, nb)) if na == nb => {
+                return self.bv_eq(a, b);
+            }
+            (BvOp::SignExtend(a, na), BvOp::SignExtend(b, nb)) if na == nb => {
+                return self.bv_eq(a, b);
+            }
+            _ => {}
         }
+        // Push a constant equality through an ite, but only when doing so
+        // actually collapses something:
+        //   `(ite c t e) = k  ↔  (c ∧ t = k) ∨ (¬c ∧ e = k)`
+        //
+        // The target is guarded-fold chains. Symbolic execution encodes
+        // `strcmp`/`memcmp` as a per-byte fold whose guard is `a_i ≠ b_i`
+        // and whose taken branch is `a_i - b_i`; testing the result against
+        // zero makes the taken arm `(a_i ≠ b_i) ∧ (a_i = b_i)`, which is
+        // `⊥`. Every level annihilates and the chain reduces to "every
+        // in-range byte agrees" — one comparator per byte instead of one
+        // full-width mux per byte plus a comparator.
+        //
+        // Applied unconditionally it is a *corpus-negative* rewrite, and
+        // measurably so: on the symex corpus it shrinks the formula
+        // (sat_vars -9.7%, clauses -7.0%) while making search markedly
+        // worse (conflicts +35%, wall +22%). Where nothing annihilates, all
+        // it does is trade a mux the bitblaster handles well — and whose
+        // selectors get VSIDS boosts via the ITE-gate registry — for a
+        // disjunction that carries none of that. So: build both arms, and
+        // keep the pushdown only if an arm folded. That test is exactly the
+        // difference between the two populations, and it recovers most of
+        // the damage (conflicts +1.9%) — but not all of it (wall +10.8%,
+        // nearly all on one instance), so the rule stays **off by default**
+        // and is opted into by clients whose formulas look like the target.
+        //
+        // Bounded additionally by the number of DISTINCT ite nodes in the
+        // sub-DAG, which is what the rewrite pays for: the rebuilt
+        // equalities are hash-consed, so a branch reachable by several
+        // paths costs once. N-ary `Select` tables are a different node and
+        // never come here.
+        if self.eq_ite_pushdown
+            && self.const_val(y).is_some()
+            && let BvOp::Ite(c, t, e) = self.bv_op(x)
+            && self.ite_dag_size_within(x, EQ_ITE_MAX_NODES) {
+                let eq_t = self.bv_eq(t, y);
+                let eq_e = self.bv_eq(e, y);
+                let nc = self.bool_not(c);
+                let hit = self.bool_and(c, eq_t);
+                let miss = self.bool_and(nc, eq_e);
+                // Profitable iff an arm degenerated: to a constant (the
+                // annihilation case), or to its own guard (the branch
+                // matched `k` outright, so the conjunction vanished).
+                let collapsed = self.const_bool(hit).is_some()
+                    || self.const_bool(miss).is_some()
+                    || hit == c
+                    || miss == nc;
+                if collapsed {
+                    return self.bool_or(hit, miss);
+                }
+                // Declined. The speculative arms stay in the arena as
+                // unreachable garbage — bitblasting is demand-driven from
+                // asserted roots, so they cost memory, not SAT variables.
+            }
         // Arithmetic solving: when the equality has a constant on the right
         // and an add/sub/neg with at least one constant operand on the left,
         // move the constant across so the equality becomes a direct
@@ -1677,8 +1820,8 @@ impl BvContext {
         // its lower bound and its `w_mask & !known_zeros` form its upper
         // bound (any unknown bit could be one). If the ranges are disjoint
         // the comparison statically decides.
-        if w <= 128 {
-            if let Some((xl, xh, yl, yh)) = self.unsigned_interval_pair(x, y, w) {
+        if w <= 128
+            && let Some((xl, xh, yl, yh)) = self.unsigned_interval_pair(x, y, w) {
                 if xh < yl {
                     return self.bool_true();
                 }
@@ -1686,7 +1829,6 @@ impl BvContext {
                     return self.bool_false();
                 }
             }
-        }
         self.push_bool(BoolOp::Ult(x, y))
     }
 
@@ -1702,8 +1844,8 @@ impl BvContext {
                 self.bool_false()
             };
         }
-        if w <= 128 {
-            if let Some((xl, xh, yl, yh)) = self.unsigned_interval_pair(x, y, w) {
+        if w <= 128
+            && let Some((xl, xh, yl, yh)) = self.unsigned_interval_pair(x, y, w) {
                 if xh <= yl {
                     return self.bool_true();
                 }
@@ -1711,7 +1853,6 @@ impl BvContext {
                     return self.bool_false();
                 }
             }
-        }
         self.push_bool(BoolOp::Ule(x, y))
     }
 
@@ -1977,7 +2118,7 @@ impl BvContext {
     pub fn bv_const_value_limbs(&self, t: BvTerm) -> Vec<u64> {
         let node = &self.bv_nodes[t.0 as usize];
         if node.wide == WIDE_NONE {
-            let nlimbs = ((node.width as usize) + 63) / 64;
+            let nlimbs = (node.width as usize).div_ceil(64);
             let mut limbs = vec![0u64; nlimbs];
             if nlimbs >= 1 {
                 limbs[0] = node.value as u64;
@@ -2613,6 +2754,9 @@ impl BvContext {
     /// node is decomposed exactly once with its full coefficient — a naive
     /// recursive flatten re-visits shared subterms once per PATH, which is
     /// exponential on deep shared add-DAGs (bench_4351 hangs in it).
+    // Wide by nature: the traversal threads term, coefficient, width,
+    // the occurrence map and the memo/visited state through one frame.
+    #[allow(clippy::too_many_arguments)]
     fn flatten_add(
         &mut self,
         t: BvTerm,

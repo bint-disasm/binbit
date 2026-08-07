@@ -258,7 +258,7 @@ fn fuzz_udiv() {
             |s, a, b| s.bv_udiv(a, b),
             |a, b, w| {
                 let b_m = b & mask(w);
-                if b_m == 0 { mask(w) } else { (a & mask(w)) / b_m }
+                (a & mask(w)).checked_div(b_m).unwrap_or(mask(w))
             },
         );
     }
@@ -790,7 +790,8 @@ fn identity_shift_composition() {
     // We must constrain the mathematical sum, not the BV-wrapped sum —
     // otherwise cases like a=250, b=10 wrap to 4 and the guard spuriously
     // fires while `x << 250` has already cleared all bits.
-    for &w in &[8u32] {
+    {
+        let &w = &8u32;
         let mut s = SmtSolver::new();
         let x = s.bv_var(w);
         let a = s.bv_var(w);

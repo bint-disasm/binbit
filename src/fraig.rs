@@ -26,8 +26,49 @@
 //!   total accumulated AIG. Old nodes still serve as representatives —
 //!   merging a new duplicate into an already-materialized old node is the
 //!   best case (its SAT lit gets reused outright).
+//!
+//! ## Why this is off by default — and why optimizing it is not the answer
+//!
+//! Measured 2026-08-06. FRAIG's *relative* numbers are the best in the
+//! codebase: on a matched subset of the symbex corpus it cuts original
+//! clauses 8.7%, conflicts 33.9% and SAT-search time 45.9%, and on single
+//! instances it removes ~88% of the CNF. Those percentages are a trap.
+//! The absolute figures:
+//!
+//! | instance | full solve, no FRAIG | this sweep alone |
+//! |---|---|---|
+//! | bench_2467 | 0.02s | 17.0s |
+//! | bench_4933 | 0.159s | 30.6s |
+//! | bench_4351 | 0.319s | 23.8s |
+//! | bench_13728 | 0.678s | 49.9s |
+//! | bench_5906 | 1.635s | >200s (timeout) |
+//!
+//! The prize is a fraction of a SAT phase that lasts 0.0-1.2s, so the
+//! whole theoretical saving is ~0.05-0.5s against a 17-50s sweep. That is
+//! a 2-3 order of magnitude gap, and no constant-factor work closes it:
+//!
+//! - Removing the allocation-level waste (SipHash → FxHashMap,
+//!   per-counterexample `HashMap` → epoch-stamped dense memo,
+//!   `add_clause(vec![])` → `add_clause_from_slice`) bought 3-10%, with
+//!   decisions bit-identical. Those fixes are kept.
+//! - Replacing the bit-serial counterexample replay with a bit-parallel
+//!   64-vector batch (`Aig::simulate`-style) was built and measured: 28%
+//!   faster on bench_2467, 24% on bench_4351, but 32% SLOWER on
+//!   bench_4933 (deferring pruning halved `cex_pruned`, 1949 → 949, and
+//!   cost ~900 extra queries), and it proved slightly FEWER equivalences.
+//!   Reverted — it reshuffles tens of seconds where sub-second is needed.
+//!
+//! The cost is dominated by the bounded SAT queries themselves (time
+//! tracks query count closely across configurations), not by anything a
+//! tighter inner loop fixes. FRAIG would need a fundamentally cheaper
+//! equivalence oracle to matter here.
+//!
+//! Where it could still conceivably pay: an instance whose SAT phase is
+//! tens of seconds, so that a 46% cut is worth more than the sweep. That
+//! is the nobranch shape — but the sweep does not finish there either, so
+//! it remains untested rather than promising.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::aig::{Aig, AigNode, AigRef};
 use crate::lit::Lit;
@@ -102,7 +143,7 @@ pub fn sweep(
 
     // Buckets hold (node_idx, phase) in ascending idx order (we iterate the
     // arena in order), so members[0] is always the oldest node — the rep.
-    let mut buckets: HashMap<[u64; SIM_WORDS], Vec<(u32, bool)>> = HashMap::new();
+    let mut buckets: HashMap<[u64; SIM_WORDS], Vec<(u32, bool)>> = HashMap::default();
     for idx in 1..aig.num_nodes() {
         if !matches!(aig.node(idx as u32), AigNode::And(..)) {
             continue;
@@ -121,6 +162,7 @@ pub fn sweep(
     classes.sort_by_key(|v| v[0].0);
 
     let mut enc = ScratchEncoder::new(aig.num_nodes());
+    let mut memo = EvalMemo::new(aig.num_nodes());
     for class in classes {
         let (rep, rep_phase) = class[0];
         let mut members: Vec<(u32, bool)> = class[1..].to_vec();
@@ -186,7 +228,7 @@ pub fn sweep(
             // near-miss families (functions differing only on rare inputs)
             // from costing two queries per member.
             if counterexample && i < members.len() {
-                let mut memo: HashMap<u32, bool> = HashMap::new();
+                memo.reset();
                 let rv = eval_under_model(aig, rep, &enc, &mut memo);
                 let mut w = i;
                 for j in i..members.len() {
@@ -211,15 +253,63 @@ pub fn sweep(
 /// inputs the scratch solver never saw are completed with `false` (any
 /// completion yields a legitimate concrete vector). Iterative; `memo` is
 /// shared across members within one counterexample.
+/// Per-counterexample evaluation memo over AIG node indices.
+///
+/// Dense and epoch-stamped rather than a hash map: node indices are a
+/// dense space, the replay walks the same cones repeatedly, and a fresh
+/// `HashMap` per counterexample meant re-growing a table from empty
+/// thousands of times per sweep — profiling showed the sweep dominated
+/// by `reserve_rehash` and SipHash, not by the SAT queries it exists to
+/// avoid. Bumping the epoch resets the whole memo in O(1).
+struct EvalMemo {
+    val: Vec<bool>,
+    stamp: Vec<u32>,
+    epoch: u32,
+    /// Reused DFS stack (was a fresh `Vec` per evaluated node).
+    stack: Vec<u32>,
+}
+
+impl EvalMemo {
+    fn new(num_nodes: usize) -> Self {
+        EvalMemo {
+            val: vec![false; num_nodes],
+            stamp: vec![0; num_nodes],
+            epoch: 0,
+            stack: Vec::new(),
+        }
+    }
+    /// Invalidate every entry. O(1); on wraparound, hard-clear.
+    fn reset(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.stamp.iter_mut().for_each(|s| *s = 0);
+            self.epoch = 1;
+        }
+    }
+    #[inline]
+    fn get(&self, idx: u32) -> Option<bool> {
+        let i = idx as usize;
+        (self.stamp[i] == self.epoch).then(|| self.val[i])
+    }
+    #[inline]
+    fn set(&mut self, idx: u32, v: bool) {
+        let i = idx as usize;
+        self.val[i] = v;
+        self.stamp[i] = self.epoch;
+    }
+}
+
 fn eval_under_model(
     aig: &Aig,
     idx: u32,
     enc: &ScratchEncoder,
-    memo: &mut HashMap<u32, bool>,
+    memo: &mut EvalMemo,
 ) -> bool {
-    let mut stack: Vec<u32> = vec![idx];
+    let mut stack = std::mem::take(&mut memo.stack);
+    stack.clear();
+    stack.push(idx);
     while let Some(&top) = stack.last() {
-        if memo.contains_key(&top) {
+        if memo.get(top).is_some() {
             stack.pop();
             continue;
         }
@@ -230,10 +320,7 @@ fn eval_under_model(
                 None => false,
             }),
             AigNode::And(a, b) => {
-                match (
-                    memo.get(&a.node_idx()).copied(),
-                    memo.get(&b.node_idx()).copied(),
-                ) {
+                match (memo.get(a.node_idx()), memo.get(b.node_idx())) {
                     (Some(av), Some(bv)) => {
                         Some((av ^ a.is_negated()) && (bv ^ b.is_negated()))
                     }
@@ -249,11 +336,12 @@ fn eval_under_model(
             }
         };
         if let Some(v) = v {
-            memo.insert(top, v);
+            memo.set(top, v);
             stack.pop();
         }
     }
-    memo[&idx]
+    memo.stack = stack;
+    memo.get(idx).expect("root evaluated")
 }
 
 /// Lazy Tseitin encoder from AIG nodes into a private scratch `Solver`.
@@ -281,7 +369,7 @@ impl ScratchEncoder {
         }
         let v = self.solver.new_var();
         let l = Lit::new(v, false);
-        self.solver.add_clause(vec![l]);
+        self.solver.add_clause_from_slice(&[l]);
         self.true_lit = Some(l);
         l
     }
@@ -342,9 +430,9 @@ impl ScratchEncoder {
                     let la = self.signed(a);
                     let lb = self.signed(b);
                     let v = Lit::new(self.solver.new_var(), false);
-                    self.solver.add_clause(vec![!v, la]);
-                    self.solver.add_clause(vec![!v, lb]);
-                    self.solver.add_clause(vec![v, !la, !lb]);
+                    self.solver.add_clause_from_slice(&[!v, la]);
+                    self.solver.add_clause_from_slice(&[!v, lb]);
+                    self.solver.add_clause_from_slice(&[v, !la, !lb]);
                     self.node_lit[top as usize] = Some(v);
                     worklist.pop();
                 }

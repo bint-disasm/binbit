@@ -71,12 +71,25 @@ fn real_main() -> i32 {
         // Clause vivification in the SAT core. Off by default (per-
         // instance trajectory lottery on the symbex corpus).
         let mut vivify = false;
+        let mut target_phases = false;
+        let mut xor_reason = false;
+        let mut pcaug = false;
+        let mut pcaug_lazy = false;
+        // DAG-aware 4-input cut rewriting of the AIG (diagnostic).
+        let mut aig_rw = false;
+        // Portfolio diversification seed for initial phases (0 = off).
+        let mut seed: u64 = 0;
+        // Experimental branching restriction to circuit inputs.
+        let mut input_branch: u8 = 0;
         // Two-level AIG rewriting (Brummayer-Biere) in the bitblaster.
         // Off by default (changes search trajectory).
         let mut aig2 = false;
         // Sharing-aware variant: safe build rules + parent-count-gated
         // post-build substitution pass.
         let mut aig2_post = false;
+        // aig2 restricted to its safe subset (no node-bypassing
+        // substitution / idem-4) — see `set_aig_two_level_subst`.
+        let mut aig2_safe = false;
         // Cut-based CNF technology mapping at materialization. Off by
         // default (see `SmtSolver::cnf_mapping`); `--cnfmap` maps at Fast
         // effort, `--cnfmap-full` spends more mapping time for better
@@ -89,6 +102,19 @@ fn real_main() -> i32 {
                 "--fraig-diag" => want_fraig_diag = true,
                 "--fraig" => fraig = true,
                 "--vivify" => vivify = true,
+                "--target" => target_phases = true,
+                "--xor" => xor_reason = true,
+                "--pcaug" => pcaug = true,
+                "--pcaug-lazy" => {
+                    pcaug = true;
+                    pcaug_lazy = true;
+                }
+                "--aig-rw" => aig_rw = true,
+                _ if a.starts_with("--seed=") => {
+                    seed = a[7..].parse().unwrap_or(0);
+                }
+                "--inputs-only" => input_branch = 1,
+                "--inputs-first" => input_branch = 2,
                 "--aig2" => aig2 = true,
                 "--cnfmap" => cnfmap = true,
                 "--no-cnfmap" => cnfmap = false,
@@ -97,6 +123,10 @@ fn real_main() -> i32 {
                     cnfmap_full = true;
                 }
                 "--aig2-post" => aig2_post = true,
+                "--aig2-safe" => {
+                    aig2 = true;
+                    aig2_safe = true;
+                }
                 "--no-norm" => norm = false,
                 "--no-subst" => subst = false,
                 "--no-gauss" => gauss = false,
@@ -136,9 +166,19 @@ fn real_main() -> i32 {
         solver.set_bve(bve);
         solver.set_fraig(fraig);
         solver.set_vivification(vivify);
+        solver.set_target_phases(target_phases);
+        solver.set_xor_reasoning(xor_reason);
+        solver.set_pcaug(pcaug);
+        solver.set_pcaug_lazy(pcaug_lazy);
+        solver.set_aig_rewrite(aig_rw);
+        solver.set_phase_seed(seed);
+        solver.set_input_branching(input_branch);
         solver.set_aig_two_level(aig2);
         solver.set_cnf_mapping(cnfmap);
         solver.set_cnf_mapping_effort(cnfmap_full);
+        if aig2_safe {
+            solver.set_aig_two_level_subst(false);
+        }
         if aig2_post {
             solver.set_aig_two_level_post(true);
         }
@@ -162,7 +202,50 @@ fn real_main() -> i32 {
                         "c phase_times : front {:.3}s emit {:.3}s preprocess {:.3}s sat {:.3}s",
                         s.time_front, s.time_emit, s.time_preprocess, s.time_sat
                     );
+                    if xor_reason {
+                        let (x, xt) = solver.xor_report();
+                        eprintln!(
+                            "c xor_gauss   : rows {} rank {} dropped {} units {} equivs {} conflict {} ({xt:.3}s)",
+                            x.rows_in, x.rank, x.dropped, x.units, x.equivs, x.conflict
+                        );
+                        let (x2, _) = solver.xor_report();
+                        eprintln!(
+                            "c xor_rows    : len<=3 {} 4-8 {} 9-16 {} >16 {} (max {}) | vars {} rank {} => {} free",
+                            x2.len_hist[0], x2.len_hist[1], x2.len_hist[2],
+                            x2.len_hist[3], x2.max_row, x2.vars, x2.rank,
+                            x2.vars.saturating_sub(x2.rank)
+                        );
+                        let (xp, xc) = solver.xor_prop_report();
+                        eprintln!(
+                            "c xor_native  : rows {} visits {} propagations {} conflicts {}",
+                            x2.native_rows, solver.xor_visit_report(), xp, xc
+                        );
+                        let (xr, rs) = solver.xor_reason_report();
+                        eprintln!(
+                            "c xor_proof   : parity reasons {xr} of {rs} resolution steps ({:.3}%)",
+                            if rs > 0 { xr as f64 * 100.0 / rs as f64 } else { 0.0 }
+                        );
+                    }
+                    if pcaug {
+                        let (ar, ac, aa, at) = solver.pcaug_report();
+                        eprintln!(
+                            "c pcaug       : roots {ar} cuts {ac} derived {aa} ({at:.3}s)"
+                        );
+                        if pcaug_lazy {
+                            let (b, i, sw) = solver.pcaug_lazy_report();
+                            let (ev, un, live) = solver.pcaug_set_report();
+                            eprintln!(
+                                "c pcaug_lazy  : banked {b} injected {i} ({:.1}%) sweeps {sw}",
+                                if b > 0 { i as f64 * 100.0 / b as f64 } else { 0.0 }
+                            );
+                            eprintln!(
+                                "c pcaug_set   : live {live} evicted {ev} root_units {un}"
+                            );
+                        }
+                    }
                     eprintln!("c learned     : {}", s.learned);
+                    eprintln!("c learnt_avg  : {:.1} lits", s.learnt_avg_len);
+                    eprintln!("c learnt_live : {} clauses, {} lits, max {}", s.learnt_live, s.learnt_live_lits, s.learnt_max_len);
                     eprintln!("c propagations: {}", s.propagations);
                     eprintln!("c reductions  : {}", s.reductions);
                     eprintln!("c gcs         : {}", s.gcs);
@@ -173,6 +256,31 @@ fn real_main() -> i32 {
                     eprintln!("c bv_blasted  : {}", s.bv_vars_bitblasted);
                     eprintln!("c pp_subst    : {}", s.pp_substituted);
                     eprintln!("c pp_elim     : {}", s.pp_eliminated);
+                    if aig_rw {
+                        let (r, t) = solver.aig_rewrite_report();
+                        eprintln!(
+                            "c aig_rw      : nodes {} -> {} ({:+.1}%) cuts={} tried={} repl={} zero={} verify_fail={}",
+                            r.nodes_before,
+                            r.nodes_after,
+                            if r.nodes_before > 0 {
+                                (r.nodes_after as f64 - r.nodes_before as f64) * 100.0
+                                    / r.nodes_before as f64
+                            } else { 0.0 },
+                            r.cuts, r.structures_tried, r.replacements, r.zero_gain,
+                            r.verify_failures
+                        );
+                        eprintln!(
+                            "c aig_rw_mffc : size1={} size2={} size3={} size4+={} best_added_total={}",
+                            r.mffc1, r.mffc2, r.mffc3, r.mffc4plus, r.best_added
+                        );
+                        eprintln!(
+                            "c aig_rw_recon: predicted_gain={} realized={} bypassed_decisions={}",
+                            r.predicted_gain,
+                            r.nodes_before as i64 - r.nodes_after as i64,
+                            r.bypassed
+                        );
+                        eprintln!("c aig_rw_time : {:.3}s", t.as_secs_f64());
+                    }
                     eprintln!("c pp_subsumed : {}", s.pp_subsumed);
                     eprintln!("c pp_remat    : {}", s.pp_remat);
                     let (ag, xg, mg) = solver.gate_mix();

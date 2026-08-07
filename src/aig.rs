@@ -103,6 +103,9 @@ pub struct Aig {
     /// default: it changes circuit structure and therefore CNF shape and
     /// search trajectory — benchmark per-corpus before adopting.
     two_level: bool,
+    /// Parent-count ceiling above which a two-level substitution is
+    /// declined (see [`Aig::set_subst_share_limit`]).
+    subst_share_limit: u32,
     /// When two_level is on, also apply the substitution / idempotence-4
     /// families. These are the only rules that BYPASS a shared interior
     /// node (re-pointing an operand at a grandchild) instead of purely
@@ -131,6 +134,22 @@ pub struct Aig {
     /// hasher work and makes probes a word compare — `and()` is the
     /// hottest front-end call on emission-bound sessions.
     hash_cons: HashMap<u64, u32>,
+    /// Operand-reference count per node: how many And nodes already take
+    /// it as a child. Used as a construction-time sharing test — a node
+    /// with a live co-parent must not be BYPASSED by a substitution, or
+    /// its subfunction ends up with two CNF vocabularies and learned
+    /// clauses stop transferring (the bench_5906 pathology). This is a
+    /// lower bound (future parents aren't known yet), so it never claims
+    /// a shared node is private; `substitute_pass` still catches the rest
+    /// after the batch is complete.
+    uses: Vec<u32>,
+    /// Scratch for `substitute_pass`, reused across flushes (see the
+    /// allocation note there). Node-sized; kept here so an incremental
+    /// session doesn't re-allocate and re-zero them per flush.
+    post_live: Vec<bool>,
+    post_parents: Vec<u32>,
+    post_stack: Vec<u32>,
+    post_rel: Vec<u32>,
     /// Input dedup: one AIG input per SAT literal, dense-indexed by the
     /// literal (a lit and its negation share the node; polarity carried on
     /// the AigRef). `u32::MAX` = no entry. Dense because input creation is
@@ -138,20 +157,42 @@ pub struct Aig {
     input_lut: Vec<u32>,
 }
 
+
 #[inline]
 fn cons_key(lhs: AigRef, rhs: AigRef) -> u64 {
     ((lhs.0 as u64) << 32) | rhs.0 as u64
 }
 
 impl Aig {
+    /// Default for [`Aig::set_subst_share_limit`]: unrestricted.
+    /// How many existing co-parents a node may have and still be bypassed by
+    /// a construction-time substitution. 0 = only private nodes; `u32::MAX`
+    /// (the DEFAULT) is the original ungated behaviour.
+    ///
+    /// Measured 2026-08-06, and the two workloads want opposite settings, so
+    /// this stays a knob rather than becoming a policy. On the shared-DAG
+    /// pathology it is decisive — bench_5906 conflicts 213,411 (ungated) →
+    /// 25,219 at limit 1, against a 17,428 baseline. On nobranch every
+    /// gating level is a large loss — 628,280 ungated → 863,487 at 1 →
+    /// 1,025,755 at 0 — because that circuit's substitutions are on
+    /// genuinely private structure and blocking them leaves a worse graph.
+    /// Note it is not monotonic: limit 0 is worse than 1 on BOTH.
+    pub const SUBST_SHARE_UNLIMITED: u32 = u32::MAX;
+
     pub fn new() -> Self {
         Aig {
             two_level: false,
+            subst_share_limit: Self::SUBST_SHARE_UNLIMITED,
             two_level_subst: true,
             rw_counts: [0; 6],
             nodes: vec![AigNode::ConstTrue],
             src_terms: vec![None],
             hash_cons: HashMap::with_capacity_and_hasher(512, Default::default()),
+            uses: Vec::new(),
+            post_live: Vec::new(),
+            post_parents: Vec::new(),
+            post_stack: Vec::new(),
+            post_rel: Vec::new(),
             input_lut: Vec::new(),
         }
     }
@@ -159,6 +200,14 @@ impl Aig {
     /// Enable/disable two-level rewriting in `and()` (see the field docs).
     pub fn set_two_level(&mut self, on: bool) {
         self.two_level = on;
+    }
+
+    /// Decline a two-level substitution when the node it would bypass has
+    /// more than `limit` parents. [`Aig::SUBST_SHARE_UNLIMITED`] (the
+    /// default) never declines; the constant's doc carries the measurement
+    /// showing why this is a knob and not a policy.
+    pub fn set_subst_share_limit(&mut self, limit: u32) {
+        self.subst_share_limit = limit;
     }
 
     /// Whether two-level rewriting is enabled (see `set_two_level`).
@@ -193,11 +242,10 @@ impl Aig {
     /// input node — the negation is carried on the returned AigRef.
     pub fn input(&mut self, lit: Lit) -> AigRef {
         let li = lit.0 as usize;
-        if let Some(&raw) = self.input_lut.get(li) {
-            if raw != u32::MAX {
+        if let Some(&raw) = self.input_lut.get(li)
+            && raw != u32::MAX {
                 return AigRef(raw);
             }
-        }
         // Canonicalize to positive-polarity storage.
         let canonical_lit = Lit(lit.0 & !1);
         let ci = canonical_lit.0 as usize;
@@ -271,95 +319,77 @@ impl Aig {
             // === Level 2 ===
 
             // Contradiction (asymmetric): (a ∧ b) ∧ c with a = ¬c ∨ b = ¬c.
-            if !ln {
-                if let Some((x, y)) = lk {
-                    if x == !right || y == !right {
+            if !ln
+                && let Some((x, y)) = lk
+                    && (x == !right || y == !right) {
                         self.rw_counts[0] += 1;
                         return AigRef::FALSE;
                     }
-                }
-            }
-            if !rn {
-                if let Some((x, y)) = rk {
-                    if x == !left || y == !left {
+            if !rn
+                && let Some((x, y)) = rk
+                    && (x == !left || y == !left) {
                         self.rw_counts[0] += 1;
                         return AigRef::FALSE;
                     }
-                }
-            }
 
             // Contradiction (symmetric): (a ∧ b) ∧ (c ∧ d) with any
             // child pair complementary.
-            if !ln && !rn {
-                if let (Some((x, y)), Some((w, z))) = (lk, rk) {
-                    if x == !w || x == !z || y == !w || y == !z {
+            if !ln && !rn
+                && let (Some((x, y)), Some((w, z))) = (lk, rk)
+                    && (x == !w || x == !z || y == !w || y == !z) {
                         self.rw_counts[0] += 1;
                         return AigRef::FALSE;
                     }
-                }
-            }
 
             // Subsumption (asymmetric): ¬(a ∧ b) ∧ c with a = ¬c ∨ b = ¬c
             // → c.
-            if ln {
-                if let Some((x, y)) = lk {
-                    if x == !right || y == !right {
+            if ln
+                && let Some((x, y)) = lk
+                    && (x == !right || y == !right) {
                         self.rw_counts[1] += 1;
                         return right;
                     }
-                }
-            }
-            if rn {
-                if let Some((x, y)) = rk {
-                    if x == !left || y == !left {
+            if rn
+                && let Some((x, y)) = rk
+                    && (x == !left || y == !left) {
                         self.rw_counts[1] += 1;
                         return left;
                     }
-                }
-            }
 
             // Subsumption (symmetric): ¬(a ∧ b) ∧ (c ∧ d) with any child
             // pair complementary → (c ∧ d).
-            if ln && !rn {
-                if let (Some((x, y)), Some((w, z))) = (lk, rk) {
-                    if x == !w || x == !z || y == !w || y == !z {
+            if ln && !rn
+                && let (Some((x, y)), Some((w, z))) = (lk, rk)
+                    && (x == !w || x == !z || y == !w || y == !z) {
                         self.rw_counts[1] += 1;
                         return right;
                     }
-                }
-            }
-            if rn && !ln {
-                if let (Some((w, z)), Some((x, y))) = (rk, lk) {
-                    if w == !x || w == !y || z == !x || z == !y {
+            if rn && !ln
+                && let (Some((w, z)), Some((x, y))) = (rk, lk)
+                    && (w == !x || w == !y || z == !x || z == !y) {
                         self.rw_counts[1] += 1;
                         return left;
                     }
-                }
-            }
 
             // Idempotence (2-level): (a ∧ b) ∧ c with a = c ∨ b = c
             // → (a ∧ b).
-            if !ln {
-                if let Some((x, y)) = lk {
-                    if x == right || y == right {
+            if !ln
+                && let Some((x, y)) = lk
+                    && (x == right || y == right) {
                         self.rw_counts[2] += 1;
                         return left;
                     }
-                }
-            }
-            if !rn {
-                if let Some((x, y)) = rk {
-                    if x == left || y == left {
+            if !rn
+                && let Some((x, y)) = rk
+                    && (x == left || y == left) {
                         self.rw_counts[2] += 1;
                         return right;
                     }
-                }
-            }
 
             // Resolution: ¬(a ∧ b) ∧ ¬(c ∧ d) with {a=c, b=¬d} or
             // {a=d, b=¬c} → ¬a (and the mirrored variants → ¬d).
-            if ln && rn {
-                if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+            if ln && rn
+                && let (Some((x, y)), Some((w, z))) = (lk, rk) {
                     if (x == w && y == !z) || (x == z && y == !w) {
                         self.rw_counts[3] += 1;
                         return !x;
@@ -369,7 +399,6 @@ impl Aig {
                         return !z;
                     }
                 }
-            }
 
             // Safe-subset mode stops here: the remaining families bypass
             // shared interior nodes rather than deleting redundancy.
@@ -378,11 +407,23 @@ impl Aig {
             }
 
             // === Level 3: substitution — shrink an operand, restart. ===
+            //
+            // Each rule below BYPASSES an interior node (re-points this
+            // node at a grandchild). That is safe only while the bypassed
+            // node has no co-parent: otherwise its subfunction keeps a
+            // gate variable for the other parents while this cone
+            // constrains its expansion, and learned clauses stop
+            // transferring between the two vocabularies. `may_bypass`
+            // enforces that with the reference counts known so far.
+            let may_bypass = |uses: &Vec<u32>, r: AigRef| -> bool {
+                uses.get(r.node_idx() as usize).copied().unwrap_or(0)
+                    <= self.subst_share_limit
+            };
 
             // Asymmetric: ¬(a ∧ b) ∧ c with a = c → ¬b ∧ c (resp. b = c
             // → ¬a ∧ c).
-            if ln {
-                if let Some((x, y)) = lk {
+            if ln && may_bypass(&self.uses, left)
+                && let Some((x, y)) = lk {
                     if x == right {
                         left = !y;
                         self.rw_counts[4] += 1;
@@ -394,9 +435,8 @@ impl Aig {
                         continue;
                     }
                 }
-            }
-            if rn {
-                if let Some((w, z)) = rk {
+            if rn && may_bypass(&self.uses, right)
+                && let Some((w, z)) = rk {
                     if w == left {
                         right = !z;
                         self.rw_counts[4] += 1;
@@ -408,12 +448,11 @@ impl Aig {
                         continue;
                     }
                 }
-            }
 
             // Symmetric: ¬(a ∧ b) ∧ (c ∧ d) with a ∈ {c, d} → ¬b ∧ (c ∧ d)
             // (resp. b ∈ {c, d} → ¬a ∧ (c ∧ d)).
-            if ln && !rn {
-                if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+            if ln && !rn && may_bypass(&self.uses, left)
+                && let (Some((x, y)), Some((w, z))) = (lk, rk) {
                     if x == w || x == z {
                         left = !y;
                         self.rw_counts[4] += 1;
@@ -425,9 +464,8 @@ impl Aig {
                         continue;
                     }
                 }
-            }
-            if rn && !ln {
-                if let (Some((w, z)), Some((x, y))) = (rk, lk) {
+            if rn && !ln && may_bypass(&self.uses, right)
+                && let (Some((w, z)), Some((x, y))) = (rk, lk) {
                     if w == x || w == y {
                         right = !z;
                         self.rw_counts[4] += 1;
@@ -439,13 +477,12 @@ impl Aig {
                         continue;
                     }
                 }
-            }
 
             // === Level 4: idempotence across two Ands — drop the shared
             // conjunct from one side, restart. (a ∧ b) ∧ (c ∧ d) with
             // c ∈ {a, b} → keep d (resp. d ∈ {a, b} → keep c). ===
-            if !ln && !rn {
-                if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+            if !ln && !rn
+                && let (Some((x, y)), Some((w, z))) = (lk, rk) {
                     if x == w || y == w {
                         self.rw_counts[5] += 1;
                         right = z;
@@ -457,7 +494,6 @@ impl Aig {
                         continue;
                     }
                 }
-            }
 
             break;
         }
@@ -476,7 +512,29 @@ impl Aig {
         self.nodes.push(AigNode::And(lhs, rhs));
         self.src_terms.push(None);
         self.hash_cons.insert(cons_key(lhs, rhs), idx);
+        if self.two_level && self.two_level_subst {
+            if self.uses.len() <= idx as usize {
+                self.uses.resize(idx as usize + 1, 0);
+            }
+            self.uses[lhs.node_idx() as usize] += 1;
+            self.uses[rhs.node_idx() as usize] += 1;
+        }
         AigRef::from_parts(idx, false)
+    }
+
+    /// Read-only hash-cons probe: does `and(a, b)` already exist as a
+    /// node? Returns it without creating anything.
+    ///
+    /// Deliberately skips the constant folds and two-level rewriting that
+    /// [`Self::and`] applies, so a `None` here does not prove `and(a, b)`
+    /// would allocate — it only proves no node with this exact operand
+    /// pair exists. Cost estimators may therefore over-estimate, never
+    /// under-estimate, the nodes a build would add.
+    pub fn lookup_and(&self, a: AigRef, b: AigRef) -> Option<AigRef> {
+        let (lhs, rhs) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+        self.hash_cons
+            .get(&cons_key(lhs, rhs))
+            .map(|&idx| AigRef::from_parts(idx, false))
     }
 
     /// `or(a, b) = ¬and(¬a, ¬b)` — no native OR node in an AIG.
@@ -575,12 +633,11 @@ impl Aig {
     /// strictly smaller node index.
     fn resolve(&self, mut r: AigRef) -> AigRef {
         loop {
-            if let AigNode::And(a, b) = self.nodes[r.node_idx() as usize] {
-                if a == b {
+            if let AigNode::And(a, b) = self.nodes[r.node_idx() as usize]
+                && a == b {
                     r = if r.is_negated() { !a } else { a };
                     continue;
                 }
-            }
             return r;
         }
     }
@@ -619,13 +676,26 @@ impl Aig {
         let n = self.nodes.len();
         let mut stats = PostPassStats::default();
         let is_pinned = |i: u32| (i as usize) < pinned.len() && pinned[i as usize];
+        // Scratch reused across flushes. An incremental session calls this
+        // once per flush over a monotonically growing AIG, so allocating
+        // and zeroing three node-sized buffers each time is quadratic in
+        // the session — invisible on single-query corpus files, not on a
+        // symbex run that flushes thousands of times.
+        let mut live = std::mem::take(&mut self.post_live);
+        let mut parents = std::mem::take(&mut self.post_parents);
+        let mut stack = std::mem::take(&mut self.post_stack);
+        let mut rel = std::mem::take(&mut self.post_rel);
+        live.clear();
+        live.resize(n, false);
+        parents.clear();
+        parents.resize(n, 0);
 
         // Liveness: reachable from the roots without descending into
         // pinned cones (their structure is settled). Keeps garbage nodes
         // (e.g. rejected-normalization variants) from inflating parent
         // counts and blocking valid substitutions.
-        let mut live = vec![false; n];
-        let mut stack: Vec<u32> = roots.iter().map(|r| r.node_idx()).collect();
+        stack.clear();
+        stack.extend(roots.iter().map(|r| r.node_idx()));
         while let Some(i) = stack.pop() {
             if live[i as usize] || is_pinned(i) {
                 continue;
@@ -639,7 +709,6 @@ impl Aig {
 
         // Live parent counts. Roots get a sentinel parent so they can
         // never be bypassed (they materialize regardless).
-        let mut parents = vec![0u32; n];
         for i in 0..n {
             if !live[i] {
                 continue;
@@ -655,8 +724,18 @@ impl Aig {
 
         // Release a reference to node `k`; if it just died, cascade into
         // its children so later passes see accurate counts.
-        fn release(k: u32, nodes: &[AigNode], parents: &mut [u32], live: &mut [bool]) {
-            let mut stack = vec![k];
+        // `stack` is caller-owned scratch: this fires on every re-point
+        // and fold, so a fresh Vec per call was one allocation per
+        // rewrite.
+        fn release(
+            k: u32,
+            nodes: &[AigNode],
+            parents: &mut [u32],
+            live: &mut [bool],
+            stack: &mut Vec<u32>,
+        ) {
+            stack.clear();
+            stack.push(k);
             while let Some(i) = stack.pop() {
                 let iu = i as usize;
                 debug_assert!(parents[iu] > 0, "releasing unreferenced node");
@@ -693,11 +772,11 @@ impl Aig {
                 let mut right = self.resolve(r0);
                 if left != l0 {
                     parents[left.node_idx() as usize] += 1;
-                    release(l0.node_idx(), &self.nodes, &mut parents, &mut live);
+                    release(l0.node_idx(), &self.nodes, &mut parents, &mut live, &mut rel);
                 }
                 if right != r0 {
                     parents[right.node_idx() as usize] += 1;
-                    release(r0.node_idx(), &self.nodes, &mut parents, &mut live);
+                    release(r0.node_idx(), &self.nodes, &mut parents, &mut live, &mut rel);
                 }
 
                 let mut fold: Option<AigRef> = None;
@@ -723,83 +802,65 @@ impl Aig {
 
                     // Pure-deletion folds (ungated — they don't bypass).
                     // Contradiction.
-                    if !ln {
-                        if let Some((x, y)) = lk {
-                            if x == !right || y == !right {
+                    if !ln
+                        && let Some((x, y)) = lk
+                            && (x == !right || y == !right) {
                                 fold = Some(AigRef::FALSE);
                                 break;
                             }
-                        }
-                    }
-                    if !rn {
-                        if let Some((x, y)) = rk {
-                            if x == !left || y == !left {
+                    if !rn
+                        && let Some((x, y)) = rk
+                            && (x == !left || y == !left) {
                                 fold = Some(AigRef::FALSE);
                                 break;
                             }
-                        }
-                    }
-                    if !ln && !rn {
-                        if let (Some((x, y)), Some((w, z))) = (lk, rk) {
-                            if x == !w || x == !z || y == !w || y == !z {
+                    if !ln && !rn
+                        && let (Some((x, y)), Some((w, z))) = (lk, rk)
+                            && (x == !w || x == !z || y == !w || y == !z) {
                                 fold = Some(AigRef::FALSE);
                                 break;
                             }
-                        }
-                    }
                     // Subsumption.
-                    if ln {
-                        if let Some((x, y)) = lk {
-                            if x == !right || y == !right {
+                    if ln
+                        && let Some((x, y)) = lk
+                            && (x == !right || y == !right) {
                                 fold = Some(right);
                                 break;
                             }
-                        }
-                    }
-                    if rn {
-                        if let Some((x, y)) = rk {
-                            if x == !left || y == !left {
+                    if rn
+                        && let Some((x, y)) = rk
+                            && (x == !left || y == !left) {
                                 fold = Some(left);
                                 break;
                             }
-                        }
-                    }
-                    if ln && !rn {
-                        if let (Some((x, y)), Some((w, z))) = (lk, rk) {
-                            if x == !w || x == !z || y == !w || y == !z {
+                    if ln && !rn
+                        && let (Some((x, y)), Some((w, z))) = (lk, rk)
+                            && (x == !w || x == !z || y == !w || y == !z) {
                                 fold = Some(right);
                                 break;
                             }
-                        }
-                    }
-                    if rn && !ln {
-                        if let (Some((w, z)), Some((x, y))) = (rk, lk) {
-                            if w == !x || w == !y || z == !x || z == !y {
+                    if rn && !ln
+                        && let (Some((w, z)), Some((x, y))) = (rk, lk)
+                            && (w == !x || w == !y || z == !x || z == !y) {
                                 fold = Some(left);
                                 break;
                             }
-                        }
-                    }
                     // Idempotence (2-level).
-                    if !ln {
-                        if let Some((x, y)) = lk {
-                            if x == right || y == right {
+                    if !ln
+                        && let Some((x, y)) = lk
+                            && (x == right || y == right) {
                                 fold = Some(left);
                                 break;
                             }
-                        }
-                    }
-                    if !rn {
-                        if let Some((x, y)) = rk {
-                            if x == left || y == left {
+                    if !rn
+                        && let Some((x, y)) = rk
+                            && (x == left || y == left) {
                                 fold = Some(right);
                                 break;
                             }
-                        }
-                    }
                     // Resolution.
-                    if ln && rn {
-                        if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                    if ln && rn
+                        && let (Some((x, y)), Some((w, z))) = (lk, rk) {
                             if (x == w && y == !z) || (x == z && y == !w) {
                                 fold = Some(!x);
                                 break;
@@ -809,7 +870,6 @@ impl Aig {
                                 break;
                             }
                         }
-                    }
 
                     // Gated substitution: bypass only single-parent,
                     // unpinned interiors. `parents[k] == 1` means the sole
@@ -820,14 +880,14 @@ impl Aig {
                     let mut applied = false;
 
                     // Asymmetric: ¬(a ∧ b) ∧ c.
-                    if ln {
-                        if let Some((x, y)) = lk {
+                    if ln
+                        && let Some((x, y)) = lk {
                             let k = left.node_idx();
                             if x == right || y == right {
                                 if can_bypass(k, &parents) {
                                     let repl = if x == right { !y } else { !x };
                                     parents[repl.node_idx() as usize] += 1;
-                                    release(k, &self.nodes, &mut parents, &mut live);
+                                    release(k, &self.nodes, &mut parents, &mut live, &mut rel);
                                     left = repl;
                                     applied = true;
                                 } else {
@@ -835,15 +895,14 @@ impl Aig {
                                 }
                             }
                         }
-                    }
-                    if !applied && rn {
-                        if let Some((w, z)) = rk {
+                    if !applied && rn
+                        && let Some((w, z)) = rk {
                             let k = right.node_idx();
                             if w == left || z == left {
                                 if can_bypass(k, &parents) {
                                     let repl = if w == left { !z } else { !w };
                                     parents[repl.node_idx() as usize] += 1;
-                                    release(k, &self.nodes, &mut parents, &mut live);
+                                    release(k, &self.nodes, &mut parents, &mut live, &mut rel);
                                     right = repl;
                                     applied = true;
                                 } else {
@@ -851,16 +910,15 @@ impl Aig {
                                 }
                             }
                         }
-                    }
                     // Symmetric: ¬(a ∧ b) ∧ (c ∧ d).
-                    if !applied && ln && !rn {
-                        if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                    if !applied && ln && !rn
+                        && let (Some((x, y)), Some((w, z))) = (lk, rk) {
                             let k = left.node_idx();
                             if x == w || x == z || y == w || y == z {
                                 if can_bypass(k, &parents) {
                                     let repl = if x == w || x == z { !y } else { !x };
                                     parents[repl.node_idx() as usize] += 1;
-                                    release(k, &self.nodes, &mut parents, &mut live);
+                                    release(k, &self.nodes, &mut parents, &mut live, &mut rel);
                                     left = repl;
                                     applied = true;
                                 } else {
@@ -868,15 +926,14 @@ impl Aig {
                                 }
                             }
                         }
-                    }
-                    if !applied && rn && !ln {
-                        if let (Some((w, z)), Some((x, y))) = (rk, lk) {
+                    if !applied && rn && !ln
+                        && let (Some((w, z)), Some((x, y))) = (rk, lk) {
                             let k = right.node_idx();
                             if w == x || w == y || z == x || z == y {
                                 if can_bypass(k, &parents) {
                                     let repl = if w == x || w == y { !z } else { !w };
                                     parents[repl.node_idx() as usize] += 1;
-                                    release(k, &self.nodes, &mut parents, &mut live);
+                                    release(k, &self.nodes, &mut parents, &mut live, &mut rel);
                                     right = repl;
                                     applied = true;
                                 } else {
@@ -884,17 +941,16 @@ impl Aig {
                                 }
                             }
                         }
-                    }
                     // Idempotence (level 4): (a ∧ b) ∧ (c ∧ d) sharing a
                     // conjunct — drop the shared one from the right side.
-                    if !applied && !ln && !rn {
-                        if let (Some((x, y)), Some((w, z))) = (lk, rk) {
+                    if !applied && !ln && !rn
+                        && let (Some((x, y)), Some((w, z))) = (lk, rk) {
                             let k = right.node_idx();
                             if x == w || y == w || x == z || y == z {
                                 if can_bypass(k, &parents) {
                                     let repl = if x == w || y == w { z } else { w };
                                     parents[repl.node_idx() as usize] += 1;
-                                    release(k, &self.nodes, &mut parents, &mut live);
+                                    release(k, &self.nodes, &mut parents, &mut live, &mut rel);
                                     right = repl;
                                     applied = true;
                                 } else {
@@ -902,7 +958,6 @@ impl Aig {
                                 }
                             }
                         }
-                    }
 
                     if applied {
                         stats.subst_applied += 1;
@@ -917,8 +972,8 @@ impl Aig {
                     stats.folds += 1;
                     rewrites_this_pass += 1;
                     parents[t.node_idx() as usize] += 2;
-                    release(left.node_idx(), &self.nodes, &mut parents, &mut live);
-                    release(right.node_idx(), &self.nodes, &mut parents, &mut live);
+                    release(left.node_idx(), &self.nodes, &mut parents, &mut live, &mut rel);
+                    release(right.node_idx(), &self.nodes, &mut parents, &mut live, &mut rel);
                     self.nodes[i] = AigNode::And(t, t);
                 } else if left != self.resolve_stored(i, true) || right != self.resolve_stored(i, false)
                 {
@@ -942,6 +997,11 @@ impl Aig {
                 break;
             }
         }
+        // Hand the scratch back for the next flush.
+        self.post_live = live;
+        self.post_parents = parents;
+        self.post_stack = stack;
+        self.post_rel = rel;
         stats
     }
 

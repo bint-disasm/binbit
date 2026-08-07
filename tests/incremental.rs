@@ -1,7 +1,7 @@
 use binbit::{LBool, Lit, SolveResult, Solver, Var};
 
 fn lit(signed: i32) -> Lit {
-    let v = Var((signed.unsigned_abs() - 1) as u32);
+    let v = Var(signed.unsigned_abs() - 1  );
     Lit::new(v, signed < 0)
 }
 

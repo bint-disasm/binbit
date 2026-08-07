@@ -4,7 +4,7 @@
 //! contribution to the SAT formula (subterm costs land on subterm rows,
 //! not the parent's).
 
-use binbit::{BvContext, SmtSolver};
+use binbit::SmtSolver;
 
 #[test]
 fn cost_tracking_is_off_by_default() {

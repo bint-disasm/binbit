@@ -20,6 +20,22 @@
 //! is O(k) word operations per merge, and ISOP results are cached across
 //! cones keyed by the (table, arity) pair (cut functions repeat
 //! enormously — every adder bit yields the same XOR3/MAJ tables).
+//!
+//! STATUS (2026-08-06, post gate-VE overhaul): **off by default and
+//! corpus-negative in the current tree.** Mapping starves the
+//! gate-driven BVE the pipeline now leans on (nobranch `pp_elim` 164k →
+//! 27k; bench_16728 +197% conflicts, bench_5906 +301%). Two findings
+//! from the same investigation worth keeping:
+//! - ISOP emission has *propagation holes*: it drops consensus primes,
+//!   and 63.6% of 4-var functions have primes an ISOP omits. Emitting
+//!   complete prime covers instead (`BINBIT_CNF_PRIMES=1`, emission
+//!   only) took nobranch `--cnfmap-full` from 670k conflicts (worse
+//!   than the 628k no-mapping baseline) to 601k (better), with
+//!   propagations below baseline. The corpus stays net-negative either
+//!   way — the BVE interaction dominates.
+//! - The propagation-hole fix that does NOT fight BVE is
+//!   `crate::pcaug`: keep classic emission, let BVE run, then add the
+//!   missing primes as redundant clauses afterwards.
 
 use crate::aig::{Aig, AigNode};
 use crate::solver::push_unchecked;
@@ -178,6 +194,68 @@ pub fn isop_cover(f: Tt, nvars: usize, out: &mut Vec<Cube>) -> Option<()> {
     Some(())
 }
 
+/// EXPERIMENT (`BINBIT_CNF_PRIMES=1`): complete prime-implicant cover of
+/// `f` — every prime, not an irredundant subset. An ISOP drops primes it
+/// doesn't need for coverage (the consensus terms), and each dropped
+/// prime is a unit propagation the solver never makes; emitting all of
+/// them restores generalized arc consistency per mapped cut. Brute
+/// force over the ≤ 3^nvars candidate cubes — emission-path only, and
+/// memoized behind the same cube cache as ISOP.
+pub fn prime_cover(f: Tt, nvars: usize, out: &mut Vec<Cube>) {
+    out.clear();
+    let full = pad_masked(f, nvars);
+    if tt_is_zero(full) {
+        return;
+    }
+    if full == TT_ONES {
+        out.push(Cube { pos: 0, neg: 0 });
+        return;
+    }
+    let table_of = |cube: Cube| -> Tt {
+        let mut t = TT_ONES;
+        for i in 0..nvars {
+            if cube.pos & (1 << i) != 0 {
+                t = tt_and(t, VAR_MASKS[i]);
+            }
+            if cube.neg & (1 << i) != 0 {
+                t = tt_andnot(t, VAR_MASKS[i]);
+            }
+        }
+        t
+    };
+    let n3 = 3usize.pow(nvars as u32);
+    'cand: for code in 0..n3 {
+        let mut c = code;
+        let mut cube = Cube { pos: 0, neg: 0 };
+        for i in 0..nvars {
+            match c % 3 {
+                1 => cube.pos |= 1 << i,
+                2 => cube.neg |= 1 << i,
+                _ => {}
+            }
+            c /= 3;
+        }
+        // Implicant?
+        if !tt_is_zero(tt_andnot(table_of(cube), full)) {
+            continue;
+        }
+        // Prime? Dropping any literal must break implicant-ness.
+        for i in 0..nvars {
+            let mask = 1u8 << i;
+            if cube.pos & mask == 0 && cube.neg & mask == 0 {
+                continue;
+            }
+            let mut parent = cube;
+            parent.pos &= !mask;
+            parent.neg &= !mask;
+            if tt_is_zero(tt_andnot(table_of(parent), full)) {
+                continue 'cand;
+            }
+        }
+        out.push(cube);
+    }
+}
+
 /// Pad an `nvars`-variable table (meaningful in its low 2^nvars rows)
 /// to the full 64-row representation by duplication.
 pub fn pad(f: Tt, nvars: usize) -> Tt {
@@ -281,6 +359,13 @@ fn isop_cost(table: Tt, nvars: usize, scratch: &mut Vec<Cube>) -> u32 {
     // eliminator can still chew: corpus conflicts −5..−26%, post-BVE
     // clauses to −12%, never worse. (Constant, not a runtime knob —
     // this is on the cache-miss path of every candidate cut.)
+    // NOTE: costs stay ISOP-based even under `BINBIT_CNF_PRIMES`
+    // emission. Pricing the prime covers directly was tried (2026-08-06)
+    // and made nobranch WORSE (671k conflicts vs 601k with ISOP-priced
+    // mapping + prime emission, baseline 628k): prime pricing distorts
+    // the literal-aware steering this formula was corpus-tuned for, and
+    // the MAX_CUBES bound starts rejecting cuts whose extra primes are
+    // exactly the propagation the emission wants to restore.
     let mut n = 0u32;
     for f in [table, tt_not(table)] {
         match isop_cover(pad_masked(f, nvars), nvars, scratch) {
@@ -302,6 +387,7 @@ fn isop_cost(table: Tt, nvars: usize, scratch: &mut Vec<Cube>) -> u32 {
 /// [`Mapper::plan`].
 const COST_CACHE_BITS: usize = 15;
 
+#[derive(Default)]
 pub struct IsopCache {
     /// Direct-mapped (padded table, nvars) → clause-count cache. Cost is
     /// recomputable, so collisions just evict — no chaining, no probing.
@@ -316,23 +402,22 @@ pub struct IsopCache {
     cube_idx: HashMap<(Tt, u8), (u32, u16, u16)>,
     /// Scratch for the cache-miss ISOP runs.
     miss_scratch: Vec<Cube>,
+    /// Emit full prime covers instead of ISOP covers; see
+    /// [`IsopCache::set_prime_emission`]. Off by default.
+    prime_emission: bool,
 }
 
-impl Default for IsopCache {
-    fn default() -> Self {
-        IsopCache {
-            // Allocated lazily on first use: a solver that never maps
-            // (the whole classic path) must not pay ~768KB of
-            // allocate-and-zero in its constructor.
-            cost_keys: Vec::new(),
-            cube_store: Vec::new(),
-            cube_idx: HashMap::default(),
-            miss_scratch: Vec::new(),
-        }
-    }
-}
 
 impl IsopCache {
+    /// Emit the full set of prime implicates for each cut instead of an
+    /// ISOP cover. Propagation-complete but much wider, and measured
+    /// corpus-negative — the eliminator starves on the wide covers. Off
+    /// by default; kept because it is the right encoding when propagation
+    /// holes are the thing under study.
+    pub fn set_prime_emission(&mut self, on: bool) {
+        self.prime_emission = on;
+    }
+
     fn cost(&mut self, table: Tt, nvars: usize, scratch: &mut Vec<Cube>) -> u32 {
         if self.cost_keys.is_empty() {
             self.cost_keys.resize(1 << COST_CACHE_BITS, (TT_ZERO, 0, 0));
@@ -364,11 +449,19 @@ impl IsopCache {
         }
         let start = self.cube_store.len();
         let mut scratch = std::mem::take(&mut self.miss_scratch);
-        isop_cover(key.0, nvars, &mut scratch).expect("chosen cut has bounded ISOP");
+        if self.prime_emission {
+            prime_cover(key.0, nvars, &mut scratch);
+        } else {
+            isop_cover(key.0, nvars, &mut scratch).expect("chosen cut has bounded ISOP");
+        }
         let non = scratch.len() as u16;
         self.cube_store.extend_from_slice(&scratch);
-        isop_cover(pad_masked(tt_not(key.0), nvars), nvars, &mut scratch)
-            .expect("chosen cut has bounded ISOP");
+        if self.prime_emission {
+            prime_cover(pad_masked(tt_not(key.0), nvars), nvars, &mut scratch);
+        } else {
+            isop_cover(pad_masked(tt_not(key.0), nvars), nvars, &mut scratch)
+                .expect("chosen cut has bounded ISOP");
+        }
         let noff = scratch.len() as u16;
         self.cube_store.extend_from_slice(&scratch);
         self.cube_idx.insert(key, (start as u32, non, noff));
@@ -1083,6 +1176,11 @@ fn merge_union(a: &CutC, b: &CutC) -> Option<(CutC, u8, u8)> {
 
 /// Complete a deduped union cut: conjoin the re-expressed child tables
 /// and price the CNF through the cache.
+// Wide by nature: two source cuts each contribute (table, sign, presence
+// mask), plus the output and two scratch borrows. Bundling them into a
+// struct would only move the same words behind a pointer on the hottest
+// path of the mapper.
+#[allow(clippy::too_many_arguments)]
 fn fill_cut(
     c: &mut CutC,
     a: &CutC,
@@ -1163,7 +1261,9 @@ mod tests {
         cubes.iter().any(|c| {
             (0..MAX_K).all(|i| {
                 let bit = row & (1usize << i) != 0;
-                !(c.pos & (1 << i) != 0 && !bit) && !(c.neg & (1 << i) != 0 && bit)
+                // Every positive literal needs the bit set, every
+                // negative literal needs it clear.
+                (c.pos & (1 << i) == 0 || bit) && (c.neg & (1 << i) == 0 || !bit)
             })
         })
     }
@@ -1238,7 +1338,7 @@ mod tests {
 
     #[test]
     fn pad_and_cofactor_agree_with_rows() {
-        let mut x = 0xabad_1dea_0u64;
+        let mut x = 0x00ab_ad1d_ea00u64;
         for _ in 0..100 {
             let raw = rnd_tt(&mut x);
             for nvars in 1..=MAX_K {

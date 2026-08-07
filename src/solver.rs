@@ -20,6 +20,14 @@ enum Reason {
     // literal sits at the head of its trail entry; `other` is what we resolve
     // against during conflict analysis.
     Binary(Lit),
+    // A parity row (index into `Solver::xrows`) that forced this variable.
+    // The reason clause — every other variable of the row, as the literal
+    // false under its current assignment — is expanded on demand instead
+    // of being materialized, because the overwhelming majority of parity
+    // propagations are never walked by conflict analysis. Expansion is
+    // valid whenever analysis runs, since analysis precedes backtracking
+    // and every other variable of the row was assigned before this one.
+    Xor(u32),
 }
 
 /// Per-variable assignment metadata. Level and reason are written together
@@ -680,6 +688,19 @@ pub struct Solver {
     // and letting them overwrite saved phases would silently re-roll the
     // decision-march trajectory even when vivification changes nothing.
     save_phases: bool,
+    // Kissat-style target phases (opt-in, see `set_target_phases`): the
+    // polarity each variable held in the deepest consistent trail seen
+    // since the last per-solve reset, consulted ahead of the saved phase
+    // when branching. Entry = (epoch << 1) | polarity; a stale epoch tag
+    // means "no target recorded" and the saved phase applies — the epoch
+    // bump makes the per-solve reset O(1). Distinct from phase *saving*:
+    // saved phases track the most recent assignment, targets track the
+    // globally deepest one, steering search back toward its best
+    // near-model instead of its latest neighborhood.
+    target_on: bool,
+    target_phase: Vec<u32>,
+    target_epoch: u32,
+    target_assigned: usize,
     // Opt-in clause vivification (see `vivify_pass` for the corpus verdict
     // that keeps this off by default).
     viv_enabled: bool,
@@ -687,6 +708,84 @@ pub struct Solver {
     viv_next_conflicts: u64,
     // Round-robin position in `learnts` where the next pass resumes.
     viv_cursor: usize,
+
+    // === Native GF(2) propagation (see `crate::xorgauss`). ===
+    // Parity rows propagated directly rather than through CNF: a row of
+    // k variables would need 2^(k-1) clauses to encode, so the long
+    // derived rows are only reachable this way. Rows live in a flat
+    // arena; each watches two of its variables, held at the first two
+    // slots of its span exactly like a clause's two watched literals.
+    xor_on: bool,
+    xvars: Vec<u32>,
+    xrows: Vec<(u32, u32, bool)>, // (offset, len, rhs)
+    // Watch lists as intrusive singly-linked lists over TWO flat arrays,
+    // not a `Vec<Vec<_>>` — same reason `WatchArena` exists. Every row
+    // watches exactly two variables, so the link storage is exactly
+    // `2 * rows` and never reallocates: entry `row*2 + slot` corresponds
+    // to row position `off + slot`, `xw_head[var]` starts that variable's
+    // chain, and moving a watch is an unlink/relink of two `u32`s.
+    xw_head: Vec<u32>,
+    xw_next: Vec<u32>,
+    // Trail position up to which XOR watches have been processed. Reset
+    // on backtrack alongside `qhead`.
+    xqhead: usize,
+    xscratch: Vec<Lit>,
+    pub stats_xor_props: u64,
+    pub stats_xor_confl: u64,
+    /// Rows examined — the engine's real work metric, distinct from the
+    /// propagations it yields.
+    pub stats_xor_visits: u64,
+    /// Times conflict analysis resolved against a parity row, i.e. how
+    /// often parity actually participates in a proof. Compared against
+    /// `stats_reason_steps` this says whether the linear part of the
+    /// formula is where the difficulty lives at all.
+    pub stats_xor_reasons: u64,
+    /// Total reason expansions in `analyze` (any reason kind).
+    pub stats_reason_steps: u64,
+
+    // === On-demand augmentation (see `crate::pcaug`). ===
+    // Logically-implied clauses held OUT of the formula until the search
+    // shows it is working inside their region. Banking is free — an
+    // un-injected clause costs no watch, no propagate visit, nothing but
+    // its literals in the arena — which is the whole point: adding all of
+    // them up front measured net-negative because CDCL re-derives the
+    // useful ones itself and the rest just tax propagation.
+    aug_on: bool,
+    // Flat arena of banked clause literals.
+    aug_bank: Vec<Lit>,
+    // (offset, len) of every clause still banked. Injected clauses are
+    // swap-removed, so this stays dense and a sweep is O(live bank).
+    aug_index: Vec<(u32, u32)>,
+    // Conflict count that arms the next injection sweep.
+    aug_next_conflicts: u64,
+    // Copy-out buffer for injection (the bank is moved out during a
+    // sweep, so the clause must be copied before `add_clause_*` runs).
+    aug_scratch: Vec<Lit>,
+    // The WORKING SET: augmentation clauses currently in the formula,
+    // with the bank slot each came from so an evicted clause can be
+    // offered again if its region heats up later.
+    //
+    // Deliberately NOT part of `learnts`: these are allocated as learned
+    // clauses so that `bump_clause_activity` scores them on the hot path
+    // for free, but `reduce_db`'s policy is tuned for derived clauses and
+    // measured hostile to changes, so it never sees them. That makes
+    // this list a `ClauseRef` holder the arena doesn't know about —
+    // `garbage_collect`, `purge_vars` and `rescale_clause_activity` all
+    // have to include it explicitly.
+    aug_live: Vec<AugLive>,
+    // Ceiling on `aug_live`. Seeded from `BINBIT_AUG_SET` for
+    // calibration; settable per solver so tests can exercise the bound
+    // without a process-wide environment race.
+    aug_set_max: usize,
+    /// Return evicted augmentation clauses to the reserve for possible
+    /// re-injection. Off by default — see the eviction site.
+    aug_recycle: bool,
+    /// VSIDS-activity fraction defining "hot" for augmentation injection
+    /// (see [`Solver::inject_hot_augments`]).
+    aug_hot_frac: f64,
+    // Conflicts between sweeps (see `AUG_INTERVAL`), settable for the
+    // same reason.
+    aug_interval: u64,
 
     // === Incremental solving state. ===
     // Literals that must hold for the current solve. Each becomes a pseudo-
@@ -723,11 +822,20 @@ pub struct Solver {
     pub stats_viv_strengthened: u64,
     pub stats_viv_deleted: u64,
     pub stats_viv_units: u64,
+    /// TEMP diagnostic: total literals ever learned (for average length).
+    pub stats_learnt_lits: u64,
     pub stats_learned: u64,
     pub stats_deleted: u64,
     pub stats_reductions: u64,
     pub stats_min_removed: u64,
     pub stats_gcs: u64,
+    /// On-demand augmentation: clauses banked / injected / sweeps run /
+    /// evicted from the working set / re-injected after eviction.
+    pub stats_aug_banked: u64,
+    pub stats_aug_injected: u64,
+    pub stats_aug_sweeps: u64,
+    pub stats_aug_evicted: u64,
+    pub stats_aug_units: u64,
 
     // Sticky: an original clause with >= SEARCH_POS_MIN_LEN literals was
     // added. Arms saved-position replacement scans in propagate.
@@ -805,6 +913,30 @@ impl Solver {
     // at the next restart, when the trail is already torn down to the
     // root), spending at most VIV_BUDGET watcher-visits per pass.
     const VIV_INTERVAL: u64 = 2_000;
+    /// Conflicts between augmentation-injection sweeps. A sweep is one
+    /// linear pass over the live bank, so this trades sweep cost against
+    /// how promptly a newly-hot region gets its clauses.
+    const AUG_INTERVAL: u64 = 2_000;
+    /// Ceiling on clauses injected per sweep — keeps a single sweep from
+    /// dumping the whole bank in when activity spikes broadly.
+    const AUG_MAX_PER_SWEEP: u32 = 512;
+    /// Ceiling on augmentation clauses live in the formula at once. This
+    /// is what stops a long search from draining the whole bank: without
+    /// it, injection is monotonic and every region eventually looks hot,
+    /// so the pass degenerates into adding everything up front. Override
+    /// with [`Solver::set_augmentation_capacity`].
+    const AUG_WORKING_SET: usize = 4_000;
+
+    /// Default for [`Solver::set_augmentation_hot_fraction`].
+    ///
+    /// 0.01 rather than a looser 0.001: a stricter test injects only where
+    /// the search is genuinely contested, and that is what makes this pass
+    /// cooperate with `--aig2` instead of fighting it. Measured 2026-08-06
+    /// on nobranch over 11 seeds, against aig2 alone: at 0.001 augmentation
+    /// is +6.1% conflicts (better on only 3/11 seeds); at 0.01 it is
+    /// **-3.1%** (better on 8/11). On the full symbex corpus the same change
+    /// takes the combination from +8.7% wall over aig2 to +3.5%.
+    pub const AUG_HOT_FRAC: f64 = 0.01;
     const VIV_BUDGET: u64 = 300_000;
     // Only probe quality learnts. Low-LBD clauses are the ones that keep
     // re-propagating — shortening them pays every future visit. Probing
@@ -838,9 +970,37 @@ impl Solver {
             restart: RestartState::new(),
             restart_reuse: false,
             save_phases: true,
+            target_on: false,
+            target_phase: Vec::new(),
+            // Epoch 1, not 0: fresh `target_phase` entries are zero, and a
+            // zero entry must never read as a current target.
+            target_epoch: 1,
+            target_assigned: 0,
             viv_enabled: false,
             viv_next_conflicts: Self::VIV_INTERVAL,
             viv_cursor: 0,
+            aug_on: false,
+            aug_bank: Vec::new(),
+            aug_index: Vec::new(),
+            aug_next_conflicts: Self::AUG_INTERVAL,
+            aug_scratch: Vec::new(),
+            xor_on: false,
+            xvars: Vec::new(),
+            xrows: Vec::new(),
+            xw_head: Vec::new(),
+            xw_next: Vec::new(),
+            xqhead: 0,
+            xscratch: Vec::new(),
+            stats_xor_props: 0,
+            stats_xor_confl: 0,
+            stats_xor_visits: 0,
+            stats_xor_reasons: 0,
+            stats_reason_steps: 0,
+            aug_live: Vec::new(),
+            aug_set_max: Self::AUG_WORKING_SET,
+            aug_recycle: false,
+            aug_hot_frac: Self::AUG_HOT_FRAC,
+            aug_interval: Self::AUG_INTERVAL,
             assumptions: Vec::new(),
             conflict_core: Vec::new(),
             analyze_toclear: Vec::new(),
@@ -856,11 +1016,17 @@ impl Solver {
             stats_viv_strengthened: 0,
             stats_viv_deleted: 0,
             stats_viv_units: 0,
+            stats_learnt_lits: 0,
             stats_learned: 0,
             stats_deleted: 0,
             stats_reductions: 0,
             stats_min_removed: 0,
             stats_gcs: 0,
+            stats_aug_banked: 0,
+            stats_aug_injected: 0,
+            stats_aug_sweeps: 0,
+            stats_aug_evicted: 0,
+            stats_aug_units: 0,
             has_wide_original: false,
             dead: false,
             has_model: false,
@@ -907,6 +1073,20 @@ impl Solver {
     pub fn num_clauses(&self) -> usize {
         self.num_clauses_total as usize
     }
+    /// TEMP diagnostic: (live learnt count, total live learnt literals,
+    /// max length) over the current learnt DB.
+    pub fn learnt_profile(&self) -> (usize, u64, usize) {
+        let mut n = 0usize;
+        let mut lits = 0u64;
+        let mut mx = 0usize;
+        for &cr in &self.learnts {
+            if self.clauses.deleted(cr) { continue; }
+            let l = self.clauses.len(cr);
+            n += 1; lits += l as u64; if l > mx { mx = l; }
+        }
+        (n, lits, mx)
+    }
+
     pub fn num_learnts(&self) -> usize {
         self.learnts.len()
     }
@@ -919,6 +1099,7 @@ impl Solver {
         self.vardata.reserve(num_vars);
         self.activity.reserve(num_vars);
         self.polarity.reserve(num_vars);
+        self.target_phase.reserve(num_vars);
         self.decision.reserve(num_vars);
         self.seen.reserve(num_vars);
         self.lbd_stamp.reserve(num_vars);
@@ -953,6 +1134,7 @@ impl Solver {
             let vi = v.idx();
             self.activity[vi] = 0.0;
             self.polarity[vi] = false;
+            self.target_phase[vi] = 0;
             self.decision[vi] = true;
             self.seen[vi] = false;
             self.lbd_stamp[vi] = 0;
@@ -979,6 +1161,7 @@ impl Solver {
         });
         self.activity.push(0.0);
         self.polarity.push(false);
+        self.target_phase.push(0);
         self.decision.push(true);
         self.seen.push(false);
         self.lbd_stamp.push(0);
@@ -1215,7 +1398,7 @@ impl Solver {
                     if lits.len() >= Self::SEARCH_POS_MIN_LEN {
                         self.has_wide_original = true;
                     }
-                    let cref = self.clauses.alloc(&lits, false);
+                    let cref = self.clauses.alloc(lits, false);
                     self.num_clauses_total += 1;
                     self.watches.push(w0.idx(), Watcher::long(cref, w1));
                     self.watches.push(w1.idx(), Watcher::long(cref, w0));
@@ -1592,6 +1775,18 @@ impl Solver {
                         self.analyze_touch(b, current_level, &mut path_c, &mut learned);
                     }
                 }
+                AnalyzeSrc::Xor(r, skip) => {
+                    let (off, len, _) = self.xrows[r as usize];
+                    for k in off as usize..(off + len) as usize {
+                        let u = self.xvars[k];
+                        if u == skip {
+                            continue;
+                        }
+                        // The literal that is FALSE under u's assignment.
+                        let q = Lit::new(Var(u), self.var_val(u) == LBool::True);
+                        self.analyze_touch(q, current_level, &mut path_c, &mut learned);
+                    }
+                }
             }
 
             first_iter = false;
@@ -1613,6 +1808,7 @@ impl Solver {
                 break;
             }
 
+            self.stats_reason_steps += 1;
             current = match self.vardata[pvi].reason {
                 Reason::Clause(cr) => {
                     // Prefetch the next reason clause. Unlike propagate —
@@ -1627,6 +1823,10 @@ impl Solver {
                     AnalyzeSrc::Clause(cr)
                 }
                 Reason::Binary(other) => AnalyzeSrc::Binary(p, other),
+                Reason::Xor(r) => {
+                    self.stats_xor_reasons += 1;
+                    AnalyzeSrc::Xor(r, pvi as u32)
+                }
                 Reason::Decision => {
                     panic!("analyze walked past a decision without reaching UIP")
                 }
@@ -1751,7 +1951,20 @@ impl Solver {
         // None of these are resized during the walk — `seen`, `vardata`
         // and the clause arena only grow in `new_var` / `add_clause`,
         // neither of which runs mid-analysis.
-        let Solver { seen, vardata, clauses, analyze_stack, analyze_toclear, .. } = self;
+        let Solver {
+            seen,
+            vardata,
+            clauses,
+            analyze_stack,
+            analyze_toclear,
+            xvars,
+            xrows,
+            lit_value,
+            ..
+        } = self;
+        // Scratch for expanding a parity reason (see `Reason::Xor`); reused
+        // across the walk so the expansion allocates at most once.
+        let mut xbuf: Vec<Lit> = Vec::new();
         let seen: &mut [bool] = seen.as_mut_slice();
         let vardata: &[VarInfo] = vardata.as_slice();
 
@@ -1761,6 +1974,7 @@ impl Solver {
             // SAFETY (all unchecked accesses in this loop): every literal
             // here comes from the trail or a live clause, so its variable
             // index is < num_vars == seen.len() == vardata.len().
+            let mut xor_row: Option<u32> = None;
             let (cref_opt, binary_other): (Option<ClauseRef>, Option<Lit>) =
                 match unsafe { vardata.get_unchecked(p.var_idx()) }.reason {
                     // SAFETY: the caller filters decision literals, and we
@@ -1776,7 +1990,25 @@ impl Solver {
                     },
                     Reason::Clause(cr) => (Some(cr), None),
                     Reason::Binary(other) => (None, Some(other)),
+                    Reason::Xor(r) => {
+                        xor_row = Some(r);
+                        (None, None)
+                    }
                 };
+            if let Some(r) = xor_row {
+                // Expand the row into the literals false under the current
+                // assignment, skipping the variable it propagated.
+                let (off, len, _) = xrows[r as usize];
+                xbuf.clear();
+                for k in off as usize..(off + len) as usize {
+                    let u = xvars[k];
+                    if u as usize == p.var_idx() {
+                        continue;
+                    }
+                    let is_true = lit_value[(u as usize) << 1] == LBool::True;
+                    xbuf.push(Lit::new(Var(u), is_true));
+                }
+            }
 
             // Walk the reason's other literals as a SLICE, not by index:
             // the index form paid a `Range` iterator step plus a bounds-
@@ -1784,12 +2016,19 @@ impl Solver {
             // under `analyze`. The binary case borrows a one-element
             // slice from the stack so both shapes share the loop body.
             let binary_buf = [binary_other.unwrap_or(start)];
-            let others: &[Lit] = match binary_other {
-                Some(_) => &binary_buf,
-                // SAFETY: a Reason::Clause is always a long clause (len ≥ 3
-                // — binaries use Reason::Binary, units are enqueued as
-                // Decision at level 0), so index 1 is in bounds.
-                None => unsafe { clauses.lits(cref_opt.unwrap()).get_unchecked(1..) },
+            let others: &[Lit] = if xor_row.is_some() {
+                &xbuf
+            } else {
+                match binary_other {
+                    Some(_) => &binary_buf,
+                    // SAFETY: a Reason::Clause is always a long clause
+                    // (len >= 3 — binaries use Reason::Binary, units are
+                    // enqueued as Decision at level 0), so index 1 is in
+                    // bounds.
+                    None => unsafe {
+                        clauses.lits(cref_opt.unwrap()).get_unchecked(1..)
+                    },
+                }
             };
 
             for &q in others {
@@ -1868,6 +2107,15 @@ impl Solver {
                     // `x` is the trail entry = the literal the caller passed.
                     self.conflict_core.push(x);
                 }
+                Reason::Xor(r) => {
+                    let (off, len, _) = self.xrows[r as usize];
+                    for k in off as usize..(off + len) as usize {
+                        let u = self.xvars[k] as usize;
+                        if u != vx && self.vardata[u].level > 0 {
+                            self.seen[u] = true;
+                        }
+                    }
+                }
                 Reason::Clause(cr) => {
                     let clen = self.clauses.len(cr);
                     for j in 1..clen {
@@ -1916,6 +2164,16 @@ impl Solver {
         if self.decision_level() <= level {
             return;
         }
+        // Target phases snapshot the trail at its deepest, i.e. right
+        // before any teardown shrinks it. Gated on `save_phases` for the
+        // same reason phase saving is: vivification-probe trails are
+        // scheduling artifacts, not search progress.
+        if self.target_on
+            && self.save_phases
+            && self.trail.len() > self.target_assigned
+        {
+            self.save_target();
+        }
         let target = self.trail_lim[level as usize];
         let save_phases = self.save_phases;
         for i in (target..self.trail.len()).rev() {
@@ -1945,6 +2203,8 @@ impl Solver {
         }
         self.trail.truncate(target);
         self.trail_lim.truncate(level as usize);
+        // Same rule as `qhead`: never leave the XOR cursor past the trail.
+        self.xqhead = self.xqhead.min(self.trail.len());
         // `min`, not assignment: incremental `add_clause` rewinds `qhead`
         // below the trail tip to schedule re-discovery of implications its
         // new clauses create under the standing trail — a later cancel
@@ -2025,6 +2285,15 @@ impl Solver {
     fn rescale_clause_activity(&mut self) {
         for i in 0..self.learnts.len() {
             let cr = self.learnts[i];
+            let a = self.clauses.activity(cr);
+            self.clauses.set_activity(cr, a * 1e-20);
+        }
+        // Working-set clauses are learned (so they accumulate activity)
+        // but live outside `learnts`; missing them here would leave their
+        // scores 1e20× too large, re-triggering this rescale on every
+        // subsequent bump.
+        for i in 0..self.aug_live.len() {
+            let cr = self.aug_live[i].cref;
             let a = self.clauses.activity(cr);
             self.clauses.set_activity(cr, a * 1e-20);
         }
@@ -2141,6 +2410,12 @@ impl Solver {
         for cr in self.learnts.iter_mut() {
             *cr = self.clauses.reloc(*cr, &mut to);
         }
+        // The augmentation working set holds ClauseRefs outside
+        // `learnts`, so it must be relocated too or its entries would
+        // dangle into the old arena.
+        for e in self.aug_live.iter_mut() {
+            e.cref = self.clauses.reloc(e.cref, &mut to);
+        }
 
         // Remap the remaining ClauseRef holders. `reloc` is idempotent, so
         // everything already moved just gets its forwarding pointer back.
@@ -2205,6 +2480,7 @@ impl Solver {
             }
         }
         self.learnts.retain(|&cr| !self.clauses.deleted(cr));
+        self.aug_live.retain(|e| !self.clauses.deleted(e.cref));
 
         // Pass 2: drop watchers of deleted clauses, and binary watchers
         // whose either endpoint is marked (each binary counts once, from
@@ -2231,11 +2507,10 @@ impl Solver {
         // assignment (they are facts) but drop the dangling reference.
         for i in 0..self.trail.len() {
             let vi = self.trail[i].var_idx();
-            if let Reason::Clause(cr) = self.vardata[vi].reason {
-                if self.clauses.deleted(cr) {
+            if let Reason::Clause(cr) = self.vardata[vi].reason
+                && self.clauses.deleted(cr) {
                     self.vardata[vi].reason = Reason::Decision;
                 }
-            }
         }
 
         // Marked variables can never be forced again — take them out of
@@ -2404,13 +2679,12 @@ impl Solver {
             self.clauses.mark_deleted(cref);
             return Some(VivOutcome::Removed);
         }
-        let final_len = if conflicted {
-            kept.len()
-        } else if dropped {
-            kept.len()
-        } else {
-            return Some(VivOutcome::Kept); // nothing learned
-        };
+        // Either outcome leaves the shortened clause in `kept`; with
+        // neither, nothing was learned.
+        if !conflicted && !dropped {
+            return Some(VivOutcome::Kept);
+        }
+        let final_len = kept.len();
         if final_len >= len {
             return Some(VivOutcome::Kept); // conflict only on the last literal
         }
@@ -2522,13 +2796,530 @@ impl Solver {
             if self.decision[v as usize]
                 && self.lit_value[(v as usize) << 1] == LBool::Undef
             {
-                let lit = Lit::new(Var(v), !self.polarity[v as usize]);
+                let vi = v as usize;
+                let mut pol = self.polarity[vi];
+                if self.target_on {
+                    let t = self.target_phase[vi];
+                    if t >> 1 == self.target_epoch {
+                        pol = t & 1 != 0;
+                    }
+                }
+                let lit = Lit::new(Var(v), !pol);
                 return Some(lit);
             }
             // Otherwise this variable was assigned since we last saw it; keep
             // popping. (It'll re-enter on the next backtrack.)
         }
         None
+    }
+
+    /// Record the current trail as the new target assignment (deepest
+    /// consistent trail this solve). Cold: fires only when the running
+    /// maximum is beaten, which decays to rare as the maximum climbs.
+    #[cold]
+    fn save_target(&mut self) {
+        self.target_assigned = self.trail.len();
+        let tag = self.target_epoch << 1;
+        for &lit in &self.trail {
+            self.target_phase[lit.var_idx()] = tag | (!lit.is_negated()) as u32;
+        }
+    }
+
+    /// Enable on-demand augmentation (off by default): banked implied
+    /// clauses (see [`Self::bank_implied_clause`]) become eligible for
+    /// injection during search. With this off, `bank_implied_clause` is
+    /// a no-op, so a caller can hand clauses over unconditionally.
+    ///
+    /// The mechanism is source-agnostic — anything that can produce
+    /// implied clauses can use it. Injected clauses are held to a bounded
+    /// working set (see [`Self::set_augmentation_capacity`]) and evicted
+    /// by clause activity, so a long search cannot silently absorb the
+    /// entire reserve. See [`crate::pcaug`] for the measured behaviour of
+    /// its only current client.
+    pub fn set_augmentation(&mut self, on: bool) {
+        self.aug_on = on;
+    }
+
+    /// Hand the solver a clause that is IMPLIED by the current formula —
+    /// adding it changes no model — to hold in reserve. It is not part of
+    /// the formula, watches nothing, and costs nothing in `propagate`
+    /// until a sweep decides the search has moved into its region.
+    ///
+    /// The caller owes the implication: [`crate::pcaug`] derives these
+    /// as prime implicates of small multi-gate cut functions, which unit
+    /// propagation over the gate encoding provably cannot derive on its
+    /// own.
+    pub fn bank_implied_clause(&mut self, lits: &[Lit]) {
+        // Units and empties are never "redundant strengthening" — a
+        // caller handing one over has a bug, and injecting it later
+        // would silently move a root fact.
+        if !self.aug_on || lits.len() < 2 {
+            return;
+        }
+        let off = self.aug_bank.len() as u32;
+        self.aug_bank.extend_from_slice(lits);
+        self.aug_index.push((off, lits.len() as u32));
+        self.stats_aug_banked += 1;
+    }
+
+    /// Augmentation clauses currently live in the formula.
+    pub fn aug_working_set_len(&self) -> usize {
+        self.aug_live.len()
+    }
+
+    /// Ceiling on the augmentation working set (default from
+    /// `BINBIT_AUG_SET`, else 4000).
+    pub fn set_augmentation_capacity(&mut self, n: usize) {
+        self.aug_set_max = n;
+    }
+
+    /// Return evicted augmentation clauses to the reserve so they can be
+    /// re-injected later. Off by default: recycling cycles — a clause
+    /// evicted under capacity pressure is exactly the one the next sweep
+    /// finds hot again.
+    pub fn set_augmentation_recycle(&mut self, on: bool) {
+        self.aug_recycle = on;
+    }
+
+    /// VSIDS-activity fraction defining "hot" for augmentation injection
+    /// (default [`Solver::AUG_HOT_FRAC`], whose doc carries the
+    /// measurement behind that number).
+    pub fn set_augmentation_hot_fraction(&mut self, frac: f64) {
+        self.aug_hot_frac = frac;
+    }
+
+    /// Conflicts between injection/eviction sweeps (default 2000).
+    pub fn set_augmentation_interval(&mut self, n: u64) {
+        self.aug_interval = n.max(1);
+        self.aug_next_conflicts = self.stats_conflicts + self.aug_interval;
+    }
+
+    /// Drop every banked clause. Callers MUST do this whenever variable
+    /// ids can be recycled or defining clauses deleted (binbit: cone
+    /// retirement) — a banked clause names variables, and a recycled id
+    /// means something else entirely.
+    ///
+    /// Only the *reserve* is dropped. Clauses already injected stay in
+    /// the formula — they are implied, and `purge_vars` prunes the ones
+    /// whose variables actually die.
+    pub fn clear_augmentation_bank(&mut self) {
+        self.aug_bank.clear();
+        self.aug_index.clear();
+    }
+
+    /// Inject banked clauses whose variables are all currently hot in
+    /// VSIDS terms — i.e. the search is doing its work inside exactly the
+    /// region the clause short-cuts.
+    ///
+    /// The hotness test is `activity[v] >= var_inc × frac`, which is
+    /// scale-invariant (bumps add `var_inc`, and rescaling divides both
+    /// sides), so it reads as "bumped within the last ~log(frac)/log(decay)
+    /// conflicts" regardless of where the search is. Requiring EVERY
+    /// variable to pass is deliberate: a clause spanning one hot variable
+    /// and three cold ones connects regions the search is not relating,
+    /// and pre-adding those is exactly what made bulk augmentation lose.
+    #[cold]
+    fn inject_hot_augments(&mut self) {
+        debug_assert_eq!(self.decision_level(), 0);
+        self.stats_aug_sweeps += 1;
+
+        // ---- Evict ONLY under capacity pressure.
+        //
+        // A clause earns its place by being used: `bump_clause_activity`
+        // scores it whenever conflict analysis walks it, and activity
+        // decays against `cla_inc`, so the ranking below reads as "least
+        // recently useful". Evicting on a fixed threshold instead was
+        // measured badly wrong — it discarded clauses while the set was
+        // nearly empty (bench_6554 injected 162 and evicted 155,
+        // thrashing to a WORSE result than never evicting at all). Under
+        // the ceiling, keep everything.
+        let want = Self::AUG_MAX_PER_SWEEP as usize;
+        if self.aug_live.len() + want > self.aug_set_max {
+            let target = self.aug_set_max.saturating_sub(want);
+            let n_evict = self.aug_live.len().saturating_sub(target);
+            let mut live = std::mem::take(&mut self.aug_live);
+            // Weakest first. A locked clause is some variable's reason
+            // and cannot be removed, so it is skipped and survives.
+            live.sort_by(|a, b| {
+                let (aa, ab) =
+                    (self.clauses.activity(a.cref), self.clauses.activity(b.cref));
+                aa.partial_cmp(&ab).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut done = 0usize;
+            let mut keep: Vec<AugLive> = Vec::with_capacity(live.len());
+            for e in live {
+                let AugLive { cref, off, len, .. } = e;
+                if done < n_evict && !self.locked(cref) {
+                    self.detach_long(cref);
+                    self.clauses.mark_deleted(cref);
+                    self.stats_aug_evicted += 1;
+                    self.stats_deleted += 1;
+                    // Eviction is TERMINAL by default. Returning the slot
+                    // to the bank sounds right — the region may heat up
+                    // again — but it cycles: the variables that made the
+                    // clause hot are still hot, so it is re-injected at
+                    // the next sweep and evicted again. Measured on
+                    // nobranch: 151,171 evictions against a ceiling of
+                    // 4,000, i.e. the set churning ~38× over, and 781k
+                    // conflicts vs a 628k baseline.
+                    if self.aug_recycle {
+                        self.aug_index.push((off, len));
+                    }
+                    done += 1;
+                } else {
+                    keep.push(e);
+                }
+            }
+            self.aug_live = keep;
+        }
+
+        // ---- Then inject, up to the working-set ceiling.
+        let room = self.aug_set_max.saturating_sub(self.aug_live.len());
+        let budget = room.min(want);
+        if budget == 0 {
+            return;
+        }
+        let thresh = self.var_inc * self.aug_hot_frac;
+        // Move the bank out: injection calls back into `self`.
+        let bank = std::mem::take(&mut self.aug_bank);
+        let mut index = std::mem::take(&mut self.aug_index);
+        let mut scratch = std::mem::take(&mut self.aug_scratch);
+        let mut n = 0usize;
+        let mut i = 0usize;
+        while i < index.len() {
+            let (off, len) = index[i];
+            let lits = &bank[off as usize..(off + len) as usize];
+            if !lits.iter().all(|l| self.activity[l.var_idx()] >= thresh) {
+                i += 1;
+                continue;
+            }
+            scratch.clear();
+            scratch.extend_from_slice(lits);
+            // Swap-remove before injecting: an offer is consumed here and
+            // only returns to the bank via eviction.
+            index.swap_remove(i);
+            match self.inject_at_root(&scratch) {
+                Some(cref) => {
+                    self.aug_live.push(AugLive { cref, off, len });
+                    self.stats_aug_injected += 1;
+                    n += 1;
+                }
+                None => {
+                    // Became a root unit or was already satisfied — a
+                    // strengthening, not a working-set member.
+                    self.stats_aug_injected += 1;
+                }
+            }
+            if n >= budget || self.dead {
+                break;
+            }
+        }
+        self.aug_bank = bank;
+        self.aug_index = index;
+        self.aug_scratch = scratch;
+    }
+
+
+    /// Install the parity rows to propagate natively. Rows shorter than
+    /// three variables are not accepted: units and equivalences are
+    /// emitted as clauses, where CNF propagation already handles them.
+    pub fn set_xor_rows(&mut self, rows: &[(Vec<u32>, bool)]) {
+        self.xvars.clear();
+        self.xrows.clear();
+        let nvars = self.lit_value.len() >> 1;
+        self.xw_head.clear();
+        self.xw_head.resize(nvars, u32::MAX);
+        self.xw_next.clear();
+        for (vars, rhs) in rows {
+            if vars.len() < 3 {
+                continue;
+            }
+            let off = self.xvars.len() as u32;
+            self.xvars.extend_from_slice(vars);
+            let id = self.xrows.len() as u32;
+            self.xrows.push((off, vars.len() as u32, *rhs));
+            // Two link slots per row; watch its first two variables.
+            for k in 0..2u32 {
+                let v = self.xvars[(off + k) as usize] as usize;
+                let e = id * 2 + k;
+                debug_assert_eq!(self.xw_next.len(), e as usize);
+                self.xw_next.push(self.xw_head[v]);
+                self.xw_head[v] = e;
+            }
+        }
+        self.xor_on = !self.xrows.is_empty();
+        self.xqhead = 0;
+    }
+
+    #[inline(always)]
+    fn var_val(&self, v: u32) -> LBool {
+        // SAFETY: every variable reaching the parity engine came from a
+        // row installed over the current variable space.
+        unsafe { *self.lit_value.get_unchecked((v as usize) << 1) }
+    }
+
+    fn propagate_with_xor(&mut self) -> Option<PropConflict> {
+        loop {
+            if let Some(c) = self.propagate() {
+                return Some(c);
+            }
+            if !self.xor_on {
+                return None;
+            }
+            let before = self.trail.len();
+            if let Some(c) = self.xor_propagate() {
+                return Some(c);
+            }
+            if self.trail.len() == before {
+                return None;
+            }
+        }
+    }
+
+    /// One pass of watched-variable parity propagation over the trail
+    /// entries not yet seen.
+    ///
+    /// Walks each newly-assigned variable's intrusive watch chain. A row
+    /// whose watched variable just became assigned either re-watches an
+    /// unassigned variable (unlink/relink, no allocation), forces its one
+    /// remaining free variable, or — fully assigned — is satisfied or
+    /// refuted.
+    fn xor_propagate(&mut self) -> Option<PropConflict> {
+        while self.xqhead < self.trail.len() {
+            let v = self.trail[self.xqhead].var_idx();
+            self.xqhead += 1;
+            if v >= self.xw_head.len() {
+                continue;
+            }
+            let mut e = self.xw_head[v];
+            let mut prev = u32::MAX;
+            while e != u32::MAX {
+                self.stats_xor_visits += 1;
+                let r = (e >> 1) as usize;
+                let slot = (e & 1) as usize;
+                // SAFETY: `e` is a live link id, so `e >> 1` indexes a row
+                // installed by `set_xor_rows`.
+                let (off, len, rhs) = unsafe { *self.xrows.get_unchecked(r) };
+                let s = off as usize;
+                let end = s + len as usize;
+                let next = unsafe { *self.xw_next.get_unchecked(e as usize) };
+                debug_assert_eq!(self.xvars[s + slot] as usize, v);
+
+                // Look for an unassigned variable to re-watch. A
+                // saved-position scan (as `propagate` uses on wide
+                // clauses) was tried here and measured MORE row visits,
+                // 117M -> 160M: it changes which variables end up watched,
+                // so it is a trajectory change rather than a speedup, and
+                // these rows are short enough (<= 15) that the plain scan
+                // is not the cost.
+                let mut moved = u32::MAX;
+                for k in (s + 2)..end {
+                    // SAFETY: k < end <= xvars.len() by row construction.
+                    let u = unsafe { *self.xvars.get_unchecked(k) };
+                    if self.var_val(u) == LBool::Undef {
+                        self.xvars.swap(s + slot, k);
+                        moved = u;
+                        break;
+                    }
+                }
+                if moved != u32::MAX {
+                    // Unlink from v, push onto the new watcher's chain.
+                    if prev == u32::MAX {
+                        self.xw_head[v] = next;
+                    } else {
+                        self.xw_next[prev as usize] = next;
+                    }
+                    let mu = moved as usize;
+                    self.xw_next[e as usize] = self.xw_head[mu];
+                    self.xw_head[mu] = e;
+                    e = next;
+                    continue;
+                }
+
+                // The other watched slot holds the only possible free var.
+                let other = unsafe { *self.xvars.get_unchecked(s + (slot ^ 1)) };
+                if self.var_val(other) == LBool::Undef {
+                    let mut parity = false;
+                    for k in s..end {
+                        let u = unsafe { *self.xvars.get_unchecked(k) };
+                        if u != other {
+                            parity ^= self.var_val(u) == LBool::True;
+                        }
+                    }
+                    let val = rhs ^ parity;
+                    self.stats_xor_props += 1;
+                    let lit = Lit::new(Var(other), !val);
+                    if !self.enqueue(lit, Reason::Xor(r as u32)) {
+                        return Some(self.xor_conflict_clause(s, end));
+                    }
+                } else {
+                    let mut parity = false;
+                    for k in s..end {
+                        let u = unsafe { *self.xvars.get_unchecked(k) };
+                        parity ^= self.var_val(u) == LBool::True;
+                    }
+                    if parity != rhs {
+                        self.stats_xor_confl += 1;
+                        return Some(self.xor_conflict_clause(s, end));
+                    }
+                }
+                prev = e;
+                e = next;
+            }
+        }
+        None
+    }
+
+    /// Materialize a refuted row as a conflict clause (every literal
+    /// false).
+    fn xor_conflict_clause(&mut self, s: usize, e: usize) -> PropConflict {
+        let mut lits = std::mem::take(&mut self.xscratch);
+        lits.clear();
+        let mut order: Vec<(i32, Lit)> = Vec::with_capacity(e - s);
+        for k in s..e {
+            let u = self.xvars[k];
+            let a = self.var_val(u) == LBool::True;
+            order.push((self.vardata[u as usize].level, Lit::new(Var(u), a)));
+        }
+        // Watch the two deepest literals.
+        order.sort_by_key(|&(l, _)| std::cmp::Reverse(l));
+        lits.extend(order.into_iter().map(|(_, l)| l));
+        let (w0, w1) = (lits[0], lits[1]);
+        let cref = self.clauses.alloc(&lits, true);
+        self.num_clauses_total += 1;
+        self.clauses.set_lbd(cref, lits.len() as u32);
+        self.clauses.set_activity(cref, self.cla_inc as f32);
+        self.learnts.push(cref);
+        self.watches.push(w0.idx(), Watcher::long(cref, w1));
+        self.watches.push(w1.idx(), Watcher::long(cref, w0));
+        self.xscratch = lits;
+        PropConflict::Clause(cref)
+    }
+
+    /// Attach an implied clause at decision level 0 and return its ref.
+    ///
+    /// Allocated as LEARNED so conflict analysis scores it (see
+    /// `aug_live`), but deliberately kept out of `self.learnts`. At level
+    /// 0 every surviving literal is unassigned, so watch placement is the
+    /// first two — no need for the general `add_clause` trail analysis.
+    /// Returns `None` when the clause collapses to a unit (enqueued as a
+    /// root fact — a genuine strengthening) or is already satisfied.
+    fn inject_at_root(&mut self, lits: &[Lit]) -> Option<ClauseRef> {
+        debug_assert_eq!(self.decision_level(), 0);
+        let mut scratch = std::mem::take(&mut self.clause_scratch);
+        scratch.clear();
+        scratch.extend_from_slice(lits);
+        // Sort + dedup + tautology check, exactly as `add_clause_inner`
+        // does. NOT optional: distinct AIG nodes can share a SAT literal
+        // (FRAIG aliasing binds several nodes to one variable), so a cut
+        // whose leaves collide yields a clause with a repeated literal —
+        // and watching one literal twice corrupts the two-watch
+        // invariant, which showed up as propagation reading freed
+        // clauses and analyze walking past a decision.
+        scratch.sort_unstable_by_key(|l| l.0);
+        let mut taut = false;
+        let mut j = 0usize;
+        let mut i = 0usize;
+        while i < scratch.len() {
+            let li = scratch[i];
+            if i + 1 < scratch.len() && li.var() == scratch[i + 1].var() {
+                if li.is_negated() != scratch[i + 1].is_negated() {
+                    taut = true;
+                    break;
+                }
+                i += 1; // duplicate literal — keep one copy
+                continue;
+            }
+            match self.value_fixed(li) {
+                LBool::True => {
+                    taut = true; // root-satisfied; nothing to add
+                    break;
+                }
+                LBool::False => i += 1,
+                LBool::Undef => {
+                    scratch[j] = li;
+                    j += 1;
+                    i += 1;
+                }
+            }
+        }
+        if taut {
+            self.clause_scratch = scratch;
+            return None;
+        }
+        scratch.truncate(j);
+        let out = match scratch.len() {
+            0 => {
+                // An implied clause falsified at the root means the
+                // formula was already unsatisfiable.
+                self.dead = true;
+                None
+            }
+            1 => {
+                self.stats_aug_units += 1;
+                let u = scratch[0];
+                if !self.enqueue(u, Reason::Decision) {
+                    self.dead = true;
+                }
+                None
+            }
+            2 => {
+                // Binaries skip the arena entirely in this solver and live
+                // as inline watcher pairs (see `add_clause_inner`);
+                // allocating one as a long clause corrupts propagation.
+                // They have no ClauseRef, so they cannot join the working
+                // set — which is fine: a binary is the cheapest clause
+                // there is and never worth evicting.
+                let (a, b) = (scratch[0], scratch[1]);
+                self.watches.push(a.idx(), Watcher::binary(b));
+                self.watches.push(b.idx(), Watcher::binary(a));
+                None
+            }
+            _ => {
+                let w0 = scratch[0];
+                let w1 = scratch[1];
+                let cref = self.clauses.alloc(&scratch, true);
+                self.num_clauses_total += 1;
+                self.clauses.set_lbd(cref, scratch.len().min(u32::MAX as usize) as u32);
+                // Start at the current increment: one interval of grace
+                // before the eviction test can fire.
+                self.clauses.set_activity(cref, self.cla_inc as f32);
+                self.watches.push(w0.idx(), Watcher::long(cref, w1));
+                self.watches.push(w1.idx(), Watcher::long(cref, w0));
+                Some(cref)
+            }
+        };
+        self.clause_scratch = scratch;
+        out
+    }
+
+    /// Remove a long clause's two watch entries. Positions 0/1 hold the
+    /// watched literals — the propagate loop maintains that invariant.
+    fn detach_long(&mut self, cref: ClauseRef) {
+        let w0 = self.clauses.get_lit(cref, 0);
+        let w1 = self.clauses.get_lit(cref, 1);
+        self.watches
+            .retain(w0.idx(), |w| w.is_binary() || w.long_cref() != cref);
+        self.watches
+            .retain(w1.idx(), |w| w.is_binary() || w.long_cref() != cref);
+    }
+
+    /// Enable Kissat-style target phases (off by default). When on,
+    /// branching prefers the polarity a variable held in the deepest
+    /// consistent trail of the current solve, falling back to the saved
+    /// phase for variables that trail never assigned.
+    ///
+    /// **Off by default — measured net-negative on the symbex corpus
+    /// (2026-08-06).** SAT instances split (bench_5906 −47%, bench_10194
+    /// −72%, but bench_16728 +24%); UNSAT instances lose badly
+    /// (bench_7373 1.8k → 128k conflicts, bench_6554 3.2×) — steering
+    /// toward the deepest trail is exactly wrong when no model exists.
+    /// nobranch lands inside its seed-noise band (663k vs 628k, band
+    /// 551k–675k). Kissat only consults targets in *stable* mode and
+    /// binbit has no mode alternation (measured negative separately), so
+    /// the pairing that makes them pay isn't available here.
+    pub fn set_target_phases(&mut self, on: bool) {
+        self.target_on = on;
     }
 
     /// Reuse-trail on restart (van der Tak / Ramos / Heule, JSAT'11 —
@@ -2596,6 +3387,29 @@ impl Solver {
     /// callers who want to experiment. Best called once, after all input
     /// clauses are loaded but before the first `solve*` — phase saving will
     /// then carry the seed forward across incremental queries.
+    /// Portfolio diversification: randomize the initial saved phase of
+    /// every variable from `seed` (xorshift64*). This is the standard
+    /// knob parallel portfolios vary across threads — on a satisfiable
+    /// instance the search is a hunt for a witness, so different starting
+    /// phases explore different parts of the space and the ensemble's
+    /// *minimum* runtime can be far below the median. `seed == 0` leaves
+    /// the historical all-false initialization untouched.
+    ///
+    /// Call after the formula is loaded (phases are per-variable) and
+    /// before the first `solve`.
+    pub fn diversify_phases(&mut self, seed: u64) {
+        if seed == 0 {
+            return;
+        }
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        for p in self.polarity.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *p = (s >> 33) & 1 == 1;
+        }
+    }
+
     pub fn init_polarity_jw(&mut self) {
         let n = self.polarity.len();
         if n == 0 {
@@ -2819,6 +3633,17 @@ impl Solver {
         self.assumptions.extend_from_slice(&assumptions[shared..]);
         self.conflict_core.clear();
         self.restart.on_new_solve();
+        // Fresh solve, fresh target race: stale targets from a different
+        // assumption set shouldn't steer this one. O(1) via epoch bump;
+        // on (unrealistic) tag exhaustion, hard-clear and rewind.
+        if self.target_on {
+            self.target_assigned = 0;
+            self.target_epoch += 1;
+            if self.target_epoch >= u32::MAX >> 1 {
+                self.target_epoch = 1;
+                self.target_phase.iter_mut().for_each(|t| *t = 0);
+            }
+        }
 
         // Fresh DB reduction budget sized by the current (post-learning)
         // clause count. Running this per call lets long incremental sessions
@@ -2841,7 +3666,7 @@ impl Solver {
         }
 
         loop {
-            if let Some(confl) = self.propagate() {
+            if let Some(confl) = self.propagate_with_xor() {
                 self.stats_conflicts += 1;
 
                 if self.decision_level() == 0 {
@@ -2850,6 +3675,7 @@ impl Solver {
                 }
 
                 let (learned, btlevel, lbd) = self.analyze(confl);
+                self.stats_learnt_lits += learned.len() as u64;
                 self.restart.on_conflict(lbd, self.trail.len() as u64);
                 self.stats_learned += 1;
                 self.cancel_until(btlevel);
@@ -2920,6 +3746,23 @@ impl Solver {
                         self.viv_next_conflicts =
                             self.stats_conflicts + Self::VIV_INTERVAL;
                         if self.vivify_pass() {
+                            return Some(SolveResult::Unsat);
+                        }
+                    }
+                    // Augmentation injection rides the same restart
+                    // boundary, for the same reason: the trail is already
+                    // at the root, so attaching clauses costs no teardown
+                    // and every literal is unassigned (no watch-placement
+                    // subtleties, no level inflation).
+                    if self.aug_on
+                        && !self.aug_index.is_empty()
+                        && self.decision_level() == 0
+                        && self.stats_conflicts >= self.aug_next_conflicts
+                    {
+                        self.aug_next_conflicts =
+                            self.stats_conflicts + self.aug_interval;
+                        self.inject_hot_augments();
+                        if self.dead {
                             return Some(SolveResult::Unsat);
                         }
                     }
@@ -3140,6 +3983,8 @@ enum AnalyzeSrc {
     // Binary reason: resolving on literal at position 0, keeping position 1.
     // Stored as (pivot, other) so we know which to skip.
     Binary(Lit, Lit),
+    // Parity row `.0`, resolving on (and therefore skipping) variable `.1`.
+    Xor(u32, u32),
 }
 
 /// Prefetch an arbitrary slice slot's cache line — companion to
@@ -3175,6 +4020,16 @@ fn prefetch_slot<T>(heap: &[T], idx: usize) {
         }
     }
 }
+
+/// One live augmentation clause: its ref plus the bank slot it came
+/// from, so eviction can optionally return the slot to the reserve.
+#[derive(Clone, Copy)]
+struct AugLive {
+    cref: ClauseRef,
+    off: u32,
+    len: u32,
+}
+
 
 /// Hint the CPU to start loading the `lit_value` byte at `idx` into L1.
 /// Companion to `ClauseArena::prefetch` — used during `propagate` to

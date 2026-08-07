@@ -26,11 +26,10 @@ fn input_bv_var_bits_are_tagged() {
     // Walk every SAT var and collect origins that are BvBit on `x`.
     let mut seen_bits: Vec<u32> = Vec::new();
     for i in 0..s.num_sat_vars() {
-        if let VarOrigin::BvBit { term, bit } = s.var_origin(Var(i as u32)) {
-            if term == x {
+        if let VarOrigin::BvBit { term, bit } = s.var_origin(Var(i as u32))
+            && term == x {
                 seen_bits.push(bit);
             }
-        }
     }
     seen_bits.sort();
     assert_eq!(seen_bits, vec![0, 1, 2, 3, 4, 5, 6, 7]);
@@ -45,12 +44,11 @@ fn bool_var_is_tagged() {
 
     let mut found_p = false;
     for i in 0..s.num_sat_vars() {
-        if let VarOrigin::Bool { term } = s.var_origin(Var(i as u32)) {
-            if term == p {
+        if let VarOrigin::Bool { term } = s.var_origin(Var(i as u32))
+            && term == p {
                 found_p = true;
                 break;
             }
-        }
     }
     assert!(found_p, "expected a Bool-tagged SAT var for p");
 }
@@ -225,10 +223,15 @@ fn symex_style_ite_chain_shares_sel_grouping() {
     let inner1 = s.bv_ite(is1, v1, inner2);
     let read = s.bv_ite(is0, v0, inner1);
 
-    // Assert something so bitblasting runs.
-    let expected = s.bv_const(42, 8);
-    let eq = s.bv_eq(read, expected);
-    s.assert(eq);
+    // Assert something so bitblasting runs. Deliberately an inequality
+    // rather than `read = 42`: `bv_eq` pushes a constant equality through
+    // an ite chain (see `EQ_ITE_MAX_NODES` and `tests/eq_rewrites.rs`),
+    // dissolving the mux into per-branch comparisons. That is the better
+    // encoding, but it leaves no ITE gates to group and would make this
+    // test vacuous. `bvult` keeps the mux, which is what's under test here.
+    let bound = s.bv_const(42, 8);
+    let lt = s.bv_ult(read, bound);
+    s.assert(lt);
     solve_sat(&mut s);
 
     // We expect ITE gates to be grouped by `source_term` — three source

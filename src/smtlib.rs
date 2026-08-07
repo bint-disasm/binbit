@@ -160,12 +160,12 @@ impl<'a, 's> Runner<'a, 's> {
         let list = match expr {
             SExpr::List(xs) => xs,
             SExpr::Atom(_) => {
-                return Err(format!("expected a command S-expression, got atom"));
+                return Err("expected a command S-expression, got atom".to_string());
             }
         };
         let head = match list.first() {
             Some(SExpr::Atom(s)) => *s,
-            _ => return Err(format!("empty command")),
+            _ => return Err("empty command".to_string()),
         };
 
         match head {
@@ -522,11 +522,10 @@ impl<'a, 's> Runner<'a, 's> {
         }
 
         // Named symbol lookup: first in local let bindings, then globals.
-        if let Some(stack) = self.let_bindings.get(s) {
-            if let Some(&t) = stack.last() {
+        if let Some(stack) = self.let_bindings.get(s)
+            && let Some(&t) = stack.last() {
                 return Ok(t);
             }
-        }
         if let Some(&t) = self.symbols.get(s) {
             // First resolution commits this name to its current binding —
             // subsequent (assert (= s expr)) cannot safely substitute any more,
@@ -923,7 +922,7 @@ impl<'a, 's> Runner<'a, 's> {
             let w: u32 = atom(rest.get(1))?
                 .parse()
                 .map_err(|e| format!("bad width: {}", e))?;
-            if w < 1 || w > bv::MAX_BV_WIDTH {
+            if !(1..=bv::MAX_BV_WIDTH).contains(&w) {
                 return Err(format!("width {} out of range 1..={}", w, bv::MAX_BV_WIDTH));
             }
             if w <= 128 {
@@ -1137,8 +1136,8 @@ impl<'a, 's> Runner<'a, 's> {
     fn assert_body(&mut self, body_expr: &SExpr<'s>) -> Result<(), String> {
         // `(and P1 P2 ... Pn)` at the top level: recurse on each conjunct.
         // `(and)` = true, `(and P)` = P — both handled by the general loop.
-        if let SExpr::List(xs) = body_expr {
-            if let Some(SExpr::Atom(head)) = xs.first() {
+        if let SExpr::List(xs) = body_expr
+            && let Some(SExpr::Atom(head)) = xs.first() {
                 if *head == "and" {
                     for arg in &xs[1..] {
                         self.assert_body(arg)?;
@@ -1147,10 +1146,10 @@ impl<'a, 's> Runner<'a, 's> {
                 }
                 // `(not (or P1 P2 ...))` = `(and (not P1) (not P2) ...)` —
                 // De Morgan gives us another decomposition opportunity.
-                if *head == "not" && xs.len() == 2 {
-                    if let SExpr::List(inner) = &xs[1] {
-                        if let Some(SExpr::Atom(ih)) = inner.first() {
-                            if *ih == "or" {
+                if *head == "not" && xs.len() == 2
+                    && let SExpr::List(inner) = &xs[1]
+                        && let Some(SExpr::Atom(ih)) = inner.first()
+                            && *ih == "or" {
                                 for arg in &inner[1..] {
                                     let negated = SExpr::List(vec![
                                         SExpr::Atom("not"),
@@ -1160,11 +1159,7 @@ impl<'a, 's> Runner<'a, 's> {
                                 }
                                 return Ok(());
                             }
-                        }
-                    }
-                }
             }
-        }
         // Top-level equality substitution.
         if let Some((name, rhs_expr)) = self.match_substitution(body_expr) {
             let name = name.to_string();
@@ -1295,16 +1290,15 @@ impl<'a, 's> Runner<'a, 's> {
                 _ => {
                     // Check the `(_ bv1 1)` / `(_ bv0 1)` form too.
                     let is_bv1_const = |e: &SExpr| -> Option<bool> {
-                        if let SExpr::List(xs) = e {
-                            if xs.len() == 3 {
-                                if let (
+                        if let SExpr::List(xs) = e
+                            && xs.len() == 3
+                                && let (
                                     Some(SExpr::Atom(underscore)),
                                     Some(SExpr::Atom(numname)),
                                     Some(SExpr::Atom(w)),
                                 ) = (xs.first(), xs.get(1), xs.get(2))
-                                {
-                                    if *underscore == "_" && *w == "1" {
-                                        if let Some(num) = numname.strip_prefix("bv") {
+                                    && *underscore == "_" && *w == "1"
+                                        && let Some(num) = numname.strip_prefix("bv") {
                                             if num == "0" {
                                                 return Some(false);
                                             }
@@ -1312,10 +1306,6 @@ impl<'a, 's> Runner<'a, 's> {
                                                 return Some(true);
                                             }
                                         }
-                                    }
-                                }
-                            }
-                        }
                         None
                     };
                     let r1 = is_bv1_const(&inner_xs[2]);
@@ -1332,7 +1322,7 @@ impl<'a, 's> Runner<'a, 's> {
             _ => return None,
         };
         // Shadowing check — let binds must not capture `name`.
-        if self.let_bindings.get(name).map_or(false, |s| !s.is_empty()) {
+        if self.let_bindings.get(name).is_some_and(|s| !s.is_empty()) {
             return None;
         }
         if !self.declared.contains(name) {
@@ -1402,7 +1392,7 @@ impl<'a, 's> Runner<'a, 's> {
         let rname = name_of(&xs[2])?;
         // Names shadowed by a `let` binding aren't eligible.
         let shadowed = |m: &HashMap<String, Vec<TaggedTerm>>, n: &str| {
-            m.get(n).map_or(false, |s| !s.is_empty())
+            m.get(n).is_some_and(|s| !s.is_empty())
         };
         if shadowed(&self.let_bindings, &lname) || shadowed(&self.let_bindings, &rname) {
             return None;
@@ -1460,7 +1450,7 @@ impl<'a, 's> Runner<'a, 's> {
             // let-scoped names never enter `self.declared`, but a name might
             // coincidentally shadow a declared symbol; in that case we must
             // not substitute, because the let wins.
-            if self.let_bindings.get(name).map_or(false, |s| !s.is_empty()) {
+            if self.let_bindings.get(name).is_some_and(|s| !s.is_empty()) {
                 return None;
             }
             if !self.declared.contains(name) {
@@ -1494,13 +1484,11 @@ fn extract_named<'x, 'y>(expr: &'x SExpr<'y>) -> Option<(&'x SExpr<'y>, &'y str)
     let inner = xs.get(1)?;
     let mut i = 2;
     while i < xs.len() {
-        if let SExpr::Atom(k) = &xs[i] {
-            if *k == ":named" {
-                if let SExpr::Atom(name) = xs.get(i + 1)? {
+        if let SExpr::Atom(k) = &xs[i]
+            && *k == ":named"
+                && let SExpr::Atom(name) = xs.get(i + 1)? {
                     return Some((inner, *name));
                 }
-            }
-        }
         // Skip over any other `:key value` attribute pair.
         i += 2;
     }
@@ -1660,7 +1648,7 @@ fn format_bv_value(limbs: &[u64], w: u32) -> String {
         return format!("(_ bv{} {})", v, w);
     }
     // Hex rendering, MSB-first, padded to (w + 3) / 4 nibbles.
-    let total_nibs = ((w + 3) / 4) as usize;
+    let total_nibs = w.div_ceil(4) as usize;
     let mut s = String::with_capacity(total_nibs + 2);
     s.push_str("#x");
     for i in (0..total_nibs).rev() {
@@ -1679,7 +1667,7 @@ fn format_bv_value(limbs: &[u64], w: u32) -> String {
 // ==================== Wide-literal parsing helpers ====================
 
 fn limbs_for_width(w: u32) -> usize {
-    ((w as usize) + 63) / 64
+    (w as usize).div_ceil(64)
 }
 
 /// Parse a binary string (MSB-first, no `#b` prefix) into little-endian limbs.
@@ -1746,7 +1734,7 @@ fn parse_decimal_to_limbs(s: &str, w: u32) -> Result<Vec<u64>, String> {
         }
     }
     // Mask top limb to the target width.
-    if w % 64 != 0 {
+    if !w.is_multiple_of(64) {
         let top = nlimbs - 1;
         let mask = (1u64 << (w % 64)) - 1;
         let kept = limbs[top] & mask;

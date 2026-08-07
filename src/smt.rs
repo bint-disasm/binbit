@@ -71,6 +71,11 @@ pub enum VarOrigin {
 /// leave gate-shaped while protecting the genuinely wide covers.
 const CUT_BVE_MAX_CLAUSES: usize = 4;
 
+/// Row-length cap for GF(2) elimination (see `crate::xorgauss::solve`).
+/// XORing sparse rows causes fill-in; without a cap a large circuit's
+/// system degenerates into dense linear algebra.
+const XOR_MAX_ROW_LEN: usize = 32;
+
 /// Which gate produced a SAT variable. Kept deliberately small so that
 /// downstream code can `match` exhaustively. With the AIG pipeline, `And`
 /// covers plain AND nodes; `Xor` / `Ite` cover the pattern-mapped 3-node
@@ -123,6 +128,11 @@ pub struct SmtSolverStats {
     pub viv_strengthened: u64,
     pub viv_deleted: u64,
     pub viv_units: u64,
+    /// TEMP diagnostics on the learned-clause database.
+    pub learnt_avg_len: f64,
+    pub learnt_live: usize,
+    pub learnt_live_lits: u64,
+    pub learnt_max_len: usize,
     /// Flush-phase wall clocks (seconds): term-level front end, AIG
     /// bitblast + CNF emission, CNF preprocessing, SAT search.
     pub time_front: f64,
@@ -233,9 +243,186 @@ impl CnfBuffer {
     }
 }
 
+/// Sentinel for "this term has no counterpart in the fork yet". Term ids
+/// are arena indices, so `u32::MAX` is unreachable as a real handle.
+const FORK_UNMAPPED: u32 = u32::MAX;
+
+/// Work item for [`SmtSolver::fork_terms`]'s traversal. BV and Bool terms
+/// live in separate arenas but reference each other (`Ite`'s condition,
+/// `Eq`'s operands), so one stack has to carry both.
+enum ForkFrame {
+    Bv(BvTerm),
+    Bool(BoolTerm),
+}
+
+/// A fresh solver holding a rebuilt copy of some other solver's terms,
+/// plus the translation between the two sets of handles. Produced by
+/// [`SmtSolver::fork_terms`] — see that method for what it is for, and for
+/// the measured reason a symbolic executor should not reach for it.
+///
+/// Handles are **not** interchangeable across the boundary: rebuilding
+/// re-runs the term constructors, so the copy is independently rewritten
+/// and hash-consed. Always translate.
+pub struct TermFork {
+    solver: SmtSolver,
+    bv_map: Vec<u32>,
+    bool_map: Vec<u32>,
+}
+
+impl TermFork {
+    /// Translate a BV handle from the source solver into this one, or
+    /// `None` if that term wasn't reachable from the roots.
+    pub fn bv(&self, source: BvTerm) -> Option<BvTerm> {
+        match self.bv_map.get(source.0 as usize) {
+            Some(&m) if m != FORK_UNMAPPED => Some(BvTerm(m)),
+            _ => None,
+        }
+    }
+
+    /// Translate a Bool handle from the source solver into this one, or
+    /// `None` if that term wasn't reachable from the roots.
+    pub fn boolean(&self, source: BoolTerm) -> Option<BoolTerm> {
+        match self.bool_map.get(source.0 as usize) {
+            Some(&m) if m != FORK_UNMAPPED => Some(BoolTerm(m)),
+            _ => None,
+        }
+    }
+
+    /// The rebuilt solver. It arrives configured exactly like its source;
+    /// adjust here for differences you actually intend.
+    pub fn solver(&mut self) -> &mut SmtSolver {
+        &mut self.solver
+    }
+
+    /// Assert the translation of every root in `roots`. Roots handed to
+    /// [`SmtSolver::fork_terms`] always translate; anything else is
+    /// silently skipped, and the count of what was actually asserted comes
+    /// back so a caller can check.
+    pub fn assert_translated(&mut self, roots: &[BoolTerm]) -> usize {
+        let mut n = 0;
+        for &r in roots {
+            if let Some(t) = self.boolean(r) {
+                self.solver.assert(t);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Take the solver, dropping the translation tables. Do this once
+    /// you've translated every handle you still need — the maps are the
+    /// only way back and they go away with the fork.
+    pub fn into_solver(self) -> SmtSolver {
+        self.solver
+    }
+}
+
+/// Every tuning switch a solver carries, recorded by the `set_*` methods
+/// as they run.
+///
+/// It exists so a *derived* solver can be configured identically to the one
+/// it came from. The switches themselves live in four different places —
+/// `SmtSolver`'s own fields, the term context, the AIG, and the SAT core —
+/// and the sub-objects expose no getters, so there is no way to read a
+/// solver's configuration back out after the fact. Recording it at the
+/// setter is the cheap fix.
+///
+/// Defaults mirror `SmtSolver::new`. A field added here must be set by its
+/// `set_*` method and applied by [`SmtSolver::apply_config`], or a fork
+/// silently diverges from its source — `config_records_every_setter` in
+/// `tests/fork_terms.rs` fails if a setter forgets to record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SolverConfig {
+    pub normalization: bool,
+    pub substitution: bool,
+    pub gaussian: bool,
+    pub bve: bool,
+    pub eq_ite_pushdown: bool,
+    pub core_tracking: bool,
+    pub cone_retirement: bool,
+    pub cnf_mapping: bool,
+    pub cnf_mapping_full: bool,
+    pub ite_branching_hints: bool,
+    pub aig_two_level: bool,
+    pub aig_two_level_subst: bool,
+    pub aig_two_level_post: bool,
+    pub fraig: bool,
+    pub ve_gate_subst: Option<bool>,
+    pub input_branching: u8,
+    pub phase_seed: u64,
+    pub aig_rewrite: bool,
+    pub vivification: bool,
+    pub target_phases: bool,
+    pub xor_reasoning: bool,
+    pub pcaug: bool,
+    pub pcaug_lazy: bool,
+    /// `None` means "never set" — leave the derived solver's own default.
+    pub pcaug_capacity: Option<usize>,
+    pub pcaug_interval: Option<u64>,
+    /// Propagate long derived parity rows natively in the SAT core.
+    pub xor_native: bool,
+    /// Longest derived parity row to materialize as CNF (0 = none).
+    pub xor_emit_len: usize,
+    /// Per-batch ceiling on derived augmentation clauses.
+    pub pcaug_budget: usize,
+    /// Parent-count ceiling for two-level AIG substitution.
+    pub aig_subst_share_limit: u32,
+    /// Emit full prime covers instead of ISOP covers when CNF mapping.
+    pub cnf_prime_emission: bool,
+    /// Shortest derived parity row propagated natively rather than encoded.
+    pub xor_native_min: usize,
+    /// Recycle evicted augmentation clauses back into the reserve.
+    pub aug_recycle: bool,
+    /// VSIDS-activity fraction defining "hot" for augmentation injection.
+    pub aug_hot_frac: f64,
+}
+
+impl Default for SolverConfig {
+    fn default() -> Self {
+        Self {
+            normalization: true,
+            substitution: true,
+            gaussian: true,
+            bve: true,
+            eq_ite_pushdown: false,
+            core_tracking: true,
+            cone_retirement: false,
+            cnf_mapping: false,
+            cnf_mapping_full: false,
+            ite_branching_hints: true,
+            aig_two_level: false,
+            aig_two_level_subst: false,
+            aig_two_level_post: false,
+            fraig: false,
+            ve_gate_subst: None,
+            input_branching: 0,
+            phase_seed: 0,
+            aig_rewrite: false,
+            vivification: false,
+            target_phases: false,
+            xor_reasoning: false,
+            pcaug: false,
+            pcaug_lazy: false,
+            pcaug_capacity: None,
+            pcaug_interval: None,
+            xor_native: true,
+            xor_emit_len: 0,
+            pcaug_budget: 20_000,
+            aig_subst_share_limit: crate::aig::Aig::SUBST_SHARE_UNLIMITED,
+            cnf_prime_emission: false,
+            xor_native_min: crate::xorgauss::XorSystem::NATIVE_MIN,
+            aug_recycle: false,
+            aug_hot_frac: crate::solver::Solver::AUG_HOT_FRAC,
+        }
+    }
+}
+
 pub struct SmtSolver {
     pub ctx: BvContext,
     sat: Solver,
+    /// Mirror of the tuning switches, maintained by the `set_*` methods.
+    /// See [`SolverConfig`].
+    config: SolverConfig,
 
     /// The bitblaster's intermediate representation. All Boolean structure
     /// lands here; CNF is emitted lazily by `lit_of` for the cone reachable
@@ -314,6 +501,33 @@ pub struct SmtSolver {
     cnfmap_leaf_lits: Vec<Lit>,
     /// Cross-cone ISOP cache for the CNF mapper (see `cnfmap::IsopCache`).
     cnfmap_cache: crate::cnfmap::IsopCache,
+
+    /// GF(2) reasoning over the formula's XOR skeleton (see
+    /// `crate::xorgauss`). The bitblaster knows exactly which gates are
+    /// XORs, so the parity system is collected at emission rather than
+    /// recovered from CNF.
+    xor_enabled: bool,
+    xor_sys: crate::xorgauss::XorSystem,
+    xor_stats: crate::xorgauss::XorStats,
+    xor_time: std::time::Duration,
+
+    /// Post-preprocess propagation augmentation (see `crate::pcaug`).
+    /// Off by default; the Augmenter (with its 65,536-entry NPN memo) is
+    /// allocated lazily on the first augmented batch.
+    pcaug_enabled: bool,
+    /// On-demand variant: hand the derived clauses to the SAT core's
+    /// reserve instead of the formula, and let it inject the ones whose
+    /// region the search actually works in.
+    pcaug_lazy: bool,
+    pcaug_aug: Option<Box<crate::pcaug::Augmenter>>,
+    /// Applied to the augmenter whenever one is created (it is built
+    /// lazily, so the setting has to outlive its absence).
+    pcaug_min_gates: u32,
+    pcaug_shape_cache: bool,
+    aug_roots: u64,
+    aug_cuts: u64,
+    aug_added: u64,
+    time_pcaug: std::time::Duration,
     aig2_post_stats: crate::aig::PostPassStats,
 
     /// AIG nodes whose SAT binding was dropped by bounded VE. If a later
@@ -346,6 +560,24 @@ pub struct SmtSolver {
     /// Retired flush buffers, reused across flushes so a steady-state
     /// session stops allocating for emission entirely.
     cnf_buffer_pool: CnfBuffer,
+    /// DAG-aware 4-input cut rewriting of the batch AIG (see
+    /// [`crate::aigrw`]). Currently DIAGNOSTIC: the pass runs and reports
+    /// how far it could shrink the circuit, but its rewritten roots are
+    /// not yet wired into emission (that needs the bitblast caches to be
+    /// rebound, and the specialized equality path emits from BV bit refs
+    /// rather than the assertion root). Because the pass only ever
+    /// appends nodes, running it cannot change any answer.
+    aig_rw: bool,
+    aig_rw_stats: crate::aigrw::RewriteStats,
+    aig_rw_time: std::time::Duration,
+    /// Portfolio diversification seed, applied to the SAT core's saved
+    /// phases at the first solve (variables only exist after the first
+    /// flush, so this cannot be applied at construction). 0 = off.
+    phase_seed: u64,
+    phase_seed_applied: bool,
+    input_branch_mode: u8,
+    input_branch_applied: bool,
+    stats_input_bits: u64,
     /// VE gate-substitution policy: `None` = automatic (enabled unless
     /// two-level AIG rewriting is active — the two circuit minimizers
     /// stacked measured strongly net-negative on Sage2-class instances,
@@ -601,11 +833,32 @@ impl SmtSolver {
             cnfmap_effort: Default::default(),
             cnfmap_leaf_lits: Vec::new(),
             cnfmap_cache: Default::default(),
+            xor_enabled: false,
+            xor_sys: Default::default(),
+            xor_stats: Default::default(),
+            xor_time: std::time::Duration::ZERO,
+            pcaug_enabled: false,
+            pcaug_lazy: false,
+            pcaug_aug: None,
+            pcaug_min_gates: crate::pcaug::Augmenter::MIN_GATES,
+            pcaug_shape_cache: true,
+            aug_roots: 0,
+            aug_cuts: 0,
+            aug_added: 0,
+            time_pcaug: std::time::Duration::ZERO,
             aig2_post_stats: crate::aig::PostPassStats::default(),
             elim_nodes: HashSet::default(),
             pp_remat: 0,
             cnf_buffer: None,
             cnf_buffer_pool: CnfBuffer::default(),
+            aig_rw: false,
+            aig_rw_stats: Default::default(),
+            aig_rw_time: std::time::Duration::ZERO,
+            phase_seed: 0,
+            phase_seed_applied: false,
+            input_branch_mode: 0,
+            input_branch_applied: false,
+            stats_input_bits: 0,
             ve_gate_subst: None,
             pp_pool: Default::default(),
             pp_to_orig: Vec::new(),
@@ -633,6 +886,7 @@ impl SmtSolver {
             eval_stack: Vec::new(),
             subst_enabled: true,
             gauss_enabled: true,
+            config: SolverConfig::default(),
             bve_enabled: true,
             pp_eliminated: 0,
             pp_subsumed: 0,
@@ -668,18 +922,96 @@ impl SmtSolver {
     /// (bitwuzla-style bvadd flattening/cancellation under comparisons).
     /// On by default; off is useful for ablation benchmarks.
     pub fn set_normalization(&mut self, on: bool) {
+        self.config.normalization = on;
         self.normalize_enabled = on;
+    }
+
+    /// This solver's tuning switches. Feed to [`Self::apply_config`] to
+    /// configure another solver identically.
+    pub fn config(&self) -> SolverConfig {
+        self.config
+    }
+
+    /// Apply a whole [`SolverConfig`], routing through the individual
+    /// setters so every switch reaches its real home (term context, AIG,
+    /// SAT core) rather than just the mirror.
+    pub fn apply_config(&mut self, cfg: SolverConfig) {
+        self.set_normalization(cfg.normalization);
+        self.set_substitution(cfg.substitution);
+        self.set_gaussian(cfg.gaussian);
+        self.set_bve(cfg.bve);
+        self.set_eq_ite_pushdown(cfg.eq_ite_pushdown);
+        self.set_core_tracking(cfg.core_tracking);
+        self.set_cone_retirement(cfg.cone_retirement);
+        self.set_cnf_mapping(cfg.cnf_mapping);
+        self.set_cnf_mapping_effort(cfg.cnf_mapping_full);
+        self.set_ite_branching_hints(cfg.ite_branching_hints);
+        // Order matters: `set_aig_two_level_post` forces `two_level` on and
+        // `two_level_subst` off, so replay it first and let the plain
+        // switches below restore the exact pair the source ended up with.
+        if cfg.aig_two_level_post {
+            self.set_aig_two_level_post(true);
+        }
+        self.set_aig_two_level(cfg.aig_two_level);
+        self.set_aig_two_level_subst(cfg.aig_two_level_subst);
+        self.set_fraig(cfg.fraig);
+        self.set_ve_gate_substitution(cfg.ve_gate_subst);
+        self.set_input_branching(cfg.input_branching);
+        self.set_phase_seed(cfg.phase_seed);
+        self.set_aig_rewrite(cfg.aig_rewrite);
+        self.set_vivification(cfg.vivification);
+        self.set_target_phases(cfg.target_phases);
+        self.set_xor_reasoning(cfg.xor_reasoning);
+        self.set_pcaug(cfg.pcaug);
+        self.set_pcaug_lazy(cfg.pcaug_lazy);
+        if let Some(n) = cfg.pcaug_capacity {
+            self.set_pcaug_capacity(n);
+        }
+        if let Some(n) = cfg.pcaug_interval {
+            self.set_pcaug_interval(n);
+        }
+        self.set_xor_native(cfg.xor_native);
+        self.set_xor_emit_len(cfg.xor_emit_len);
+        self.set_xor_native_min(cfg.xor_native_min);
+        self.set_pcaug_budget(cfg.pcaug_budget);
+        self.set_aig_subst_share_limit(cfg.aig_subst_share_limit);
+        self.set_cnf_prime_emission(cfg.cnf_prime_emission);
+        self.set_augmentation_recycle(cfg.aug_recycle);
+        self.set_augmentation_hot_fraction(cfg.aug_hot_frac);
     }
 
     /// Enable/disable single-variable `(= x t)` substitution. On by default.
     pub fn set_substitution(&mut self, on: bool) {
+        self.config.substitution = on;
         self.subst_enabled = on;
+    }
+
+    /// Let `bv_eq` push an equality-against-a-constant through an ite
+    /// chain. **Off by default.**
+    ///
+    /// Turn it on when the formula's comparisons are guarded folds — the
+    /// shape a symbolic executor emits for `strcmp`/`memcmp`, where the
+    /// guard on each level is the negation of that level's own equality
+    /// and the whole chain annihilates against a zero test. There the win
+    /// is large and structural: a 64-byte comparison against zero drops
+    /// from ~11k SAT variables and ~20k clauses to the ~2k variables and
+    /// zero clauses of the equivalent `AND` of per-byte equalities.
+    ///
+    /// Leave it off for general verification conditions. Measured on the
+    /// symex corpus it costs +10.8% wall against a +1.9% conflict change,
+    /// with nearly all the damage on instances whose muxes have several
+    /// consumers — there the decomposition cannot retire the mux, so it
+    /// only adds structure alongside it. See the rule in `bv_eq`.
+    pub fn set_eq_ite_pushdown(&mut self, on: bool) {
+        self.config.eq_ite_pushdown = on;
+        self.ctx.eq_ite_pushdown = on;
     }
 
     /// Enable/disable Gaussian elimination of coupled linear systems. On by
     /// default. (Independent of [`set_substitution`], though both feed the
     /// same substitution map.)
     pub fn set_gaussian(&mut self, on: bool) {
+        self.config.gaussian = on;
         self.gauss_enabled = on;
     }
 
@@ -690,6 +1022,7 @@ impl SmtSolver {
     /// instance (it can hurt: eliminating gate variables sometimes
     /// lengthens conflict analysis).
     pub fn set_bve(&mut self, on: bool) {
+        self.config.bve = on;
         self.bve_enabled = on;
     }
 
@@ -700,6 +1033,7 @@ impl SmtSolver {
     /// "feasible or not?" (symbex branch loops) save an O(trail) core
     /// walk on every Unsat answer.
     pub fn set_core_tracking(&mut self, on: bool) {
+        self.config.core_tracking = on;
         self.sat.set_core_tracking(on);
     }
 
@@ -716,6 +1050,7 @@ impl SmtSolver {
     /// still covers most of the formula (the sweep is O(everything),
     /// finds nothing to delete, and drops the standing trail).
     pub fn set_cone_retirement(&mut self, on: bool) {
+        self.config.cone_retirement = on;
         self.retirement_enabled = on;
     }
 
@@ -723,6 +1058,7 @@ impl SmtSolver {
     /// `cnf_mapping` field). Takes effect for cones materialized after
     /// the call; already-emitted CNF is untouched.
     pub fn set_cnf_mapping(&mut self, on: bool) {
+        self.config.cnf_mapping = on;
         self.cnf_mapping = on;
     }
 
@@ -731,6 +1067,7 @@ impl SmtSolver {
     /// to full effort on symbex-shaped instances at ~40% less mapping
     /// cost; `true` pays off on dense arithmetic (multiplier arrays).
     pub fn set_cnf_mapping_effort(&mut self, full: bool) {
+        self.config.cnf_mapping_full = full;
         self.cnfmap_effort = if full {
             crate::cnfmap::Effort::Full
         } else {
@@ -743,6 +1080,7 @@ impl SmtSolver {
     /// flush; off disables that boost entirely. Useful to benchmark the
     /// impact of the heuristic on a given workload.
     pub fn set_ite_branching_hints(&mut self, on: bool) {
+        self.config.ite_branching_hints = on;
         self.ite_branching_hints = on;
     }
 
@@ -750,6 +1088,7 @@ impl SmtSolver {
     /// bitblaster's `and()` (see `Aig::set_two_level`). Off by default —
     /// changes circuit structure and search trajectory.
     pub fn set_aig_two_level(&mut self, on: bool) {
+        self.config.aig_two_level = on;
         self.aig.set_two_level(on);
     }
 
@@ -758,6 +1097,7 @@ impl SmtSolver {
     /// two rules that fragment the learned-clause vocabulary on shared
     /// DAGs. Only meaningful with [`set_aig_two_level`] on.
     pub fn set_aig_two_level_subst(&mut self, on: bool) {
+        self.config.aig_two_level_subst = on;
         self.aig.set_two_level_subst(on);
     }
 
@@ -766,6 +1106,9 @@ impl SmtSolver {
     /// counts, so a substitution never bypasses a shared interior node.
     /// The compatible successor to plain `set_aig_two_level`.
     pub fn set_aig_two_level_post(&mut self, on: bool) {
+        self.config.aig_two_level_post = on;
+        self.config.aig_two_level = on;
+        self.config.aig_two_level_subst = false;
         self.aig.set_two_level(on);
         self.aig.set_two_level_subst(false);
         self.aig2_post = on;
@@ -779,6 +1122,7 @@ impl SmtSolver {
     /// Off by default: merging changes CNF shape and therefore search
     /// trajectory — benchmark per-corpus before adopting.
     pub fn set_fraig(&mut self, on: bool) {
+        self.config.fraig = on;
         self.fraig_enabled = on;
     }
 
@@ -786,14 +1130,281 @@ impl SmtSolver {
     /// `ve_gate_subst` field doc). `set_ve_gate_substitution(None)`
     /// restores the automatic rule.
     pub fn set_ve_gate_substitution(&mut self, forced: Option<bool>) {
+        self.config.ve_gate_subst = forced;
         self.ve_gate_subst = forced;
+    }
+
+    /// Experimental: restrict (or merely prioritize) CDCL branching to
+    /// the bits of free input variables — the "independent support" of a
+    /// straight-line circuit. Every other CNF variable is determined by
+    /// them through propagation, so a decision on an interior gate is
+    /// arguably wasted work; but restricting decisions also removes the
+    /// solver's ability to case-split usefully inside the circuit.
+    /// Measured per workload — see `set_input_branching`.
+    ///
+    /// 0 = off, 1 = restrict decisions to input bits, 2 = prioritize
+    /// input bits by a large one-time activity boost.
+    pub fn set_input_branching(&mut self, mode: u8) {
+        self.config.input_branching = mode;
+        self.input_branch_mode = mode;
+    }
+
+    /// Apply the input-branching policy. Called once, after flush, when
+    /// every input bit has a SAT variable.
+    fn apply_input_branching(&mut self) {
+        if self.input_branch_mode == 0 {
+            return;
+        }
+        // Input bits = BvBit of a term whose BvOp is Var, plus Bool vars.
+        let mut inputs: Vec<Var> = Vec::new();
+        for vi in 0..self.var_origin.len() {
+            let is_input = match self.var_origin[vi] {
+                VarOrigin::BvBit { term, .. } => {
+                    matches!(self.ctx.bv_op(term), crate::bv::BvOp::Var(_))
+                }
+                VarOrigin::Bool { .. } => true,
+                _ => false,
+            };
+            if is_input {
+                inputs.push(Var(vi as u32));
+            }
+        }
+        self.stats_input_bits = inputs.len() as u64;
+        match self.input_branch_mode {
+            1 => {
+                // Restrict: everything that is not an input stops being a
+                // decision variable. Model reads are structural AIG
+                // evaluations over inputs, so a model remains readable
+                // even with interior vars left unassigned.
+                let mut is_input = vec![false; self.var_origin.len()];
+                for v in &inputs {
+                    is_input[v.idx()] = true;
+                }
+                for vi in 0..self.var_origin.len() {
+                    if !is_input[vi] {
+                        self.sat.set_decision_var(Var(vi as u32), false);
+                    }
+                }
+            }
+            _ => {
+                // Prioritize: one large activity boost per input bit.
+                for v in &inputs {
+                    for _ in 0..64 {
+                        self.sat.boost_var_activity(*v);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Portfolio diversification seed for the SAT core's initial phases
+    /// (see [`crate::solver::Solver::diversify_phases`]). Applied at the
+    /// first solve, once the formula's variables exist. 0 = off (the
+    /// historical all-false phase initialization).
+    pub fn set_phase_seed(&mut self, seed: u64) {
+        self.config.phase_seed = seed;
+        self.phase_seed = seed;
+    }
+
+    /// Enable DAG-aware 4-input cut rewriting of the batch AIG.
+    pub fn set_aig_rewrite(&mut self, on: bool) {
+        self.config.aig_rewrite = on;
+        self.aig_rw = on;
+    }
+
+    /// Cumulative cut-rewriting statistics and wall-clock time.
+    pub fn aig_rewrite_report(&self) -> (crate::aigrw::RewriteStats, std::time::Duration) {
+        (self.aig_rw_stats, self.aig_rw_time)
     }
 
     /// Enable clause vivification in the SAT core (see
     /// [`crate::solver::Solver::set_vivification`] for the corpus verdict
     /// that keeps it off by default).
     pub fn set_vivification(&mut self, on: bool) {
+        self.config.vivification = on;
         self.sat.set_vivification(on);
+    }
+
+    /// Enable Kissat-style target phases in the SAT core (see
+    /// [`crate::solver::Solver::set_target_phases`]).
+    pub fn set_target_phases(&mut self, on: bool) {
+        self.config.target_phases = on;
+        self.sat.set_target_phases(on);
+    }
+
+    /// Enable post-preprocess propagation augmentation (see
+    /// [`crate::pcaug`]): add the prime implicates of small multi-gate
+    /// cut functions that the gate-by-gate encoding cannot propagate,
+    /// AFTER bounded VE has run — strengthening propagation without
+    /// starving the eliminator the way full CNF mapping does. Classic
+    /// emission path only (no-op alongside `set_cnf_mapping`).
+    /// Enable GF(2) elimination over the XOR skeleton (see
+    /// [`crate::xorgauss`]). Off by default.
+    pub fn set_xor_reasoning(&mut self, on: bool) {
+        self.config.xor_reasoning = on;
+        self.xor_enabled = on;
+    }
+
+    /// Elimination statistics and the time it took.
+    pub fn xor_report(&self) -> (crate::xorgauss::XorStats, f64) {
+        (self.xor_stats, self.xor_time.as_secs_f64())
+    }
+
+    /// (parity reasons resolved, total reason steps) in conflict analysis.
+    pub fn xor_reason_report(&self) -> (u64, u64) {
+        (self.sat.stats_xor_reasons, self.sat.stats_reason_steps)
+    }
+
+    /// Rows examined by the parity engine — its work metric.
+    pub fn xor_visit_report(&self) -> u64 {
+        self.sat.stats_xor_visits
+    }
+
+    /// (parity propagations, parity conflicts) from native in-search
+    /// propagation.
+    pub fn xor_prop_report(&self) -> (u64, u64) {
+        (self.sat.stats_xor_props, self.sat.stats_xor_confl)
+    }
+
+    pub fn set_pcaug(&mut self, on: bool) {
+        self.config.pcaug = on;
+        self.pcaug_enabled = on;
+    }
+
+    /// On-demand augmentation: derive the same clauses, but bank them in
+    /// the SAT core (see [`crate::solver::Solver::bank_implied_clause`])
+    /// instead of adding them, so each one enters the formula only if
+    /// the search moves into its region. Bulk pre-addition measured
+    /// net-negative precisely because CDCL re-derives the useful holes
+    /// itself; this pays only for the ones it is actually struggling
+    /// with. Implies `set_pcaug(true)`.
+    pub fn set_pcaug_lazy(&mut self, on: bool) {
+        self.config.pcaug_lazy = on;
+        if on {
+            self.config.pcaug = on;
+        }
+        self.pcaug_lazy = on;
+        if on {
+            self.pcaug_enabled = true;
+        }
+        self.sat.set_augmentation(on);
+    }
+
+    /// (roots examined, cuts filtered, clauses derived, seconds) for the
+    /// augmentation pass.
+    pub fn pcaug_report(&self) -> (u64, u64, u64, f64) {
+        (
+            self.aug_roots,
+            self.aug_cuts,
+            self.aug_added,
+            self.time_pcaug.as_secs_f64(),
+        )
+    }
+
+    /// (banked, injected, sweeps) for on-demand augmentation.
+    pub fn pcaug_lazy_report(&self) -> (u64, u64, u64) {
+        (
+            self.sat.stats_aug_banked,
+            self.sat.stats_aug_injected,
+            self.sat.stats_aug_sweeps,
+        )
+    }
+
+    /// Ceiling on the augmentation working set (see
+    /// [`crate::solver::Solver::set_augmentation_capacity`]).
+    pub fn set_pcaug_capacity(&mut self, n: usize) {
+        self.config.pcaug_capacity = Some(n);
+        self.sat.set_augmentation_capacity(n);
+    }
+
+    /// Conflicts between augmentation sweeps (see
+    /// [`crate::solver::Solver::set_augmentation_interval`]).
+    pub fn set_pcaug_interval(&mut self, n: u64) {
+        self.config.pcaug_interval = Some(n);
+        self.sat.set_augmentation_interval(n);
+    }
+
+    /// Propagate long derived parity rows natively in the SAT core rather
+    /// than dropping them. On by default; see [`crate::xorgauss`].
+    pub fn set_xor_native(&mut self, on: bool) {
+        self.config.xor_native = on;
+    }
+
+    /// Longest derived parity row to materialize as CNF (0 = none, the
+    /// default). Each costs 2^(k-1) clauses, so this stays small; it
+    /// exists to test whether combined-parity information helps CDCL.
+    pub fn set_xor_emit_len(&mut self, n: usize) {
+        self.config.xor_emit_len = n;
+    }
+
+    /// Shortest derived parity row handed to the SAT core for native
+    /// propagation instead of being encoded (see
+    /// [`crate::xorgauss::XorSystem::set_native_min`]).
+    pub fn set_xor_native_min(&mut self, n: usize) {
+        self.config.xor_native_min = n;
+        self.xor_sys.set_native_min(n);
+    }
+
+    /// Per-batch ceiling on derived augmentation clauses (see
+    /// `augment_batch`). Calibration knob; default 20,000.
+    pub fn set_pcaug_budget(&mut self, n: usize) {
+        self.config.pcaug_budget = n;
+    }
+
+    /// Fewest interior gates a cut must cover to be worth augmenting.
+    pub fn set_pcaug_min_gates(&mut self, n: u32) {
+        self.pcaug_min_gates = n;
+        if let Some(a) = self.pcaug_aug.as_mut() {
+            a.set_min_gates(n);
+        }
+    }
+
+    /// Enable or disable the augmenter's shape cache. Off is for checking
+    /// that the cache is output-identical to recomputing.
+    pub fn set_pcaug_shape_cache(&mut self, on: bool) {
+        self.pcaug_shape_cache = on;
+        if let Some(a) = self.pcaug_aug.as_mut() {
+            a.set_shape_cache_enabled(on);
+        }
+    }
+
+    /// Decline a two-level AIG substitution when the node it would bypass
+    /// has more than `limit` parents (see
+    /// [`crate::aig::Aig::set_subst_share_limit`]).
+    pub fn set_aig_subst_share_limit(&mut self, limit: u32) {
+        self.config.aig_subst_share_limit = limit;
+        self.aig.set_subst_share_limit(limit);
+    }
+
+    /// Emit full prime covers rather than ISOP covers when CNF mapping
+    /// (see [`crate::cnfmap::IsopCache::set_prime_emission`]).
+    pub fn set_cnf_prime_emission(&mut self, on: bool) {
+        self.config.cnf_prime_emission = on;
+        self.cnfmap_cache.set_prime_emission(on);
+    }
+
+    /// Recycle evicted augmentation clauses back into the reserve (see
+    /// [`crate::solver::Solver::set_augmentation_recycle`]).
+    pub fn set_augmentation_recycle(&mut self, on: bool) {
+        self.config.aug_recycle = on;
+        self.sat.set_augmentation_recycle(on);
+    }
+
+    /// VSIDS-activity fraction defining "hot" for augmentation injection
+    /// (see [`crate::solver::Solver::set_augmentation_hot_fraction`]).
+    pub fn set_augmentation_hot_fraction(&mut self, frac: f64) {
+        self.config.aug_hot_frac = frac;
+        self.sat.set_augmentation_hot_fraction(frac);
+    }
+
+    /// (evicted, root units derived, working-set size now) — the
+    /// bounded-working-set half of on-demand augmentation.
+    pub fn pcaug_set_report(&self) -> (u64, u64, usize) {
+        (
+            self.sat.stats_aug_evicted,
+            self.sat.stats_aug_units,
+            self.sat.aug_working_set_len(),
+        )
     }
 
     /// Cumulative FRAIG sweep statistics and wall-clock time spent.
@@ -952,6 +1563,308 @@ impl SmtSolver {
     pub fn bv_smul_overflow(&mut self, x: BvTerm, y: BvTerm) -> BoolTerm { self.ctx.bv_smul_overflow(x, y) }
     pub fn bv_neg_overflow(&mut self, x: BvTerm) -> BoolTerm { self.ctx.bv_neg_overflow(x) }
     pub fn bv_sdiv_overflow(&mut self, x: BvTerm, y: BvTerm) -> BoolTerm { self.ctx.bv_sdiv_overflow(x, y) }
+
+    // ---------- Forking a term DAG into a fresh solver ----------
+
+    /// Rebuild the term DAG reachable from `bool_roots` / `bv_roots` inside
+    /// a brand-new solver, and return it alongside a handle translator.
+    ///
+    /// # What it is for
+    ///
+    /// CNF preprocessing here is *batch-local*: bounded variable
+    /// elimination may only touch gate variables allocated during the
+    /// current flush, because anything older can be named by clauses the
+    /// preprocessor cannot see (see `commit_batch`'s frozen-variable rule).
+    /// A client that grows one formula across many small queries therefore
+    /// preprocesses almost nothing — by the time the interesting
+    /// constraints arrive, every gate they refer to is frozen. Forking buys
+    /// the one-batch case back: the rebuilt formula is asserted into a
+    /// virgin solver in a single flush, so preprocessing sees all of it.
+    ///
+    /// # Measured caveat, before you reach for it
+    ///
+    /// Recovering that preprocessing does **not** imply a faster solve, and
+    /// on symbolic-execution formulas it is a clear loss. Rebuilding
+    /// produces a materially *larger* CNF than growing the formula
+    /// incrementally — on the `nobranch` flag-checker, 507k SAT variables
+    /// against 402k, despite the rebuilt term graph being smaller (759k
+    /// nodes against 839k). Against that workload's warm-path 628k
+    /// conflicts / 382M propagations, a fork with identical configuration
+    /// and BVE on needs 677k / 464M (having eliminated 209,092 variables);
+    /// with BVE off, 933k / 2,236M. Elimination claws back part of the
+    /// rebuild's own damage and no more.
+    ///
+    /// # What carries over
+    ///
+    /// The terms, and the source's [`SolverConfig`]. Inheriting the
+    /// configuration is not a convenience: a fork left on library defaults
+    /// silently drops whatever the caller tuned — losing, say,
+    /// `set_aig_two_level` — and any comparison between the two solvers
+    /// then measures the missing switches rather than the fork.
+    ///
+    /// What does *not* carry over: assertions, learned clauses, and scopes.
+    /// The fork starts empty, so anything asserted straight into the source
+    /// — including `assert_mutually_exclusive` groups — has to be named in
+    /// the roots and re-asserted, or it simply isn't there.
+    ///
+    /// Pass as `bv_roots` anything you intend to read a model value for.
+    /// A named variable that no constraint mentions is not reachable from
+    /// `bool_roots` and would otherwise not exist in the fork.
+    pub fn fork_terms(&self, bool_roots: &[BoolTerm], bv_roots: &[BvTerm]) -> TermFork {
+        let mut out = SmtSolver::new();
+        out.apply_config(self.config);
+        let mut bv_map = vec![FORK_UNMAPPED; self.ctx.bv_nodes.len()];
+        let mut bool_map = vec![FORK_UNMAPPED; self.ctx.bool_nodes.len()];
+        let mut stack: Vec<ForkFrame> = Vec::with_capacity(64);
+
+        for &t in bv_roots {
+            stack.push(ForkFrame::Bv(t));
+        }
+        for &t in bool_roots {
+            stack.push(ForkFrame::Bool(t));
+        }
+
+        // Explicit stack, two-visit style: a node whose children aren't all
+        // mapped yet is pushed back under them and revisited. The DAG is
+        // acyclic and hash-consed, so every node is built exactly once.
+        let mut pending: Vec<ForkFrame> = Vec::with_capacity(8);
+        while let Some(frame) = stack.pop() {
+            pending.clear();
+            match frame {
+                ForkFrame::Bv(t) => {
+                    if bv_map[t.0 as usize] != FORK_UNMAPPED {
+                        continue;
+                    }
+                    let op = self.ctx.bv_nodes[t.0 as usize].op;
+                    self.fork_bv_children(op, &bv_map, &bool_map, &mut pending);
+                    if !pending.is_empty() {
+                        stack.push(frame);
+                        stack.append(&mut pending);
+                        continue;
+                    }
+                    let built = self.fork_build_bv(&mut out, t, op, &bv_map, &bool_map);
+                    bv_map[t.0 as usize] = built.0;
+                }
+                ForkFrame::Bool(t) => {
+                    if bool_map[t.0 as usize] != FORK_UNMAPPED {
+                        continue;
+                    }
+                    let op = self.ctx.bool_nodes[t.0 as usize];
+                    self.fork_bool_children(op, &bv_map, &bool_map, &mut pending);
+                    if !pending.is_empty() {
+                        stack.push(frame);
+                        stack.append(&mut pending);
+                        continue;
+                    }
+                    let built = self.fork_build_bool(&mut out, op, &bv_map, &bool_map);
+                    bool_map[t.0 as usize] = built.0;
+                }
+            }
+        }
+
+        TermFork { solver: out, bv_map, bool_map }
+    }
+
+    /// Push any not-yet-mapped operands of a BV node onto `pending`.
+    fn fork_bv_children(
+        &self,
+        op: BvOp,
+        bv_map: &[u32],
+        bool_map: &[u32],
+        pending: &mut Vec<ForkFrame>,
+    ) {
+        let bv = |t: BvTerm, out: &mut Vec<ForkFrame>| {
+            if bv_map[t.0 as usize] == FORK_UNMAPPED {
+                out.push(ForkFrame::Bv(t));
+            }
+        };
+        match op {
+            BvOp::Var(_) | BvOp::Const => {}
+            BvOp::Not(a)
+            | BvOp::Neg(a)
+            | BvOp::Popcount(a)
+            | BvOp::Clz(a)
+            | BvOp::Ctz(a)
+            | BvOp::Extract(a, _, _)
+            | BvOp::ZeroExtend(a, _)
+            | BvOp::SignExtend(a, _) => bv(a, pending),
+            BvOp::And(a, b)
+            | BvOp::Or(a, b)
+            | BvOp::Xor(a, b)
+            | BvOp::Add(a, b)
+            | BvOp::Sub(a, b)
+            | BvOp::Mul(a, b)
+            | BvOp::Udiv(a, b)
+            | BvOp::Urem(a, b)
+            | BvOp::Sdiv(a, b)
+            | BvOp::Srem(a, b)
+            | BvOp::Smod(a, b)
+            | BvOp::RotateLeft(a, b)
+            | BvOp::RotateRight(a, b)
+            | BvOp::Shl(a, b)
+            | BvOp::Lshr(a, b)
+            | BvOp::Ashr(a, b)
+            | BvOp::Concat(a, b) => {
+                bv(a, pending);
+                bv(b, pending);
+            }
+            BvOp::Ite(c, t, e) => {
+                if bool_map[c.0 as usize] == FORK_UNMAPPED {
+                    pending.push(ForkFrame::Bool(c));
+                }
+                bv(t, pending);
+                bv(e, pending);
+            }
+            BvOp::Select(idx) => {
+                let table = &self.ctx.select_tables[idx as usize];
+                for &s in table.selectors.iter() {
+                    if bool_map[s.0 as usize] == FORK_UNMAPPED {
+                        pending.push(ForkFrame::Bool(s));
+                    }
+                }
+                for &v in table.values.iter() {
+                    bv(v, pending);
+                }
+                bv(table.default, pending);
+            }
+        }
+    }
+
+    /// Push any not-yet-mapped operands of a Bool node onto `pending`.
+    fn fork_bool_children(
+        &self,
+        op: BoolOp,
+        bv_map: &[u32],
+        bool_map: &[u32],
+        pending: &mut Vec<ForkFrame>,
+    ) {
+        let bv = |t: BvTerm, out: &mut Vec<ForkFrame>| {
+            if bv_map[t.0 as usize] == FORK_UNMAPPED {
+                out.push(ForkFrame::Bv(t));
+            }
+        };
+        let bl = |t: BoolTerm, out: &mut Vec<ForkFrame>| {
+            if bool_map[t.0 as usize] == FORK_UNMAPPED {
+                out.push(ForkFrame::Bool(t));
+            }
+        };
+        match op {
+            BoolOp::True | BoolOp::False | BoolOp::Var(_) => {}
+            BoolOp::Not(a) => bl(a, pending),
+            BoolOp::And(a, b) | BoolOp::Or(a, b) | BoolOp::Implies(a, b) => {
+                bl(a, pending);
+                bl(b, pending);
+            }
+            BoolOp::NegOverflow(a) => bv(a, pending),
+            BoolOp::Eq(a, b)
+            | BoolOp::Ult(a, b)
+            | BoolOp::Ule(a, b)
+            | BoolOp::Slt(a, b)
+            | BoolOp::Sle(a, b)
+            | BoolOp::UaddOverflow(a, b)
+            | BoolOp::SaddOverflow(a, b)
+            | BoolOp::UsubOverflow(a, b)
+            | BoolOp::SsubOverflow(a, b)
+            | BoolOp::UmulOverflow(a, b)
+            | BoolOp::SmulOverflow(a, b)
+            | BoolOp::SdivOverflow(a, b) => {
+                bv(a, pending);
+                bv(b, pending);
+            }
+        }
+    }
+
+    /// Rebuild one BV node in `out`. Every operand is already mapped.
+    fn fork_build_bv(
+        &self,
+        out: &mut SmtSolver,
+        t: BvTerm,
+        op: BvOp,
+        bv_map: &[u32],
+        bool_map: &[u32],
+    ) -> BvTerm {
+        let m = |x: BvTerm| BvTerm(bv_map[x.0 as usize]);
+        let mb = |x: BoolTerm| BoolTerm(bool_map[x.0 as usize]);
+        let node = &self.ctx.bv_nodes[t.0 as usize];
+        let w = node.width;
+        match op {
+            BvOp::Var(_) => out.bv_var(w),
+            BvOp::Const => {
+                if node.wide == crate::bv::WIDE_NONE {
+                    out.bv_const(node.value, w)
+                } else {
+                    let limbs = self.ctx.bv_const_value_limbs(t);
+                    out.bv_const_wide(&limbs, w)
+                }
+            }
+            BvOp::Not(a) => out.bv_not(m(a)),
+            BvOp::And(a, b) => out.bv_and(m(a), m(b)),
+            BvOp::Or(a, b) => out.bv_or(m(a), m(b)),
+            BvOp::Xor(a, b) => out.bv_xor(m(a), m(b)),
+            BvOp::Add(a, b) => out.bv_add(m(a), m(b)),
+            BvOp::Sub(a, b) => out.bv_sub(m(a), m(b)),
+            BvOp::Neg(a) => out.bv_neg(m(a)),
+            BvOp::Mul(a, b) => out.bv_mul(m(a), m(b)),
+            BvOp::Udiv(a, b) => out.bv_udiv(m(a), m(b)),
+            BvOp::Urem(a, b) => out.bv_urem(m(a), m(b)),
+            BvOp::Sdiv(a, b) => out.bv_sdiv(m(a), m(b)),
+            BvOp::Srem(a, b) => out.bv_srem(m(a), m(b)),
+            BvOp::Smod(a, b) => out.bv_smod(m(a), m(b)),
+            BvOp::Popcount(a) => out.bv_popcount(m(a)),
+            BvOp::Clz(a) => out.bv_clz(m(a)),
+            BvOp::Ctz(a) => out.bv_ctz(m(a)),
+            BvOp::RotateLeft(a, b) => out.bv_rotate_left_dyn(m(a), m(b)),
+            BvOp::RotateRight(a, b) => out.bv_rotate_right_dyn(m(a), m(b)),
+            BvOp::Shl(a, b) => out.bv_shl(m(a), m(b)),
+            BvOp::Lshr(a, b) => out.bv_lshr(m(a), m(b)),
+            BvOp::Ashr(a, b) => out.bv_ashr(m(a), m(b)),
+            BvOp::Extract(a, hi, lo) => out.bv_extract(m(a), hi, lo),
+            BvOp::Concat(a, b) => out.bv_concat(m(a), m(b)),
+            BvOp::ZeroExtend(a, n) => out.bv_zero_extend(m(a), n),
+            BvOp::SignExtend(a, n) => out.bv_sign_extend(m(a), n),
+            BvOp::Ite(c, th, el) => out.bv_ite(mb(c), m(th), m(el)),
+            BvOp::Select(idx) => {
+                let table = &self.ctx.select_tables[idx as usize];
+                let sels: Vec<BoolTerm> = table.selectors.iter().map(|&s| mb(s)).collect();
+                let vals: Vec<BvTerm> = table.values.iter().map(|&v| m(v)).collect();
+                out.bv_select(&sels, &vals, m(table.default))
+            }
+        }
+    }
+
+    /// Rebuild one Bool node in `out`. Every operand is already mapped.
+    fn fork_build_bool(
+        &self,
+        out: &mut SmtSolver,
+        op: BoolOp,
+        bv_map: &[u32],
+        bool_map: &[u32],
+    ) -> BoolTerm {
+        let m = |x: BvTerm| BvTerm(bv_map[x.0 as usize]);
+        let mb = |x: BoolTerm| BoolTerm(bool_map[x.0 as usize]);
+        match op {
+            BoolOp::True => out.bool_true(),
+            BoolOp::False => out.bool_false(),
+            BoolOp::Var(_) => out.bool_var(),
+            BoolOp::Not(a) => out.bool_not(mb(a)),
+            BoolOp::And(a, b) => out.bool_and(mb(a), mb(b)),
+            BoolOp::Or(a, b) => out.bool_or(mb(a), mb(b)),
+            BoolOp::Implies(a, b) => out.bool_implies(mb(a), mb(b)),
+            BoolOp::Eq(a, b) => out.bv_eq(m(a), m(b)),
+            BoolOp::Ult(a, b) => out.bv_ult(m(a), m(b)),
+            BoolOp::Ule(a, b) => out.bv_ule(m(a), m(b)),
+            BoolOp::Slt(a, b) => out.bv_slt(m(a), m(b)),
+            BoolOp::Sle(a, b) => out.bv_sle(m(a), m(b)),
+            BoolOp::UaddOverflow(a, b) => out.bv_uadd_overflow(m(a), m(b)),
+            BoolOp::SaddOverflow(a, b) => out.bv_sadd_overflow(m(a), m(b)),
+            BoolOp::UsubOverflow(a, b) => out.bv_usub_overflow(m(a), m(b)),
+            BoolOp::SsubOverflow(a, b) => out.bv_ssub_overflow(m(a), m(b)),
+            BoolOp::UmulOverflow(a, b) => out.bv_umul_overflow(m(a), m(b)),
+            BoolOp::SmulOverflow(a, b) => out.bv_smul_overflow(m(a), m(b)),
+            BoolOp::NegOverflow(a) => out.bv_neg_overflow(m(a)),
+            BoolOp::SdivOverflow(a, b) => out.bv_sdiv_overflow(m(a), m(b)),
+        }
+    }
 
     // ---------- Variable aliasing (union-find) ----------
 
@@ -1197,6 +2110,12 @@ impl SmtSolver {
         }
         self.last_result = None;
         self.retirement_used = true;
+        // Banked augmentation clauses name SAT variables, and retirement
+        // both deletes defining clauses and frees ids for recycling — a
+        // banked clause could end up constraining a variable that now
+        // means something else entirely. Drop the reserve; later batches
+        // refill it.
+        self.sat.clear_augmentation_bank();
         self.flush_pending();
 
         // Live closure over the AIG: the constant, every asserted root,
@@ -1409,6 +2328,15 @@ impl SmtSolver {
 
     /// Hinted solve through the standard list shape; re-arms prefix trust.
     fn sat_solve_hinted(&mut self, asmps: &[Lit], trusted: usize) -> SolveResult {
+        if self.phase_seed != 0 && !self.phase_seed_applied {
+            self.phase_seed_applied = true;
+            self.sat.diversify_phases(self.phase_seed);
+        }
+        if self.input_branch_mode != 0 && !self.input_branch_applied {
+            self.input_branch_applied = true;
+            self.apply_input_branching();
+            eprintln!("c input_bits   : {}", self.stats_input_bits);
+        }
         let t0 = std::time::Instant::now();
         let r = self.sat.solve_under_assumptions_hinted(asmps, trusted);
         self.time_sat += t0.elapsed();
@@ -2095,7 +3023,7 @@ impl SmtSolver {
         want_one: impl Fn(usize) -> bool,
     ) -> Vec<u64> {
         let w = bits.len();
-        let nlimbs = (w + 63) / 64;
+        let nlimbs = w.div_ceil(64);
         let mut limbs = vec![0u64; nlimbs];
         // One list for the whole hunt, grown in place: [controls |
         // extras | bit lits...]. `valid` tracks how much of it provably
@@ -2190,6 +3118,17 @@ impl SmtSolver {
                         None => {
                             self.emit_clause(vec![!al, bl]);
                             self.emit_clause(vec![al, !bl]);
+                            if self.xor_enabled {
+                                // al ≡ bl is the parity row
+                                // var(al) ^ var(bl) = neg(al) ^ neg(bl).
+                                // Under an activation literal the
+                                // equality is conditional, so only the
+                                // unconditional case is a real row.
+                                self.xor_sys.add(
+                                    &[al.var().0, bl.var().0],
+                                    al.is_negated() ^ bl.is_negated(),
+                                );
+                            }
                         }
                         Some(act) => {
                             self.emit_clause(vec![!act, !al, bl]);
@@ -2200,8 +3139,8 @@ impl SmtSolver {
                 return;
             }
         }
-        if let BoolOp::Not(inner) = op {
-            if let BoolOp::Eq(a, b) = self.ctx.bool_nodes[inner.0 as usize] {
+        if let BoolOp::Not(inner) = op
+            && let BoolOp::Eq(a, b) = self.ctx.bool_nodes[inner.0 as usize] {
                 let w = self.ctx.width_of(a);
                 if w >= 2 {
                     // `¬(x = y)` = some bit differs. Build per-bit XOR refs
@@ -2233,7 +3172,6 @@ impl SmtSolver {
                     return;
                 }
             }
-        }
         // General path: bitblast to one AIG root, materialize, emit unit.
         let r = self.bitblast_bool(t);
         if self.retirement_enabled {
@@ -2651,9 +3589,9 @@ impl SmtSolver {
                     // the LOW part) is linear; lshr's `concat(0, extract…)`
                     // drops low bits and is not.
                     let wlo = self.ctx.width_of(lo);
-                    if self.ctx.try_bv_const_value(lo) == Some(0) {
-                        if let BvOp::Extract(src, ehi, elo) = self.ctx.bv_op(hi) {
-                            if elo == 0
+                    if self.ctx.try_bv_const_value(lo) == Some(0)
+                        && let BvOp::Extract(src, ehi, elo) = self.ctx.bv_op(hi)
+                            && elo == 0
                                 && self.ctx.width_of(src) == w
                                 && ehi == w - wlo - 1
                             {
@@ -2661,8 +3599,6 @@ impl SmtSolver {
                                 work.push((src, c.wrapping_mul(scale) & m));
                                 continue;
                             }
-                        }
-                    }
                     return false; // general concat — not linear
                 }
                 _ => return false, // opaque / non-linear
@@ -3191,6 +4127,90 @@ impl SmtSolver {
                 self.aig2_post_stats.accumulate(stats);
             }
 
+            if self.aig_rw {
+                let t0 = std::time::Instant::now();
+                // Roots must be what emission actually walks: the
+                // specialized wide-equality path emits per-bit
+                // biconditionals over the two operand cones, never the
+                // comparison root, so mirror that dispatch here.
+                let mut roots: Vec<crate::aig::AigRef> = Vec::new();
+                for (_, terms) in &batch {
+                    for &t in terms {
+                        let op = self.ctx.bool_nodes[t.0 as usize];
+                        match op {
+                            BoolOp::Eq(a, b) if self.ctx.width_of(a) >= 2 => {
+                                let ab = self.bitblast_bv(a);
+                                let bb = self.bitblast_bv(b);
+                                roots.extend_from_slice(&ab);
+                                roots.extend_from_slice(&bb);
+                            }
+                            _ => {
+                                let r = self.bitblast_bool(t);
+                                roots.push(r);
+                            }
+                        }
+                    }
+                }
+                // Protect structures the CNF emitter encodes specially.
+                // `lit_of` recognizes XOR and MUX shapes and spends 1 var
+                // / 4 clauses on them, where the same function as three
+                // generic AND nodes costs 3 vars / 9 clauses. Cut
+                // rewriting minimizes AIG NODES, so left alone it happily
+                // trades a recognized XOR for a "smaller" generic tree and
+                // makes the CNF much bigger — measured on bench_6554:
+                // AIG −22% but clauses 54k → 134k and solve time 4.6x
+                // worse. Marking these nodes pinned keeps them intact and
+                // confines rewriting to the generic AND logic, where node
+                // count and CNF cost do agree.
+                let mut pinned: Vec<bool> =
+                    self.aig_lit.iter().map(|l| l.is_some()).collect();
+                for i in 0..self.aig.num_nodes() as u32 {
+                    if self.detect_shape(i).is_some() {
+                        let iu = i as usize;
+                        if iu >= pinned.len() {
+                            pinned.resize(iu + 1, false);
+                        }
+                        pinned[iu] = true;
+                    }
+                }
+                let (new_roots, stats) =
+                    crate::aigrw::rewrite(&mut self.aig, &roots, &pinned, false);
+                // Rebind the bitblast caches so the assert loop below —
+                // which re-derives its refs through them — emits the
+                // REWRITTEN cones. The roots were collected in exactly
+                // the dispatch order used here, so the returned vector
+                // slices back apart the same way. Rebinding is sound
+                // because every rewritten ref is function-equivalent to
+                // the one it replaces (checked by simulation inside the
+                // pass), so any other consumer of these terms is equally
+                // well served by the new cone.
+                let mut k = 0usize;
+                for (_, terms) in &batch {
+                    for &t in terms {
+                        let op = self.ctx.bool_nodes[t.0 as usize];
+                        match op {
+                            BoolOp::Eq(a, b) if self.ctx.width_of(a) >= 2 => {
+                                let wa = self.ctx.width_of(a) as usize;
+                                let wb = self.ctx.width_of(b) as usize;
+                                let na = new_roots[k..k + wa].to_vec();
+                                k += wa;
+                                let nb = new_roots[k..k + wb].to_vec();
+                                k += wb;
+                                self.bv_cache.insert(a, na);
+                                self.bv_cache.insert(b, nb);
+                            }
+                            _ => {
+                                self.bool_cache.insert(t, new_roots[k]);
+                                k += 1;
+                            }
+                        }
+                    }
+                }
+                debug_assert_eq!(k, new_roots.len(), "root slicing must be exact");
+                self.aig_rw_stats.accumulate(stats);
+                self.aig_rw_time += t0.elapsed();
+            }
+
             // FRAIG sweep (gated): bitblast the whole batch into the AIG
             // purely first (bitblasting emits no CNF; these calls are
             // memoized, so the assert loop below re-hits the caches), then
@@ -3242,6 +4262,18 @@ impl SmtSolver {
             // into the neighbours), but the gate was real and its selector
             // still deserves the branching hint.
             self.resolve_pending_ites();
+            // GF(2) elimination runs BEFORE preprocessing so its
+            // conclusions are ordinary clauses in the same batch: BVE and
+            // subsumption then get to use them, and everything downstream
+            // is untouched.
+            let buffer = if self.xor_enabled {
+                let t_x = std::time::Instant::now();
+                let b = self.solve_xor_system(buffer);
+                self.xor_time += t_x.elapsed();
+                b
+            } else {
+                buffer
+            };
             let t_pp = std::time::Instant::now();
             self.commit_batch(buffer, batch_start_var);
             self.time_preprocess += t_pp.elapsed();
@@ -3314,12 +4346,151 @@ impl SmtSolver {
     /// invisible outside the batch, so eliminating them is sound: their
     /// AIG-node binding is dropped, and any later consumer re-materializes
     /// the node under a fresh variable with fresh defining clauses.
+    /// Solve the batch's parity system and append what it proves to the
+    /// batch as clauses: units directly, equivalences as the two binaries
+    /// `(a ∨ b')`/`(a' ∨ b)`. Everything derived is implied by the
+    /// formula, so this only ever strengthens propagation.
+    fn solve_xor_system(&mut self, mut buffer: CnfBuffer) -> CnfBuffer {
+        if self.xor_sys.is_empty() {
+            return buffer;
+        }
+        let mut sys = std::mem::take(&mut self.xor_sys);
+        let f = sys.solve_emitting(XOR_MAX_ROW_LEN, self.config.xor_emit_len);
+        sys.clear();
+        self.xor_sys = sys;
+        let st = f.stats;
+        self.xor_stats.rows_in += st.rows_in;
+        self.xor_stats.rank += st.rank;
+        self.xor_stats.dropped += st.dropped;
+        self.xor_stats.units += st.units;
+        self.xor_stats.equivs += st.equivs;
+        self.xor_stats.conflict |= st.conflict;
+        for i in 0..4 {
+            self.xor_stats.len_hist[i] += st.len_hist[i];
+        }
+        self.xor_stats.max_row = self.xor_stats.max_row.max(st.max_row);
+        self.xor_stats.vars += st.vars;
+        if st.conflict {
+            // The parity system alone is contradictory: emit the empty
+            // clause via a contradictory unit pair so the normal
+            // unsat path handles it.
+            let v = Var(0);
+            buffer.push_slice(&[Lit::new(v, false)]);
+            buffer.push_slice(&[Lit::new(v, true)]);
+            return buffer;
+        }
+        for (v, val) in f.units {
+            buffer.push_slice(&[Lit::new(Var(v), !val)]);
+        }
+        // Materialize short derived parities as CNF: a k-variable XOR is
+        // the 2^(k-1) clauses whose literal parity is even (resp. odd).
+        let mut lits: Vec<Lit> = Vec::new();
+        for (vars, rhs) in &f.short_rows {
+            let k = vars.len();
+            for mask in 0..(1u32 << k) {
+                // One clause per FORBIDDEN assignment, i.e. those whose
+                // parity disagrees with the row. (Emitting the allowed
+                // ones instead inverts the constraint and makes the
+                // formula unsatisfiable — caught immediately on nobranch.)
+                if (mask.count_ones() & 1 == 1) == *rhs {
+                    continue;
+                }
+                lits.clear();
+                for (i, &v) in vars.iter().enumerate() {
+                    // bit set => this literal appears negated
+                    lits.push(Lit::new(Var(v), mask >> i & 1 == 1));
+                }
+                buffer.push_slice(&lits);
+                self.xor_stats.emitted += 1;
+            }
+        }
+        // Long derived rows go to the SAT core for NATIVE propagation:
+        // encoding one costs 2^(k-1) clauses, which measured badly, but
+        // propagating it directly costs nothing until it fires.
+        if self.config.xor_native && !f.long_rows.is_empty() {
+            self.sat.set_xor_rows(&f.long_rows);
+            self.xor_stats.native_rows += f.long_rows.len() as u64;
+        }
+        for (a, b, rhs) in f.equivs {
+            let (la, lb) = (Lit::new(Var(a), false), Lit::new(Var(b), false));
+            if rhs {
+                // a ^ b = 1: a != b.
+                buffer.push_slice(&[la, lb]);
+                buffer.push_slice(&[!la, !lb]);
+            } else {
+                // a ^ b = 0: a == b.
+                buffer.push_slice(&[la, !lb]);
+                buffer.push_slice(&[!la, lb]);
+            }
+        }
+        buffer
+    }
+
     fn commit_batch(&mut self, buffer: CnfBuffer, batch_start_var: usize) {
         let CnfBuffer { mut data, mut ends } = buffer;
         if ends.is_empty() {
             self.cnf_buffer_pool = CnfBuffer { data, ends };
             return;
         }
+        // With BVE off there is no Preprocessor to index, and the compact
+        // variable space below exists only to index it. Building it anyway
+        // costs a hash lookup per literal on the way in and a map-back on
+        // the way out, to arrive at exactly the clauses we started with —
+        // pure overhead, and paid on every batch. A symbolic executor that
+        // disables BVE for its probe loop (the eliminate-then-rematerialize
+        // churn is worthless against assumption literals) emits thousands
+        // of small batches and pays it thousands of times.
+        //
+        // Run the same pre-filter directly on the original literals
+        // instead. The two-pass shape is deliberate: filtering the whole
+        // batch before committing any of it keeps every clause screened
+        // against the *pre-batch* root assignment, exactly as the compacted
+        // path does. Committing as we went would let a unit from early in
+        // the batch strengthen the filtering of later clauses — plausibly
+        // an improvement, but a different formula, and not this change's
+        // business.
+        if !self.bve_enabled {
+            let mut w = 0usize; // literal write cursor
+            let mut kept = 0usize; // clause write cursor
+            let mut start = 0usize;
+            for r in 0..ends.len() {
+                let end = ends[r] as usize;
+                let clause_w = w;
+                let mut satisfied = false;
+                for i in start..end {
+                    let l = data[i];
+                    match self.sat.value_fixed(l) {
+                        LBool::True => {
+                            satisfied = true;
+                            break;
+                        }
+                        LBool::False => {}
+                        LBool::Undef => {
+                            data[w] = l;
+                            w += 1;
+                        }
+                    }
+                }
+                if satisfied {
+                    w = clause_w; // discard the partial write
+                } else {
+                    ends[kept] = w as u32;
+                    kept += 1;
+                }
+                start = end;
+            }
+            data.truncate(w);
+            ends.truncate(kept);
+            let mut start = 0usize;
+            for &e in ends.iter() {
+                let end = e as usize;
+                self.sat.add_clause_from_slice(&data[start..end]);
+                start = end;
+            }
+            self.cnf_buffer_pool = CnfBuffer { data, ends };
+            return;
+        }
+
         // Remap the batch's literals into a compact variable space [0, k)
         // where k = distinct variables appearing in this batch. Every
         // preprocessing array (occurrence lists, counts, frozen flags) and
@@ -3374,24 +4545,6 @@ impl SmtSolver {
         }
         data.truncate(w);
         ends.truncate(kept);
-
-        // BVE disabled: commit the (pre-filtered) clauses directly, mapping
-        // compact lits back to originals in place. Skips the Preprocessor.
-        if !self.bve_enabled {
-            let mut start = 0usize;
-            for &e in &ends {
-                let end = e as usize;
-                for l in data[start..end].iter_mut() {
-                    *l = Lit::new(Var(to_orig[l.var_idx()]), l.is_negated());
-                }
-                self.sat.add_clause_from_slice(&data[start..end]);
-                start = end;
-            }
-            self.cnf_buffer_pool = CnfBuffer { data, ends };
-            self.pp_to_orig = to_orig;
-            self.pp_to_compact = to_compact;
-            return;
-        }
 
         let k = to_orig.len();
         // frozen[compact] — a variable survives elimination unless it is a
@@ -3477,11 +4630,134 @@ impl SmtSolver {
             }
             self.sat.add_clause_from_slice(&arena[off as usize..(off + len) as usize]);
         }
+
+        // Post-preprocess propagation augmentation (see `crate::pcaug`):
+        // now that BVE has taken everything it wanted, add the prime
+        // implicates of small multi-gate compositions that the surviving
+        // gate encoding cannot propagate. Runs on the classic emission
+        // path only — under CNF mapping the GateKind tags don't describe
+        // the emitted definitions, so the redundancy filter would be
+        // testing against clauses that never existed.
+        if self.pcaug_enabled && !self.cnf_mapping {
+            let t_aug = std::time::Instant::now();
+            self.augment_batch(&to_orig, batch_start_var, result.clauses.len());
+            self.time_pcaug += t_aug.elapsed();
+        }
+
         // Retire every reusable buffer for the next flush.
         self.cnf_buffer_pool = CnfBuffer { data: arena, ends };
         self.pp_pool = result.pool;
         self.pp_to_orig = to_orig;
         self.pp_to_compact = to_compact;
+    }
+
+    /// One batch of propagation augmentation — see the call site in
+    /// [`Self::commit_batch`] and the mechanism in [`crate::pcaug`].
+    fn augment_batch(
+        &mut self,
+        batch_vars: &[u32],
+        batch_start_var: usize,
+        committed_clauses: usize,
+    ) {
+        use crate::pcaug::Gate;
+        // The derived gate graph of this batch: every surviving gate var
+        // allocated by this flush, described exactly as its clauses were
+        // emitted (GateKind is the record of which encoding ran; the AIG
+        // supplies the operands). Sorted by node id — AIG indices are
+        // topological, and the augmenter requires operands before users.
+        let mut gates: Vec<(u32, Gate)> = Vec::new();
+        for &ov in batch_vars {
+            let ovu = ov as usize;
+            if ovu < batch_start_var {
+                continue; // older var: augmented when its batch committed
+            }
+            let node = self.lit_node[ovu];
+            if node == u32::MAX || self.node_lit(node).is_none() {
+                continue; // eliminated (or never a gate binding)
+            }
+            let VarOrigin::GateOut { gate, .. } = self.var_origin[ovu] else {
+                continue;
+            };
+            let g = match gate {
+                GateKind::And => {
+                    let AigNode::And(a, b) = self.aig.node(node) else {
+                        continue;
+                    };
+                    Gate::And(
+                        (a.node_idx(), a.is_negated()),
+                        (b.node_idx(), b.is_negated()),
+                    )
+                }
+                GateKind::Xor => match self.detect_shape(node) {
+                    Some(NodeShape::Xor(x, y)) => Gate::Xor(
+                        (x.node_idx(), x.is_negated()),
+                        (y.node_idx(), y.is_negated()),
+                    ),
+                    _ => continue,
+                },
+                GateKind::Ite => match self.detect_shape(node) {
+                    Some(NodeShape::NotMux { s, t, e }) => Gate::NotMux(
+                        (s.node_idx(), s.is_negated()),
+                        (t.node_idx(), t.is_negated()),
+                        (e.node_idx(), e.is_negated()),
+                    ),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            gates.push((node, g));
+        }
+        if gates.is_empty() {
+            return;
+        }
+        gates.sort_unstable_by_key(|&(n, _)| n);
+
+        // Budget: augmentation must stay a strengthening garnish, not a
+        // second encoding — cap at a quarter of what the batch committed,
+        // and at an absolute ceiling on top. The ceiling is what makes
+        // the pass affordable: derivation is the dominant cost (measured
+        // bench_5906, 2026-08-06: 2.1s to derive 200,809 clauses of which
+        // the search ever wanted 120), and the instances where
+        // augmentation pays are exactly the ones whose derivation was
+        // cheap to begin with.
+        let max_added = (committed_clauses / 4)
+            .max(64)
+            .min(self.config.pcaug_budget) as u32;
+        let mut aug = self
+            .pcaug_aug
+            .take()
+            .unwrap_or_default();
+        // The augmenter is built lazily, so settings made before the first
+        // batch have to be (re)applied here rather than at construction.
+        aug.set_min_gates(self.pcaug_min_gates);
+        aug.set_shape_cache_enabled(self.pcaug_shape_cache);
+        let sat = &mut self.sat;
+        let aig_lit = &self.aig_lit;
+        let lazy = self.pcaug_lazy;
+        let node_lit = |n: u32| -> Option<Lit> { aig_lit.get(n as usize).copied().flatten() };
+        let mut clause: Vec<Lit> = Vec::with_capacity(6);
+        let stats = aug.run(
+            &gates,
+            max_added,
+            8,
+            |n| node_lit(n).is_some(),
+            |cl| {
+                clause.clear();
+                for &(n, neg) in cl {
+                    let base = node_lit(n).expect("leaf_ok checked liveness");
+                    clause.push(if neg { !base } else { base });
+                }
+                if lazy {
+                    sat.bank_implied_clause(&clause);
+                } else {
+                    sat.add_clause_from_slice(&clause);
+                }
+            },
+        );
+        self.pcaug_aug = Some(aug);
+        self.aug_roots += stats.roots as u64;
+        self.aug_cuts += stats.cuts as u64;
+        self.aug_added += stats.added as u64;
     }
 
     /// Returns true iff the solver currently holds a valid SAT model —
@@ -3526,6 +4802,12 @@ impl SmtSolver {
             viv_strengthened: self.sat.stats_viv_strengthened,
             viv_deleted: self.sat.stats_viv_deleted,
             viv_units: self.sat.stats_viv_units,
+            learnt_avg_len: if self.sat.stats_learned > 0 {
+                self.sat.stats_learnt_lits as f64 / self.sat.stats_learned as f64
+            } else { 0.0 },
+            learnt_live: self.sat.learnt_profile().0,
+            learnt_live_lits: self.sat.learnt_profile().1,
+            learnt_max_len: self.sat.learnt_profile().2,
             time_front: self.time_front.as_secs_f64(),
             time_emit: self.time_emit.as_secs_f64(),
             time_preprocess: self.time_preprocess.as_secs_f64(),
@@ -3587,7 +4869,7 @@ impl SmtSolver {
                 sat_clauses: c,
             })
             .collect();
-        out.sort_by(|a, b| b.sat_clauses.cmp(&a.sat_clauses));
+        out.sort_by_key(|b| std::cmp::Reverse(b.sat_clauses));
         out
     }
 
@@ -3659,7 +4941,7 @@ impl SmtSolver {
     pub fn get_bv_value_limbs(&mut self, t: BvTerm) -> Vec<u64> {
         let bits = self.bitblast_bv(t);
         let vals = self.eval_refs(&bits);
-        let nlimbs = (bits.len() + 63) / 64;
+        let nlimbs = bits.len().div_ceil(64);
         let mut limbs = vec![0u64; nlimbs];
         for (i, &bit) in vals.iter().enumerate() {
             if bit {
@@ -4617,6 +5899,15 @@ impl SmtSolver {
         self.emit_clause_slice(&[xl, yl, !o]);
         self.emit_clause_slice(&[xl, !yl, o]);
         self.emit_clause_slice(&[!xl, yl, o]);
+        if self.xor_enabled {
+            // o = xl ^ yl, i.e. o ^ xl ^ yl = 0 over literals. In
+            // variables the negations move to the right-hand side.
+            let rhs = o.is_negated() ^ xl.is_negated() ^ yl.is_negated();
+            self.xor_sys.add(
+                &[o.var().0, xl.var().0, yl.var().0],
+                rhs,
+            );
+        }
         self.set_node_lit(idx, o);
         self.charge_cost(idx, 1, 4);
     }
@@ -4685,6 +5976,9 @@ impl SmtSolver {
     /// preprocessing is collecting a batch, the SAT core otherwise.
     #[inline]
     fn emit_clause(&mut self, c: Vec<Lit>) {
+        if self.xor_enabled && c.len() == 1 {
+            self.xor_sys.add(&[c[0].var().0], !c[0].is_negated());
+        }
         match self.cnf_buffer.as_mut() {
             Some(buf) => buf.push_slice(&c),
             None => {
@@ -4698,6 +5992,12 @@ impl SmtSolver {
     /// mode appends to the flat CSR arena.
     #[inline]
     fn emit_clause_slice(&mut self, c: &[Lit]) {
+        // A unit clause is a one-variable parity row, and those are what
+        // couple the circuit's definitional XORs to the assertion — the
+        // asserted output bits enter the linear system here.
+        if self.xor_enabled && c.len() == 1 {
+            self.xor_sys.add(&[c[0].var().0], !c[0].is_negated());
+        }
         match self.cnf_buffer.as_mut() {
             Some(buf) => buf.push_slice(c),
             None => {
@@ -5394,9 +6694,7 @@ impl SmtSolver {
             // |2*r| ≤ 2*b < 2^(n+1) still fits as signed).
             let mut shifted = vec![AigRef::FALSE; ext];
             shifted[0] = a[i];
-            for j in 1..ext {
-                shifted[j] = r[j - 1];
-            }
+            shifted[1..ext].copy_from_slice(&r[..ext - 1]);
             r = shifted;
 
             // Sign of current r (the top bit of the (N+2)-bit value).

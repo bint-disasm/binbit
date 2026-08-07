@@ -408,7 +408,7 @@ fn render_wide_const(limbs: &[u64], width: u32) -> String {
     s.push_str("#b");
     for i in (0..width).rev() {
         let limb = (i / 64) as usize;
-        let bit = (i % 64) as u32;
+        let bit = i % 64;
         let v = (limbs.get(limb).copied().unwrap_or(0) >> bit) & 1;
         s.push(if v == 1 { '1' } else { '0' });
     }

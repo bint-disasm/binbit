@@ -52,11 +52,7 @@ fn udiv_const_time(width: u32, d: u128, q: u128) -> f64 {
 
 // Force a symbolic-divisor divide: both x and y unknown.
 fn udiv_symbolic_time(width: u32, x_val: u128, y_val: u128) -> f64 {
-    let expected = if y_val == 0 {
-        (1u128 << width) - 1
-    } else {
-        x_val / y_val
-    };
+    let expected = x_val.checked_div(y_val).unwrap_or((1u128 << width) - 1);
     let (_, t) = time(|| {
         let mut s = SmtSolver::new();
         let x = s.bv_var(width);

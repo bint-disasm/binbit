@@ -12,7 +12,7 @@ fn load(input: &str) -> (Solver, bool) {
         let lits: Vec<Lit> = c
             .iter()
             .map(|&n| {
-                let v = Var((n.unsigned_abs() - 1) as u32);
+                let v = Var(n.unsigned_abs() - 1  );
                 Lit::new(v, n < 0)
             })
             .collect();
@@ -29,7 +29,7 @@ fn model_satisfies(solver: &Solver, clauses: &[Vec<i32>]) -> bool {
     for c in clauses {
         let mut sat = false;
         for &n in c {
-            let v = Var((n.unsigned_abs() - 1) as u32);
+            let v = Var(n.unsigned_abs() - 1  );
             let val = solver.value_of_var(v);
             let is_true = match val {
                 LBool::True => n > 0,
@@ -82,7 +82,7 @@ fn pigeonhole_3_into_2_is_unsat() {
     for pp in 1..=p {
         let mut c = Vec::new();
         for hh in 1..=h {
-            c.push(((pp - 1) * h + hh) as i32);
+            c.push((pp - 1) * h + hh  );
         }
         clauses.push(c);
     }
@@ -90,8 +90,8 @@ fn pigeonhole_3_into_2_is_unsat() {
     for hh in 1..=h {
         for p1 in 1..=p {
             for p2 in (p1 + 1)..=p {
-                let v1 = ((p1 - 1) * h + hh) as i32;
-                let v2 = ((p2 - 1) * h + hh) as i32;
+                let v1 = (p1 - 1) * h + hh ;
+                let v2 = (p2 - 1) * h + hh ;
                 clauses.push(vec![-v1, -v2]);
             }
         }
@@ -105,7 +105,7 @@ fn pigeonhole_3_into_2_is_unsat() {
     for c in &clauses {
         let lits: Vec<Lit> = c
             .iter()
-            .map(|&n| Lit::new(Var((n.unsigned_abs() - 1) as u32), n < 0))
+            .map(|&n| Lit::new(Var(n.unsigned_abs() - 1  ), n < 0))
             .collect();
         if !solver.add_clause(lits) {
             ok = false;
